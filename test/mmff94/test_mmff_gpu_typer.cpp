@@ -47,13 +47,9 @@ namespace smallfield::tests {
 /** How many mismatching fields either section prints before the rest are only counted. */
 static constexpr std::size_t max_printed_lines_k = 32;
 
-/**
- *  @brief Widest molecule this sweep samples, which is not the descriptor's capacity.
- *
- *  `sft::build_descriptor` refuses anything above `sft::max_atoms_per_molecule_k` on its own, so nothing
- *  here guards the storage. This bound only keeps the compared population drug-like, and raising it up to
- *  the capacity would widen that population rather than fix an overflow.
- */
+/** Widest molecule this sweep samples, which is not the descriptor's capacity. `sft::build_descriptor` refuses
+ *  anything above `sft::max_atoms_per_molecule_k` on its own, so this guards no storage — it only keeps the
+ *  compared population drug-like, and raising it to the capacity would widen that population, not fix an overflow. */
 static constexpr std::uint32_t sampled_atom_ceiling_k = 128;
 static_assert(sampled_atom_ceiling_k <= sft::max_atoms_per_molecule_k, "the sample ceiling sits under capacity");
 
@@ -63,11 +59,8 @@ enum class charge_comparison_t : std::uint8_t {
     skipped_for_fallback_k,
 };
 
-/**
- *  @brief One reporter per compared section, so each closes with its own `compared=` count.
- *
- *  The two counts are deliberately not derivable from one another; see `compare_molecule_`.
- */
+/** One reporter per compared section, so each closes with its own `compared=` count; the two counts are
+ *  deliberately not derivable from one another, as `compare_molecule_` explains. */
 struct typer_reporters_t {
     diagnostic_reporter_t atom_type {"cpu", "gpu"};
     diagnostic_reporter_t partial_charge {"cpu", "gpu"};
@@ -86,17 +79,15 @@ struct typer_reporters_t {
     }
 };
 
-/** Per-molecule outcomes of the sweep. */
+/** Per-molecule outcomes of the sweep. `matched` plus `mismatched` closes over the descriptors alone, not over
+ *  `smiles_batch.size()`: `build_descriptor_batch_` drops what it cannot parse, hydrogenate, fit under
+ *  `sampled_atom_ceiling_k` or describe, so the gap is what the sweep never compared and deriving either counter
+ *  from the input size would report molecules as matching that were never typed. `fallback_flagged` counts those
+ *  the GPU flagged for CPU fallback; their atom types are still compared, so it overlaps both buckets rather than
+ *  partitioning the batch with them. */
 struct typer_tally_t {
-    /*  The pair is not redundant with the SMILES count it is read against: `build_descriptor_batch_` drops a
-     *  molecule it cannot parse, cannot hydrogenate, cannot fit under `sampled_atom_ceiling_k`, or cannot
-     *  describe, and those never reach this tally. So `matched` plus `mismatched` closes over the descriptors
-     *  alone, and the gap up to `smiles_batch.size()` is what the sweep never compared — a cleanup deriving
-     *  either counter from the input size would report molecules as matching that were never typed. */
     std::uint32_t matched = 0;
     std::uint32_t mismatched = 0;
-    /** Molecules the GPU flagged for CPU fallback. Their atom types are still compared, so this
-     *  overlaps the two buckets above rather than partitioning the batch with them. */
     std::uint32_t fallback_flagged = 0;
 };
 
@@ -113,13 +104,9 @@ struct cpu_typing_scratch_t {
     }
 };
 
-/**
- *  @brief Parse the batch into descriptors, filling caller-owned outputs, and answer the atom total.
- *
- *  A SMILES that will not parse, will not take hydrogens, exceeds `sampled_atom_ceiling_k`, or carries an
- *  element or bond order the descriptor does not model is dropped, so the descriptor count is not the
- *  SMILES count.
- */
+/** Parse the batch into descriptors, filling caller-owned outputs, and answer the atom total. A SMILES that will
+ *  not parse, will not take hydrogens, exceeds `sampled_atom_ceiling_k`, or carries an element or bond order the
+ *  descriptor does not model is dropped, so the descriptor count is not the SMILES count. */
 static std::uint32_t build_descriptor_batch_(std::vector<std::string> const &smiles_batch,
                                              std::vector<sft::molecule_descriptor_t> &descriptors,
                                              std::vector<std::uint32_t> &atom_offsets) {
@@ -160,15 +147,11 @@ static std::uint32_t build_descriptor_batch_(std::vector<std::string> const &smi
     return total_atoms;
 }
 
-/**
- *  @brief Compare one molecule atom by atom, answering how many of its atoms disagree.
- *
- *  The charge section's denominator is deliberately smaller than the atom section's, and neither is
- *  recoverable from the other: a molecule flagged for CPU fallback has its GPU charges zeroed on
- *  purpose, and an atom whose type already differs, or whose type is zero, has no charge worth
- *  comparing. `compared` minus `mismatches` on the atom section is therefore not the charge section's
- *  count, and a cleanup that assumes it is would silently compare charges that mean nothing.
- */
+/** Compare one molecule atom by atom, answering how many of its atoms disagree. The charge section's denominator is
+ *  deliberately smaller than the atom section's and neither is recoverable from the other: a molecule flagged for
+ *  CPU fallback has its GPU charges zeroed on purpose, and an atom whose type differs, or is zero, has no charge
+ *  worth comparing. `compared` minus `mismatches` on the atom section is therefore not the charge section's count,
+ *  and assuming it is would silently compare charges that mean nothing. */
 static std::size_t compare_molecule_(typer_reporters_t &reporters, cpu_typing_scratch_t &scratch,
                                      std::size_t molecule_index, sft::molecule_descriptor_t const &descriptor,
                                      sfparam::mmff94_tables_view_t const &host_view, std::uint32_t atom_offset,
@@ -254,8 +237,8 @@ int main(int argc, char **argv) {
     std::vector<float> gpu_atom_charges(total_atoms);
     std::vector<std::uint8_t> gpu_typing_status(num_molecules);
 
-    // Zero is the typer's verdict for a molecule it accepted, so a refused launch would leave the status
-    // array claiming the whole batch was typed and the sweep below would compare uninitialised types.
+    // Zero is the typer's verdict for a molecule it accepted, so a refused launch would leave the status array
+    // claiming the whole batch was typed and the sweep would compare uninitialised types.
     auto const probe = sftest::launch_mmff94_gpu_typer_batch(device_view, descriptors, atom_offsets, gpu_atom_types,
                                                              gpu_atom_charges, gpu_typing_status);
     if (probe != sftest::typer_probe_t::completed_k) {

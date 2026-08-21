@@ -3,22 +3,21 @@
  *  @brief Cross-validate the native CSD torsion matcher against RDKit.
  *
  *  Two layers of correctness gate:
- *   - @b Sub-query-validation: every distinct `$(...)` body appearing in the CSD pattern corpus is compiled by
- *     `compile_recursive_body` and cross-checked against `RDKit::SmartsToMol` and `SubstructMatch` at every atom
- *     of every test molecule.
- *   - @b Full-pattern-validation: for every CSD torsion pattern the dispatcher marks `native==true`, the native
- *     matcher's per-torsion 4-tuple output is compared byte-for-byte to RDKit's `SubstructMatch` output, reduced to
- *     the set of `(atom_1,atom_2,atom_3,atom_4)` torsion indices and considered as an unordered multi-set modulo
- *     endpoint swap, since the central bond is symmetric.
+ *   - @b Sub-query: every distinct `$(...)` body in the CSD pattern corpus is compiled by
+ *     `compile_recursive_body` and cross-checked against `RDKit::SmartsToMol` and `SubstructMatch` at every
+ *     atom of every test molecule.
+ *   - @b Full-pattern: for every pattern the dispatcher marks `native==true`, the native matcher's
+ *     per-torsion 4-tuples are compared byte-for-byte to `SubstructMatch`, reduced to
+ *     `(atom_1,atom_2,atom_3,atom_4)` indices as an unordered multi-set modulo endpoint swap, the central
+ *     bond being symmetric.
  *
- *  Molecule corpus:
- *   - default: the builtin standards, which already reach every predicate, so a fresh clone stays green.
- *   - `argv[1]`, or `SMALLFIELD_TEST_CORPUS`: stream SMILES from a `.smi` file. A named path that does not
- *     open is a failure, never an empty run.
- *   - `argv[2]`, or `SMALLFIELD_TEST_MAX_MOLS`: cap molecules per corpus.
+ *  Corpus: the builtin standards by default, which already reach every predicate so a fresh clone stays
+ *  green; `argv[1]` or `SMALLFIELD_TEST_CORPUS` streams SMILES from a `.smi` file instead, a named path
+ *  that does not open being a failure and never an empty run; `argv[2]` or `SMALLFIELD_TEST_MAX_MOLS` caps
+ *  molecules per corpus.
  *
- *  Divergence means the native implementation's semantics differ from RDKit — always debug the native side, never
- *  weaken the assertion.
+ *  Divergence means the native semantics differ from RDKit — debug the native side, never weaken the
+ *  assertion.
  */
 
 #include <cstddef> // `std::size_t`
@@ -58,13 +57,9 @@ namespace sftest = smallfield::tests;
 
 static constexpr std::string_view test_name_k = "test_csd_torsion_predicates";
 
-/**
- *  @brief Every distinct `$(...)` body the CSD torsion corpus writes, as it appears between `$(` and `)`.
- *
- *  Each is compiled through the same path the pattern compiler uses and cross-checked atom by atom
- *  against RDKit. The single characters carry the chemistry: `H` counts hydrogens, `X` the connection
- *  count, `r` ring membership, a lower-case element symbol aromaticity, and `@` ring closure.
- */
+/** Every distinct `$(...)` body the CSD torsion corpus writes, as it appears between `$(` and `)`. Each compiles
+ *  through the pattern compiler's own path, cross-checked atom by atom against RDKit. Single characters carry the
+ *  chemistry: `H` hydrogens, `X` connections, `r` ring membership, lower-case aromaticity, `@` ring closure. */
 static constexpr std::string_view recursive_bodies_k[] = {
     "C([F])([F])[F]",
     "C([NX3])N",
@@ -132,12 +127,8 @@ namespace smallfield::tests {
 /** One torsion, as the four atom indices its pattern labelled `:1 :2 :3 :4`. */
 using torsion_tuple_t = std::tuple<std::uint8_t, std::uint8_t, std::uint8_t, std::uint8_t>;
 
-/**
- *  @brief One recursive sub-query body, compiled by both of the matchers under comparison.
- *
- *  Both sides compile once for the whole sweep rather than once per molecule, so what the corpus
- *  loop exercises is matching rather than parsing.
- */
+/** One recursive sub-query body, compiled by both matchers under comparison. Both sides compile once for the whole
+ *  sweep, not once per molecule, so the corpus loop exercises matching rather than parsing. */
 struct recursive_case_t {
     std::string_view body;
     sfp::recursive_pool_t pool;
@@ -145,12 +136,8 @@ struct recursive_case_t {
     std::unique_ptr<RDKit::ROMol const> query;
 };
 
-/**
- *  @brief Comparison buffers the sweep owns, cleared at each use rather than rebuilt.
- *
- *  `matches` and `rdkit_roots` keep their capacity across molecules, so the inner loop over the
- *  pattern corpus stops growing them after the first few.
- */
+/** Comparison buffers the sweep owns, cleared at each use rather than rebuilt; `matches` and `rdkit_roots` keep their
+ *  capacity across molecules, so the inner loop over the pattern corpus stops growing them after the first few. */
 struct match_scratch_t {
     std::vector<RDKit::MatchVectType> matches;
     std::unordered_set<std::uint32_t> rdkit_roots;
@@ -187,12 +174,9 @@ static void validate_recursive_for_molecule_(recursive_case_t const &compiled, R
     }
 }
 
-/**
- *  @brief Reduce a set of RDKit `MatchVectType` hits to the set of torsion-atom 4-tuples identified by the
- *  pattern's `:1 :2 :3 :4` labels. Each tuple is normalised so swapping endpoints (atom_1↔atom_4,
- *  atom_2↔atom_3) yields the same canonical form — the native matcher and RDKit may emit the two
- *  orientations in different order, but the torsion semantics is symmetric.
- */
+/** Reduce RDKit `MatchVectType` hits to the torsion-atom 4-tuples the pattern's `:1 :2 :3 :4` labels identify,
+ *  normalised so an endpoint swap — atom_1↔atom_4, atom_2↔atom_3 — gives the same canonical form. The two matchers
+ *  may emit the orientations in different order, but torsion semantics is symmetric. */
 static void fill_rdkit_torsion_tuples_into_(RDKit::ROMol const &molecule,
                                             sfp::csd_compiled_pattern_t const &compiled_pattern,
                                             std::vector<RDKit::MatchVectType> &matches,
@@ -225,19 +209,16 @@ static void compare_torsion_tuple_(diagnostic_reporter_t &reporter, std::string_
         .field("emitted", rdkit_tuples.count(tuple) != 0, native_tuples.count(tuple) != 0, exactly_equal);
 }
 
-/**
- *  @brief Run every native-parsed pattern against @p molecule and compare the emitted 4-tuples to RDKit's
- *  `SubstructMatch`, one tuple at a time, aborting on the first pattern that disagrees.
- */
+/** Run every native-parsed pattern against @p molecule and compare the emitted 4-tuples to `SubstructMatch` one at a
+ *  time, aborting on the first pattern that disagrees. */
 static void validate_patterns_for_molecule_(RDKit::ROMol const &molecule, sft::molecule_descriptor_t const &descriptor,
                                             std::string const &smiles,
                                             std::vector<sfp::csd_compiled_pattern_t> const &patterns,
                                             match_scratch_t &scratch, diagnostic_reporter_t &reporter) {
     std::uint8_t done_bonds_u8[sft::max_bonds_k] = {};
     for (auto const &compiled_pattern : patterns) {
-        // Collect native matches. We cannot use the dispatcher's `done_bonds`
-        // shortcut here because we want @b every emission, not just the first
-        // per bond; use a fresh stub that never marks the bond done.
+        // A fresh stub that never marks a bond done: the dispatcher's `done_bonds` shortcut would give
+        // only the first emission per bond, and every emission is wanted here.
         std::set<torsion_tuple_t> &native_tuples = scratch.native_tuples;
         native_tuples.clear();
         std::memset(done_bonds_u8, 0, sizeof(done_bonds_u8));
@@ -267,12 +248,8 @@ static void validate_patterns_for_molecule_(RDKit::ROMol const &molecule, sft::m
     }
 }
 
-/**
- *  @brief Compile every body in `recursive_bodies_k` on both sides of the comparison.
- *
- *  The native side goes through the path the pattern compiler itself takes; the RDKit side is
- *  built once here so no molecule in the sweep pays to reparse it.
- */
+/** Compile every body in `recursive_bodies_k` on both sides. The native side takes the pattern compiler's own path;
+ *  the RDKit side is built once here so no molecule in the sweep pays to reparse it. */
 static void compile_recursive_cases_into_(std::vector<recursive_case_t> &cases) {
     cases.clear();
     cases.reserve(std::size(recursive_bodies_k));
@@ -289,18 +266,13 @@ static void compile_recursive_cases_into_(std::vector<recursive_case_t> &cases) 
     }
 }
 
-/**
- *  @brief Parse @p smiles, add hydrogens, and build the flat descriptor both matchers read.
- *
- *  @param[in] smiles Molecule to rebuild, as it appears in the corpus.
- *  @param[out] molecule Reset to the parsed, hydrogenated molecule when it is admitted.
- *  @param[out] descriptor Filled when the molecule is admitted, untouched otherwise.
- *  @return `success_k` when the molecule joins the sweep, otherwise the status that refused it.
- */
+/** Parse @p smiles, add hydrogens, and build the flat descriptor both matchers read, filling @p molecule and
+ *  @p descriptor only when the molecule is admitted.
+ *  @return `success_k` when the molecule joins the sweep, otherwise the status that refused it. */
 static sft::conformer_status_t admit_molecule_(std::string const &smiles, std::unique_ptr<RDKit::RWMol> &molecule,
                                                sft::molecule_descriptor_t &descriptor) {
-    // `SmilesToMol` throws on some malformed input rather than returning null, so it belongs inside the
-    // guard alongside `addHs`.
+    // `SmilesToMol` throws on some malformed input instead of returning null, so it belongs inside the
+    // guard beside `addHs`.
     try {
         molecule.reset(RDKit::SmilesToMol(smiles));
         if (molecule) RDKit::MolOps::addHs(*molecule);
@@ -312,10 +284,10 @@ static sft::conformer_status_t admit_molecule_(std::string const &smiles, std::u
     return sft::build_descriptor(*molecule, descriptor);
 }
 
-/** What one sweep over a SMILES corpus compared, and where the lines it did not compare went. */
+/** What one sweep over a SMILES corpus compared, and where the lines it did not compare went; `refused` is
+ *  indexed by the status that kept each line out. */
 struct predicate_tally_t {
     std::size_t validated = 0;
-    /** Corpus lines left out of the sweep, indexed by the status that refused them. */
     std::size_t refused[sft::conformer_status_count_k] = {};
 };
 
@@ -330,16 +302,8 @@ static void announce_corpus_tally_(predicate_tally_t const &tally) {
     fmt::println("");
 }
 
-/**
- *  @brief Sweep a corpus: every sub-query at every atom, then every native pattern, molecule by molecule.
- *
- *  @param[in] smiles_list Corpus to walk, in order.
- *  @param[in] cases Compiled sub-queries to cross-check.
- *  @param[in] patterns Compiled CSD torsion patterns; only the natively parsed ones are compared.
- *  @param[in] max_molecules Stop once this many molecules have been validated.
- *  @param[inout] tally Counters advanced by every molecule.
- *  @param[inout] reporter Reporter counting and printing the comparisons.
- */
+/** Sweep a corpus: every sub-query at every atom, then every native pattern, molecule by molecule. Only the natively
+ *  parsed @p patterns are compared, and @p max_molecules counts molecules validated rather than corpus lines read. */
 static void validate_corpus_(std::vector<std::string> const &smiles_list, std::vector<recursive_case_t> const &cases,
                              std::vector<sfp::csd_compiled_pattern_t> const &patterns, std::size_t max_molecules,
                              predicate_tally_t &tally, diagnostic_reporter_t &reporter) {
@@ -388,15 +352,15 @@ int main(int argc, char **argv) {
         fmt::println("Corpus: {} ({} molecules)", selection.path, fmt::group_digits(smiles_list.size()));
     }
     else {
-        // The builtin standards already exercise every predicate, so a fresh clone with no corpus
-        // to hand stays green rather than reporting a failure that would hide the real ones.
+        // The builtin standards already exercise every predicate, so a fresh clone with no corpus to
+        // hand stays green rather than failing in a way that would hide the real failures.
         smiles_list = sftest::standard_test_smiles();
         fmt::println("Corpus: builtin standards only; name a .smi file on the command line " //
                      "or in SMALLFIELD_TEST_CORPUS for a wider sweep");
     }
 
-    // Every pattern `csd_patterns` hands out compiled natively — one that did not is dropped at load with a
-    // diagnostic — so this count is the corpus size, and a drop shows up as a shortfall against the table's rows.
+    // Every pattern `csd_patterns` hands out compiled natively, one that did not being dropped at load with
+    // a diagnostic, so this count is the corpus size and a drop shows up as a shortfall against the rows.
     auto const &patterns = sfp::csd_patterns();
     fmt::println("{}: {} sub-queries and {} native CSD patterns per molecule", test_name_k,
                  fmt::group_digits(cases.size()), fmt::group_digits(patterns.size()));

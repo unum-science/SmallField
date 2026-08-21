@@ -3,14 +3,12 @@
  *  @brief The two device passes that close the gap between the preprocessing kernels and the pipeline that
  *  consumes their output.
  *
- *  `mmff94_type_and_charge_kernel` leaves a per-molecule status behind, and the molecules it flags need
- *  atom types and charges from somewhere else before the extractor runs; `mmff94_apply_typing_patch_kernel`
- *  writes the host's answer for exactly those molecules.
+ *  Molecules `mmff94_type_and_charge_kernel` flags in its per-molecule status need atom types and charges from
+ *  elsewhere before the extractor runs; `mmff94_apply_typing_patch_kernel` writes the host's answer for those.
  *
- *  `csd_torsion_match_kernel` emits a torsion list per molecule, and `etkdg_pipeline_warp_kernel` reads
- *  those torsions through a per-atom CSR; `etk_build_csr_kernel` builds that CSR on the device from the
- *  torsions the matcher wrote and the 1-2 / 1-3 constraints the host emitted, mirroring
- *  `build_etk_interaction_lists`.
+ *  `etkdg_pipeline_warp_kernel` reads the torsions `csd_torsion_match_kernel` emits through a per-atom CSR,
+ *  which `etk_build_csr_kernel` builds on the device from those torsions and the host's 1-2 / 1-3 constraints,
+ *  mirroring `build_etk_interaction_lists`.
  */
 
 #pragma once
@@ -43,8 +41,7 @@ using smallfield::types::mmff94_typing_patch_t;
 /**
  *  @brief Overwrite the typer's output for the molecules the host already knows it cannot type.
  *
- *  One warp per patch record, lane-strided over the molecule's atoms. Clearing the typing status
- *  is what routes the molecule back into the normal extractor path.
+ *  One warp per patch record, lane-strided over its atoms; a cleared typing status returns it to the extractor.
  *
  *  @param[in] patches One record per flagged molecule.
  *  @param[in] num_patches Records in @p patches.
@@ -72,11 +69,10 @@ static __global__ __launch_bounds__(32, 8) void mmff94_apply_typing_patch_kernel
 /**
  *  @brief Build the per-atom ETK interaction CSR from the matched torsions and the host constraints.
  *
- *  One block per molecule, lane 0 only: the two counting passes carry per-atom cursors that a
- *  lane-parallel form would have to serialise anyway, and a drug-like molecule spends tens of
- *  microseconds of a millisecond-scale wave here. Term indices stay molecule-relative because
- *  `etk_torsion_energy_functor_t` indexes the molecule's own torsion and constraint slices, while
- *  the interaction starts are batch-global because it indexes one interaction array.
+ *  One block per molecule, lane 0 only: the two counting passes carry per-atom cursors a lane-parallel form
+ *  would serialise anyway, and a drug-like molecule spends tens of microseconds of a millisecond-scale wave
+ *  here. Term indices stay molecule-relative, since `etk_torsion_energy_functor_t` indexes the molecule's own
+ *  torsion and constraint slices; interaction starts are batch-global, since they index one batch array.
  *
  *  @param[in] torsions Batch-global torsion array the matcher filled at a fixed per-molecule stride.
  *  @param[in] torsion_stride Slots the matcher reserved per molecule.
@@ -102,9 +98,8 @@ static __global__ __launch_bounds__(32, 8) void etk_build_csr_kernel(
     auto &meta = metadata[molecule_index];
     std::uint32_t const num_atoms = meta.num_atoms;
     std::uint32_t const num_constraints = meta.num_distance_constraints;
-    // The matcher reports what it matched; the reservation is what fits. They agree for every
-    // molecule whose torsion set stays inside its bond list, which is every molecule the matcher
-    // can produce, and the clamp keeps a future widening of the rule from writing out of bounds.
+    // The matcher reports what it matched, the reservation what fits; they agree while a torsion set stays
+    // inside its bond list, which every matchable molecule does, and the clamp catches a future widening.
     std::uint32_t torsion_count = torsion_counts[molecule_index];
     if (torsion_count > torsion_stride) torsion_count = torsion_stride;
     meta.num_etk_torsions = torsion_count;

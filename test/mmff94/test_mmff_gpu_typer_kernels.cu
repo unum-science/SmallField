@@ -2,8 +2,8 @@
  *  @file test/mmff94/test_mmff_gpu_typer_kernels.cu
  *  @brief Validate the GPU MMFF typer kernel.
  *
- *  Runs it on a batch of descriptors and hands results back to the host .cpp for byte-level comparison vs the
- *  CPU native typer.
+ *  Runs it on a batch of descriptors and hands the results back to the host .cpp for byte-level comparison against
+ *  the CPU native typer.
  */
 
 #include <cstddef> // `std::size_t`
@@ -70,8 +70,8 @@ typer_probe_t launch_mmff94_gpu_typer_batch(sfparam::mmff94_tables_view_t tables
                                             custd::span<std::uint8_t> atom_types_out,
                                             custd::span<float> atom_charges_out,
                                             custd::span<std::uint8_t> typing_status_out) {
-    // The caller builds descriptors from SMILES and none of them has to parse, and a zero-block
-    // launch is a configuration error rather than a no-op.
+    // The caller builds descriptors from SMILES and none has to parse, so a zero-block launch is a configuration
+    // error rather than a no-op.
     std::uint32_t const num_molecules = static_cast<std::uint32_t>(descriptors.size());
     if (num_molecules == 0) return typer_probe_t::empty_batch_k;
 
@@ -84,9 +84,8 @@ typer_probe_t launch_mmff94_gpu_typer_batch(sfparam::mmff94_tables_view_t tables
     sfmmff::mmff94_type_and_charge_kernel<<<num_molecules, sfmmff::warp_size_k, 0, nullptr>>>(
         arena.descriptors.data(), arena.atom_offsets.data(), num_molecules, tables_view, arena.atom_types.data(),
         arena.atom_charges.data(), arena.typing_status.data());
-    // A launch the driver refuses to enqueue reports here and nowhere else. The kernel never runs, so the
-    // status array still holds whatever the allocation found -- and zero, which it is full of after a fresh
-    // reservation more often than not, is the verdict for a molecule the typer accepted.
+    // A launch the driver refuses to enqueue reports here and nowhere else: the kernel never runs, so the status
+    // array still holds whatever the allocation found — often zero, which is the verdict for an accepted molecule.
     if (cudaGetLastError() != cudaSuccess) return typer_probe_t::launch_failed_k;
 
     custd::span<std::uint8_t const> const device_types = arena.atom_types.view();

@@ -2,17 +2,16 @@
  *  @file src/smallfield/cuda/etk_kernel.cuh
  *  @brief Atom-centric ETK torsion energy and gradient for warp-level L-BFGS.
  *
- *  Implements CSD-derived torsion Fourier potentials for ETKDG stage 7.
+ *  CSD-derived torsion Fourier potentials for ETKDG stage 7:
  *
  *  @verbatim
  *  E_torsion    = Σ_k Σ_n V_n * cos(n * φ_k), for n = 1..6
  *  E_constraint = Σ_c w_c * max(0, d_c - u_c)^2 + w_c * max(0, l_c - d_c)^2
  *  @endverbatim
  *
- *  Architecture: atom-centric with `__sincosf` + Chebyshev recurrence. Each thread owns ceil(N/32)
- *  atoms, iterates all torsions/constraints, accumulates gradient in registers. No atomicAdd.
- *
- *  Positions layout (SoA): [x₀..xₙ, y₀..yₙ, z₀..zₙ] (3D only).
+ *  Atom-centric with `__sincosf` and a Chebyshev recurrence: each thread owns ceil(N/32) atoms, walks every
+ *  torsion and constraint, and accumulates gradient in registers, so no `atomicAdd`. Positions are SoA,
+ *  [x₀..xₙ, y₀..yₙ, z₀..zₙ], 3D only.
  */
 
 #pragma once
@@ -36,9 +35,8 @@ using smallfield::types::etk_torsion_k;
 /**
  *  @brief Compute torsion energy and per-atom gradient using the Wilson B-matrix approach.
  *
- *  Uses `__sincosf` + Chebyshev recurrence for the 6-term Fourier series. Accumulates gradient for the
- *  specified @p atom_role (first through fourth) into the provided @p grad_x / @p grad_y / @p grad_z
- *  accumulators.
+ *  A Chebyshev recurrence drives the 6-term Fourier series, and @p atom_role's share of it lands in
+ *  @p gradient.
  *
  *  @param[in] positions SoA coordinate array [x0..xN, y0..yN, z0..zN].
  *  @param[in] num_atoms Number of atoms in the molecule.
@@ -55,8 +53,7 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
     std::uint8_t const atom_k = torsion.atom_indices[2];
     std::uint8_t const atom_l = torsion.atom_indices[3];
 
-    // Bond vectors of the i-j-k-l chain. The second half-plane is spanned by (j-k) and (l-k),
-    // and (j-k) is the negation of `bond_vec_1`, so these three cover both planes.
+    // Bond vectors of the i-j-k-l chain; (j-k) negates `bond_vec_1`, so these three span both half-planes.
     float3 const bond_vec_0 = sub_float3_(load_position_(positions, num_atoms, atom_i),
                                           load_position_(positions, num_atoms, atom_j));
     float3 const bond_vec_1 = sub_float3_(load_position_(positions, num_atoms, atom_k),
@@ -77,8 +74,7 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
     float const sin_phi_sq = 1.0f - cos_phi * cos_phi;
     float const sin_phi = (sin_phi_sq > 0.0f) ? sqrtf(sin_phi_sq) : 0.0f;
 
-    // Direction of this atom's torsion force, which the Fourier coefficients only rescale.
-    // The four roles' forces still sum to zero by Newton's 3rd law.
+    // Direction of this atom's torsion force, which the coefficients only rescale; the four roles sum to zero.
     float3 lever_0 {0.0f, 0.0f, 0.0f};
     float3 lever_1 {0.0f, 0.0f, 0.0f};
     switch (atom_role) {
@@ -121,9 +117,8 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
         cos_curr = cos_next;
     }
 
-    // sin_term = -energy_gradient_dihedral / sin(φ), needed for the chain rule ∂E/∂r = sin_term * ∂cos(φ)/∂r
-    // at φ = 0 or pi, sin(φ) -> 0 but energy_gradient_dihedral -> 0 too (sin(nφ) = 0 for integer n).
-    // L'Hopital: lim[sin->0] energy_gradient_dihedral/sin(φ) = ∂^2E/∂φ^2 / cos(φ)
+    // sin_term = -energy_gradient_dihedral / sin(φ), for the chain rule ∂E/∂r = sin_term * ∂cos(φ)/∂r. At
+    // φ = 0 or pi both go to zero — sin(nφ) = 0 for integer n — and L'Hopital gives ∂^2E/∂φ^2 / cos(φ).
     float const sin_term = (fabsf(sin_phi) > torsion_planarity_threshold_k)
                                ? (-energy_gradient_dihedral / sin_phi)
                                : (-energy_second_gradient_dihedral / copysignf(fmaxf(fabsf(cos_phi), 1e-10f), cos_phi));
@@ -135,9 +130,8 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
 /**
  *  @brief Atom-centric ETK torsion energy and gradient, in the shape `fire_minimize_` calls.
  *
- *  Each lane owns atoms and walks its own interaction list, so no `atomicAdd` is needed. The terms and
- *  the molecule are members and the geometry arrives per call, which is the split that lets one functor
- *  serve every iteration of a stage.
+ *  Each lane owns atoms and walks its own interaction list, so no `atomicAdd` is needed. Terms and molecule
+ *  are members while geometry arrives per call, the split that lets one functor serve a whole stage.
  *
  *  @param[in] positions SoA coordinate array [x0..xN, y0..yN, z0..zN].
  *  @param[out] gradient Output gradient array, same layout as positions.

@@ -1,8 +1,6 @@
 /**
  *  @file src/smallfield/cuda/dg_kernel.cuh
- *  @brief Atom-centric distance geometry energy and gradient for warp-level L-BFGS.
- *
- *  Implements the DG violation energy used in ETKDG stages 4 and 6.
+ *  @brief Atom-centric distance geometry energy and gradient for warp-level L-BFGS, ETKDG stages 4 and 6.
  *
  *  @verbatim
  *  E_total    = E_distance + E_chiral + E_4th_dim
@@ -11,14 +9,11 @@
  *  E_4th_dim  = w_4 * Σ_i x_i4^2
  *  @endverbatim
  *
- *  Architecture: atom-centric. Each thread owns ceil(N/32) atoms and accumulates their gradients in
- *  registers. The partner atom of the inner loop is warp-uniform, so its coordinates come from a
- *  broadcast read of the shared-memory position array. No atomicAdd. No pair index scan.
- *
- *  Bounds matrix is int8-quantized with a per-molecule (min, inv_scale) pair (floats broadcast in
- *  registers). Storage per pair is 1 byte — half the `__half` layout — and at N=128 the shared
- *  footprint drops from 32 KB to 16 KB. Dequantize at read site with a single FMA:
- *  `bound = q * inv_scale + mol_min`.
+ *  Atom-centric: each thread owns ceil(N/32) atoms and accumulates their gradients in registers, and the inner
+ *  loop's partner atom is warp-uniform, so its coordinates come from a broadcast read of the shared-memory
+ *  position array. No atomicAdd, no pair index scan. The bounds matrix is int8-quantized with a per-molecule
+ *  min and inv_scale broadcast in registers: one byte per pair, half what `__half` costs, dequantized at the
+ *  read site by a single FMA, `bound = q * inv_scale + mol_min`.
  */
 
 #pragma once
@@ -39,13 +34,8 @@ using smallfield::types::chiral_center_descriptor_t;
  *  V = (r_b - r_a) · ((r_c - r_a) × (r_d - r_a)). Uses only xyz and ignores the 4th dimension. Positions
  *  are in SoA layout: @p positions[dimension * num_atoms + atom].
  *
- *  @param[in] positions SoA coordinate array.
- *  @param[in] num_atoms Number of atoms (stride between dimensions).
+ *  @param[in] num_atoms Stride between coordinate dimensions, which need not be the molecule's own count.
  *  @param[in] atom_a Pivot atom index — the point the three edges are measured from.
- *  @param[in] atom_b First neighbor atom index.
- *  @param[in] atom_c Second neighbor atom index.
- *  @param[in] atom_d Third neighbor atom index.
- *  @return Signed tetrahedral volume.
  */
 __device__ __forceinline__ float compute_signed_tetrahedral_volume_(float const *positions, std::uint32_t num_atoms,
                                                                     std::uint8_t atom_a, std::uint8_t atom_b,
@@ -66,19 +56,15 @@ constexpr float chiral_volume_slack_k = 0.8f;
 /**
  *  @brief Count the chiral centers whose geometry contradicts their descriptor.
  *
- *  A center fails on either of two grounds: the signed volume is handed the wrong way, or its
- *  magnitude has collapsed to a fraction of the window's floor — a center flat enough to be read
- *  either way has not proved anything. The handedness comparison is `signbit` against the stored
- *  sign rather than a product against it, which is RDKit #7560: a product says nothing at a
- *  negative zero and underflows to zero for the very magnitudes the test exists to catch.
+ *  A center fails on either of two grounds: the signed volume is handed the wrong way, or its magnitude has
+ *  collapsed to a fraction of the window's floor, since a center flat enough to be read either way has proved
+ *  nothing. Handedness compares `signbit` against the stored sign rather than a product against it — RDKit
+ *  #7560, where a product says nothing at negative zero and underflows for the magnitudes this test catches.
  *
  *  Centers are spread across the warp, so the count is warp-reduced and every lane returns it.
  *
- *  @param[in] positions SoA coordinate array.
- *  @param[in] num_atoms Number of atoms.
- *  @param[in] chiral_centers Array of chiral center descriptors.
- *  @param[in] num_chiral_centers Number of chiral centers.
- *  @param[in] lane Warp lane index (0-31).
+ *  @param[in] num_atoms Stride between coordinate dimensions of @p positions.
+ *  @param[in] lane Warp lane index, 0-31.
  *  @return How many centers failed; zero means the stereochemistry is intact.
  */
 __device__ __forceinline__ std::uint32_t count_invalid_chiral_centers_(float const *positions, std::uint32_t num_atoms,
@@ -102,11 +88,9 @@ __device__ __forceinline__ std::uint32_t count_invalid_chiral_centers_(float con
 
 /** Row stride in bytes for the shared int8 bounds matrix.
  *
- *  The DG inner loop reads `bounds[atom * stride + other]` with `atom` lane-varying and
- *  `other` warp-uniform, so lanes are separated by `stride` bytes. Shared memory banks
- *  are 4-byte words, making the conflict degree `32 / gcd(stride / 4, 32)` — 32-way at an
- *  unpadded N=128. Rounding to a multiple of 4 with an odd quotient forces that gcd to
- *  1 for every N, so all 32 lanes land on distinct banks.
+ *  The DG inner loop reads `bounds[atom * stride + other]` with `atom` lane-varying and `other` warp-uniform,
+ *  so lanes sit `stride` bytes apart; against 4-byte banks the conflict degree is `32 / gcd(stride / 4, 32)`,
+ *  32-way at an unpadded N=128. A multiple of 4 with an odd quotient forces that gcd to 1 for every N.
  */
 constexpr std::uint32_t compute_bounds_row_stride(std::uint32_t num_atoms) {
     std::uint32_t stride = (num_atoms + 3u) & ~3u;
@@ -117,30 +101,25 @@ constexpr std::uint32_t compute_bounds_row_stride(std::uint32_t num_atoms) {
 /**
  *  @brief Atom-centric distance geometry energy and gradient, in the shape `fire_minimize_` calls.
  *
- *  Each lane owns atoms {lane, lane+32, lane+64, ...} and accumulates their gradients in registers.
- *  All-pairs distance violations are computed by walking every other atom in a warp-uniform inner loop,
- *  whose coordinates are read straight out of the positions as a broadcast.
+ *  Each lane owns atoms {lane, lane+32, lane+64, ...} and accumulates their gradients in registers; all-pairs
+ *  distance violations walk every other atom in a warp-uniform inner loop whose coordinates broadcast straight
+ *  out of the positions. Positions and gradients are SoA float [x0..xN, y0..yN, z0..zN, (w0..wN)], with
+ *  `spatial_dimension` 3 or 4.
  *
- *  The bounds matrix is int8 in shared memory, with the per-molecule dequantization pair held in
- *  registers, and positions and gradients are SoA float: [x0..xN, y0..yN, z0..zN, (w0..wN)].
+ *  `bounds_matrix` is int8 in shared memory, upper at [min × stride + max] and lower at [max × stride + min],
+ *  dequantized as `q * inv_scale + mol_min` from the per-molecule floor and range/255 held in registers.
+ *  `bounds_row_stride` pads that row off `num_atoms` so the lane-varying row term misses the bank conflict.
  *
  *  @see fire_minimize_
  */
 struct distance_geometry_energy_functor_t {
-    /** Int8-quantized bounds in shared memory. Upper at [min × stride + max], lower at [max × stride + min];
-     *  dequantize with `q * inv_scale + mol_min`. */
     std::uint8_t const *__restrict__ bounds_matrix;
     chiral_center_descriptor_t const *__restrict__ chiral_centers;
-    /** Per-molecule floor, the dequantization baseline. */
     float mol_min;
-    /** Per-molecule range / 255, the per-step size. */
     float inv_scale;
-    /** Row stride of `bounds_matrix`, padded off `num_atoms` so the lane-varying row term does not
-     *  collide on shared-memory banks. */
     std::uint32_t bounds_row_stride;
     std::uint32_t num_atoms;
     std::uint32_t num_chiral_centers;
-    /** 3 or 4. */
     std::uint32_t spatial_dimension;
     float upper_violation_weight;
     float lower_violation_weight;
@@ -148,9 +127,7 @@ struct distance_geometry_energy_functor_t {
     float fourth_dimension_penalty_weight;
 
     /**
-     *  @param[in] positions SoA coordinate array.
-     *  @param[out] gradient Output gradient array, same layout as positions.
-     *  @param[in] num_elements Total number of coordinate elements.
+     *  @param[out] gradient Output gradient array, same layout as @p positions.
      *  @param[in] lane Warp lane index, 0-31.
      *  @return Total energy, the same value in all lanes after the warp reduction.
      */
@@ -173,13 +150,11 @@ struct distance_geometry_energy_functor_t {
                 coord_a[dimension] = positions[dimension * num_atoms + atom];
             float grad_a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-            // The lane-varying row index of the bounds matrix is fixed for this atom, so its row
-            // base is hoisted; the transposed read keeps `other` in the row term and `atom` in the
-            // column, which is likewise conflict-free because the column varies by one per lane.
+            // The row index is fixed for this atom, so the row base is hoisted; the transposed read keeps
+            // `atom` in the column, conflict-free too because the column varies by one per lane.
             std::uint8_t const *__restrict__ own_bounds_row = bounds_matrix + atom * bounds_row_stride;
 
-            // `other` is warp-uniform, so every `positions[d * num_atoms + other]` is a broadcast
-            // read of one shared-memory word — no per-lane partner registers, no shuffles.
+            // `other` is warp-uniform, so each partner read broadcasts one shared word: no registers, no shuffles.
             for (std::uint32_t other = 0; other < num_atoms; ++other) {
                 if (other == atom) continue;
 
@@ -196,9 +171,8 @@ struct distance_geometry_energy_functor_t {
                 float const inverse_distance = rsqrtf(fmaxf(distance_squared, 1e-12f));
                 float const distance = distance_squared * inverse_distance;
 
-                // Read bounds (int8 → dequantized float via a single FMA per value). The upper
-                // bound lives above the diagonal and the lower bound below, so which of the two
-                // reads is which follows the atom ordering.
+                // Int8 bounds, one FMA each to dequantize; the upper lives above the diagonal and the lower
+                // below, so the atom ordering decides which read is which.
                 bool const atom_first = atom < other;
                 std::uint8_t const own_row_q = own_bounds_row[other];
                 std::uint8_t const other_row_q = bounds_matrix[other * bounds_row_stride + atom];
@@ -232,8 +206,7 @@ struct distance_geometry_energy_functor_t {
                 }
             }
 
-            // chiral volume contributions for this atom; volume and gradient share
-            // the same three edges and the cross(second, third) intermediate.
+            // Chiral volumes for this atom; volume and gradient share the three edges and cross(second, third).
             for (std::uint32_t center_index = 0; center_index < num_chiral_centers; ++center_index) {
                 auto const &center = chiral_centers[center_index];
                 std::uint8_t const chiral_center_atom = center.center_atom;
@@ -253,9 +226,8 @@ struct distance_geometry_energy_functor_t {
                 float const volume = dot_float3_(edge_first, cross_second_third);
 
                 // Signing the floor puts both failure modes on one axis: a wrongly handed volume and a
-                // correctly handed but nearly flat one both land on the far side of it, and the
-                // distance to it is already the derivative the gradient wants. A sign test alone leaves
-                // the second case with no restoring force at all, which is the whole defect.
+                // correctly handed but nearly flat one both land past it, and the distance to it is already
+                // the derivative the gradient wants. A sign test alone leaves the flat case no restoring force.
                 float const signed_minimum = center.target_sign < 0 ? -center.minimum_volume : center.minimum_volume;
                 float const shortfall = volume - signed_minimum;
                 float const excess_volume = (signbit(signed_minimum) != signbit(shortfall)) ? shortfall : 0.0f;
@@ -264,9 +236,8 @@ struct distance_geometry_energy_functor_t {
                 // only one thread per chiral center counts the energy
                 if (atom == chiral_center_atom) total_energy += chiral_volume_weight * excess_volume * excess_volume;
 
-                // V = edge_first · (edge_second × edge_third), so the chain rule gives each of the three
-                // gradients as a cross product of the other two edges, and the pivot takes the negated
-                // sum. cross(edge_second, edge_third) is already in hand.
+                // V = edge_first · (edge_second × edge_third), so the chain rule makes each gradient the cross
+                // of the other two edges and the pivot the negated sum; cross(second, third) is in hand.
                 float const scale = 2.0f * chiral_volume_weight * excess_volume;
                 auto add_scaled_to_grad_a_ = [&](float3 const &delta) {
                     grad_a[0] += scale * delta.x;

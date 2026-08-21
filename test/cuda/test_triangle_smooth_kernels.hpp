@@ -13,16 +13,14 @@
 namespace smallfield::tests {
 
 /**
- *  @brief Atom ceiling of the warp-level kernel: the whole matrix has to fit one shared-memory tile.
- *
- *  128 atoms is 64 KB of dynamic shared memory, which every architecture in `SMALLFIELD_CUDA_ARCH` grants
- *  once the kernel asks for it. The caller skips anything wider rather than watching the launch refuse.
+ *  @brief Atom ceiling of the warp-level kernel: the whole matrix has to fit one shared-memory tile. 128
+ *  atoms is 64 KB of dynamic shared memory, which every architecture in `SMALLFIELD_CUDA_ARCH` grants once
+ *  the kernel asks. The caller skips anything wider rather than watching the launch refuse.
  */
 constexpr std::uint32_t max_smoothed_atoms_k = 128;
 
 /**
  *  @brief Smooth one bounds matrix on the device, entirely in shared memory.
- *
  *  @param[inout] bounds Square bounds matrix over the molecule's atoms, smoothed in place.
  *  @return What the sweep did to the matrix.
  */

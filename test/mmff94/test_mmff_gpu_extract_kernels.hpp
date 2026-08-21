@@ -18,13 +18,10 @@
 
 namespace smallfield::tests {
 
-/**
- *  @brief Which step of the extraction round trip refused, so a caller can say why it compared nothing.
- *
- *  Zero is the typer's own verdict for a molecule it accepted, and no path here writes the status array
- *  before the kernels do, so a caller that reads it after a refusal is told every molecule was typed and
- *  then scores every one of them against the CPU extractor's real answer.
- */
+/** Which step of the extraction round trip refused, so a caller can say why it compared nothing. Zero is the
+ *  typer's own verdict for a molecule it accepted, and no path here writes the status array before the kernels do,
+ *  so a caller reading it after a refusal is told every molecule was typed and scores them all against the CPU
+ *  extractor's real answer. */
 enum class extract_probe_t {
     completed_k,
     table_upload_failed_k,
@@ -36,12 +33,9 @@ enum class extract_probe_t {
 /** The sentence an `extract_probe_t` reads as, for the `NOTE` line above a skipped comparison. */
 std::string_view extract_probe_reason(extract_probe_t outcome) noexcept;
 
-/**
- *  @brief Host mirror of the packed, variable-length MMFF term arrays the compaction pass emits.
- *
- *  Each vector is sized from the batch totals the harness sums out of the per-molecule counts, so the
- *  aggregate size is the real device footprint of a wave rather than the fixed-stride staging footprint.
- */
+/** Host mirror of the packed, variable-length MMFF term arrays the compaction pass emits. Each vector is sized from
+ *  the batch totals the harness sums out of the per-molecule counts, so the aggregate is a wave's real device
+ *  footprint rather than the fixed-stride staging one. */
 struct mmff94_packed_host_result_t {
     std::vector<smallfield::types::mmff94_bond_t> bonds;
     std::vector<smallfield::types::mmff94_angle_t> angles;
@@ -53,28 +47,17 @@ struct mmff94_packed_host_result_t {
     std::vector<smallfield::types::etkdg_molecule_metadata_t> metadata;
 };
 
-/**
- *  @brief Type, extract, build the CSR, and compact one batch on the device, then copy it all back.
- *
- *  Every staging array is fixed-stride, so each output span states the stride by its own extent and no
- *  count travels beside it: `out_bonds` spans `max_mmff_bonds_per_mol_k` slots per descriptor, and
- *  `out_atom_offsets` one slot per atom, which is what carries the batch's atom total.
- *
+/** Type, extract, build the CSR, and compact one batch on the device, then copy it all back. Every staging array is
+ *  fixed-stride, so each output span states the stride by its own extent and no count travels beside it:
+ *  `out_bonds` spans `max_mmff_bonds_per_mol_k` slots per descriptor, `out_atom_offsets` one slot per atom, which
+ *  is what carries the batch's atom total.
  *  @param[in] tables_host MMFF94 parameter tables, uploaded here.
- *  @param[in] descriptors One descriptor per molecule.
  *  @param[in] atom_offsets Each molecule's first atom in the batch-global atom array.
  *  @param[out] out_counts Receives the per-molecule term counts.
  *  @param[out] out_status Receives one typing status per molecule.
- *  @param[out] out_bonds Receives the fixed-stride bond staging.
- *  @param[out] out_angles Receives the fixed-stride angle staging.
- *  @param[out] out_torsions Receives the fixed-stride torsion staging.
- *  @param[out] out_oops Receives the fixed-stride out-of-plane staging.
- *  @param[out] out_stbns Receives the fixed-stride stretch-bend staging.
- *  @param[out] out_interactions Receives the fixed-stride nonbonded staging.
  *  @param[out] out_atom_offsets Receives one CSR offset record per atom of the batch.
  *  @param[out] packed_out Receives the compacted arrays, resized to the totals the counts sum to.
- *  @return Whether the round trip completed, and which step refused it.
- */
+ *  @return Whether the round trip completed, and which step refused it. */
 [[nodiscard]] extract_probe_t launch_mmff94_gpu_extract_pipeline(
     smallfield::parameters::mmff94_tables_host_t const &tables_host,
     custd::span<smallfield::types::molecule_descriptor_t const> descriptors,

@@ -2,21 +2,19 @@
  *  @file test/mmff94/test_mmff_typer.cpp
  *  @brief Cross-validate the native MMFF atom typer against RDKit's `MMFFMolProperties::getMMFFAtomType`.
  *
- *  On drug-like SMILES. The gate counts @b molecules, not atoms: a wrong type is a wrong molecule, and
- *  averaging six bad atoms over the ~889 000 in a 20 000-molecule sweep hides a whole structural class
- *  behind four nines.
- *
+ *  On drug-like SMILES. The gate counts @b molecules, not atoms: a wrong type is a wrong molecule, and averaging
+ *  six bad atoms over the ~889 000 in a 20 000-molecule sweep hides a whole structural class behind four nines.
  *  A third section pins `native_get_mmff_bond_type` against `MMFFMolProperties::getMMFFBondType` on molecules
- *  kekulized with their aromatic flags left standing, which is the only state where the descriptor's two
- *  aromatic bond flags disagree and so the only state that tells the right one from the wrong one.
+ *  kekulized with their aromatic flags left standing, the only state where the descriptor's two aromatic bond
+ *  flags disagree and so the only one that tells the right from the wrong.
  *
  *  The two typers do @b not automatically read the same aromaticity, and this suite runs the sequence the
- *  preprocess-step runs rather than one arranged to agree: the descriptor is built from the parser's
- *  perception, `fill_mmff_perception` then lays MMFF's onto its own fields, and the native typer reads
- *  those. The oracle comes from a second parse of the same SMILES, so `MMFFMolProperties` perceives it
- *  exactly once as it perceives each side once — `MolOps::setMMFFAromaticity` is not idempotent on every
- *  molecule, and perceiving the subject twice would compare two different molecules. Skipping the
- *  perception on the subject entirely is what left a divergence over 9 % of PubChem in the shipped path.
+ *  preprocess step runs rather than one arranged to agree: the descriptor is built from the parser's
+ *  perception, `fill_mmff_perception` lays MMFF's onto its own fields, and the native typer reads those. The
+ *  oracle comes from a second parse of the same SMILES so each side is perceived exactly once —
+ *  `MolOps::setMMFFAromaticity` is not idempotent on every molecule, and perceiving the subject twice would
+ *  compare two different molecules. Skipping it on the subject leaves a divergence over 9 % of PubChem, which
+ *  is what this guards.
  */
 
 #include <cstddef> // `std::size_t`
@@ -55,9 +53,8 @@ static constexpr std::string_view test_name_k = "test_mmff_typer";
 
 namespace smallfield::tests {
 
-/** How many mismatching fields either section prints before the rest are only counted. A cap of three
- *  or ten turned a thirteen-molecule structural class into what read as a single stray molecule, so
- *  the budget is generous; lower it locally when triaging one molecule. */
+/** Mismatching fields a section prints before the rest are only counted. A cap of three or ten made a
+ *  thirteen-molecule structural class read as one stray molecule; lower it locally when triaging. */
 static constexpr std::size_t max_reported_mismatches_k = 64;
 
 /** One reporter per compared section, so each closes with its own `compared=` count. */
@@ -123,9 +120,8 @@ static std::unique_ptr<RDKit::RWMol> parse_for_typing_(std::string const &smiles
 /**
  *  @brief Type one SMILES both ways and fold the outcome into @p tally.
  *
- *  A molecule RDKit itself cannot type is not a disagreement, so it leaves no trace in the tally.
- *  The charge section compares only the atoms whose type already agrees, which is why its `compared=`
- *  count is smaller than the atom section's and cannot be derived from it.
+ *  A molecule RDKit itself cannot type is not a disagreement and leaves no trace in the tally. The charge
+ *  section compares only atoms whose type already agrees, so its `compared=` never follows from the atom one.
  */
 static void test_one_(std::string const &smiles, sfparam::mmff94_tables_view_t const &tables,
                       typer_reporters_t &reporters, native_typing_scratch_t &scratch, typer_tally_t &tally) {
@@ -174,26 +170,20 @@ static void test_one_(std::string const &smiles, sfparam::mmff94_tables_view_t c
 /**
  *  @brief Compare every MMFF bond type on a molecule whose aromatic bonds carry a Kekulé order.
  *
- *  `Kekulize` with `markAtomsBonds` false hands each aromatic bond an integer order and leaves
- *  `getIsAromatic()` set, which is the one state where `bond_flag_aromatic_k` and `mmff_bond_type`
- *  disagree — the flag is set and the type is `mmff_bond_single_k`. RDKit's gate at `AtomTyper.cpp:2470`
- *  is `getBondType() == Bond::SINGLE`, so such a bond is a single bond to RDKit and
- *  `native_get_mmff_bond_type` reproduces that only while it reads the bond type. Reading the plain
- *  aromatic flag instead drops every one of them to type 0, and on this probe set that is three to six
- *  wrong bonds per molecule.
+ *  `Kekulize` with `markAtomsBonds` false gives each aromatic bond an integer order while leaving
+ *  `getIsAromatic()` set -- the one state where `bond_flag_aromatic_k` and `mmff_bond_type` disagree, flag set
+ *  and type `mmff_bond_single_k`. RDKit's gate at `AtomTyper.cpp:2470` is `getBondType() == Bond::SINGLE`, so
+ *  the bond is single to RDKit and `native_get_mmff_bond_type` matches only while it reads the bond type;
+ *  reading the plain aromatic flag drops every one to type 0, three to six wrong bonds per molecule here.
  *
- *  Order of operations is what makes both sides read one molecule. `MMFFMolProperties` types the atoms
- *  and restores aromatic bond @b orders on the rings MMFF accepts, so the Kekulé structure is laid down
- *  after it and the descriptor is built from the result. `getMMFFBondType` stores no bond state and reads
- *  the `Bond` handed to it, so it sees the same kekulized bond the descriptor did.
+ *  Order of operations makes both sides read one molecule: `MMFFMolProperties` types the atoms and restores
+ *  aromatic bond @b orders on the rings MMFF accepts, so the Kekulé structure is laid down after it and the
+ *  descriptor built from the result, while `getMMFFBondType` stores no bond state and reads the `Bond` handed
+ *  to it. RDKit's own atom types feed both sides, leaving the bond gate the only free variable -- the native
+ *  typer would legitimately differ, reading the kekulized molecule where `MMFFMolProperties` typed the aromatic
+ *  one, and that divergence belongs to the `atom_type` section.
  *
- *  RDKit's own atom types feed both sides, which leaves the bond gate as the only free variable. The
- *  native typer would answer differently here, and legitimately: it reads the kekulized molecule while
- *  `MMFFMolProperties` typed the aromatic one, and that divergence belongs to the `atom_type` section.
- *
- *  @param[in] smiles Aromatic SMILES to kekulize.
  *  @param[in] tables MMFF94 parameter tables the native bond typer reads.
- *  @param[inout] reporter Reporter for the `bond_type` section.
  *  @param[inout] scratch Reusable storage for the atom types both sides read.
  *  @return How many bonds reached the descriptor flagged aromatic without an aromatic order.
  */
@@ -251,7 +241,7 @@ int main(int argc, char **argv) {
         "CC(=O)OC1=CC=CC=C1C(=O)O", "CN1C=NC2=C1C(=O)N(C(=O)N2C)C", "CC(C)CC1=CC=C(C=C1)C(C)C(=O)O",
         "CC(=O)NC1=CC=C(O)C=C1", "[NH2+]=C(N)N", "CC(=O)[O-]", "c1cc[nH+]c(c1)", "C1CCOC1", "C1CC1", "c1ccc2[nH]ccc2c1",
         "O=N(=O)c1ccccc1", "CCO", "c1ccsc1",
-        // Regression witnesses, one per way the typer used to read the descriptor wrong.
+        // Regression witnesses, one per way the typer can read the descriptor wrong.
         "CC1=CC=CC=[N+]1[O-]",                                              // aromatic N-oxide: O is 32, not 35
         "CC1=C(C=CN=C1C2=CC(=CC(=C2)Cl)[NH+](O)[O-])CC#N",                  // hydroxylammonium O the typer refused
         "C1=CC=C2C=C(C=CC2=C1)NC3=CC#CC=C3",                                // triple bond inside an aromatic ring
@@ -259,8 +249,8 @@ int main(int argc, char **argv) {
         "CC(C)NC(=O)C1=CC(=C(C=C1)C2=C3C=CC(=O)C=C3OC4=C2C=CC(=C4)O)C(=O)O" // quinoid single bond, fused system
     };
 
-    // A named corpus that does not open is a failure, never an empty run: the ppm gate below is
-    // loosened for external structures, and loosening it while comparing nothing passes everything.
+    // A named corpus that will not open fails: the ppm gate below loosens for external structures, and
+    // loosening it while comparing nothing passes everything.
     std::vector<std::string> external;
     if (corpus.knob == sftest::corpus_knob_t::named_k) {
         auto const outcome = sftest::load_smiles_into(corpus.path, corpus.max_molecules, external);
@@ -277,10 +267,9 @@ int main(int argc, char **argv) {
     for (auto const &smiles : probe) sftest::test_one_(smiles, tables, reporters, scratch, tally);
     for (auto const &smiles : external) sftest::test_one_(smiles, tables, reporters, scratch, tally);
 
-    // Aromatic rings whose bonds are given a Kekulé order while keeping `getIsAromatic()`, the only state
-    // in which the descriptor's two aromatic bond flags disagree. Each carries a ring bond that reaches
-    // `native_get_mmff_bond_type` as `Bond::SINGLE`, and biphenyl adds the inter-ring single bond between
-    // two aromatic carbons, which is where MMFF's bond type 1 actually falls.
+    // Aromatic rings given a Kekulé order while keeping `getIsAromatic()`, the only state where the descriptor's
+    // two aromatic bond flags disagree. Each carries a ring bond reaching `native_get_mmff_bond_type` as
+    // `Bond::SINGLE`; biphenyl adds the inter-ring single bond where MMFF's bond type 1 actually falls.
     std::vector<std::string> const kekule_probe = {"c1ccccc1",   "Cc1ccccc1",           "c1ccc2ccccc2c1", "c1ccncc1",
                                                    "c1cc[nH]c1", "c1ccc(-c2ccccc2)cc1", "c1ccc(cc1)C=O"};
     std::size_t divergent_bonds = 0;
@@ -288,8 +277,7 @@ int main(int argc, char **argv) {
         divergent_bonds += sftest::test_kekulized_bond_types_(smiles, tables, reporters.bond_type, scratch);
     fmt::println("kekule probe: {} molecules, {} bonds aromatic without an aromatic order",
                  fmt::group_digits(kekule_probe.size()), fmt::group_digits(divergent_bonds));
-    // Without one such bond the section compared only bonds the two flags agree on, and the parity it
-    // exists to pin is untested however green it prints.
+    // Without one such bond the section compared only agreeing flags, leaving the parity it pins untested.
     if (divergent_bonds == 0)
         return sftest::report_fail(test_name_k, "the kekule probe built no bond flagged aromatic at a Kekule order");
 
@@ -315,11 +303,10 @@ int main(int argc, char **argv) {
                                              ? 1.0e6 * (double)tally.molecules_mismatched / (double)tally.molecules
                                              : 0.0;
     fmt::println("molecule mismatch: {:.3f} ppm", molecule_mismatch_ppm);
-    // Gate on molecules. The curated probe set carries a witness for every known typing hazard and must be
-    // exact; a corpus that actually loaded gets 100 ppm of slack for structures nobody has triaged yet,
-    // which is still tight enough that a single structural class — the smallest seen was five molecules in
-    // 18 344 — fails it. Keying the slack on whether molecules arrived rather than on `argc` is what stops
-    // a mistyped path from buying the slack while comparing no external molecule at all.
+    // Gate on molecules. The curated probe carries a witness for every known typing hazard and must be exact;
+    // a corpus that actually loaded gets 100 ppm of slack for untriaged structures, still tight enough that
+    // one structural class — the smallest seen was five molecules in 18 344 — fails it. Keying the slack on
+    // molecules arriving rather than on `argc` stops a mistyped path from buying it while comparing nothing.
     double const max_molecule_mismatch_ppm = external.empty() ? 0.0 : 100.0;
     if (molecule_mismatch_ppm > max_molecule_mismatch_ppm)
         return sftest::report_fail(test_name_k, "{} of {} molecules mismatched, {:.3f} ppm > {:.3f} ppm",

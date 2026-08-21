@@ -59,8 +59,8 @@ struct csd_torsion_arena_t {
 void *create_csd_torsion_device_table(std::size_t &table_bytes) {
     auto *table = new csd_torsion_test_table_t;
     sfc::build_csd_torsion_table(table->host);
-    // The harness launches on the legacy default stream, so the upload rides it too and the matcher
-    // is already ordered behind the copies.
+    // The harness launches on the legacy default stream, so the upload rides it and the matcher is already
+    // ordered behind the copies.
     if (sfc::upload_csd_torsion_table_to_device(table->host, table->device, nullptr) ==
         sft::table_residency_t::refused_k) {
         delete table;

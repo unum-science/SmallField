@@ -46,9 +46,9 @@ namespace sftest = smallfield::tests;
  *  @brief Quantize the incoming float bounds into the int8 shared-memory layout the production
  *  `distance_geometry_energy_functor_t` consumes.
  *
- *  The source is packed at `num_atoms`; the destination uses the bank-conflict-free padded stride,
- *  so the flat index is decomposed on the way in — mirroring the production quantization loop in
- *  `etkdg_pipeline_warp_kernel`. Fills in the dequantization pair the functor reads back through.
+ *  The source is packed at `num_atoms` and the destination uses the bank-conflict-free padded stride, so
+ *  the flat index is decomposed on the way in, as the quantization loop in `etkdg_pipeline_warp_kernel`
+ *  does. Fills in the dequantization pair the functor reads back through.
  */
 __device__ __forceinline__ void quantize_bounds_into_shared_(float const *bounds_float, std::uint8_t *shared_bounds,
                                                              std::uint32_t lane, sftest::device_problem_t *problem) {
@@ -155,10 +155,8 @@ template <typename value_type_>
 using device_array = sft::buffer<value_type_, sft::device_allocator_t>;
 
 /**
- *  @brief A non-blocking stream that outlives every buffer allocated against it.
- *
- *  Declared before those buffers so it is destroyed after them: `cudaFreeAsync` against a destroyed stream
- *  is undefined, which is the lifetime rule every stream-ordered resource in the pipeline already follows.
+ *  @brief A non-blocking stream that outlives every buffer allocated against it. Declared before those
+ *  buffers so it is destroyed after them, `cudaFreeAsync` against a destroyed stream being undefined.
  */
 struct owned_stream_t {
     cudaStream_t handle = nullptr;
@@ -180,10 +178,10 @@ struct owned_stream_t {
 /**
  *  @brief Device-side copies of one molecule's inputs, released when the call returns.
  *
- *  Every entry point below stages the same four arrays, so the reservation and the release live here once
- *  rather than being spelled out and paired by hand at each of them. Allocation is stream-ordered:
- *  `cudaMalloc` and `cudaFree` synchronize the whole device, which the pipeline never does and a harness
- *  sharing the box with it should not either.
+ *  Every entry point below stages the same four arrays, so reservation and release live here once rather
+ *  than being paired by hand at each. Allocation is stream-ordered: `cudaMalloc` and `cudaFree` synchronize
+ *  the whole device, which the pipeline never does and a harness sharing the box should not either. `ready`
+ *  says whether every array reached the device; a launch on a half-staged problem would score garbage.
  */
 struct staged_problem_t {
     device_problem_t problem;
@@ -193,7 +191,6 @@ struct staged_problem_t {
     device_array<float> gradient;
     device_array<sft::chiral_center_descriptor_t> chiral_centers;
     std::uint32_t num_elements = 0;
-    /** Whether every array reached the device; a launch on a half-staged problem would score garbage. */
     bool ready = false;
 
     staged_problem_t(dg_problem_t const &host_problem, float const *host_coords)
@@ -256,9 +253,8 @@ dg_probe_t gpu_dg_energy(dg_problem_t const &host_problem, float const *host_coo
 
     dg_energy_eval_kernel<<<1, sfc::warp_size_k, staged.bounds_shared_bytes(), staged.stream.handle>>>(
         staged.problem, staged.bounds.data(), staged.coordinates.data(), staged.gradient.data(), device_energy.data());
-    // A launch the driver refuses to enqueue reports here and nowhere else. The kernel never runs, so the
-    // drain below has nothing to fail on, and the energy and the gradient still hold whatever the
-    // allocation found -- which the caller would otherwise compare and read as a numerical defect.
+    // A refused enqueue reports here and nowhere else: the kernel never runs, the drain has nothing to fail
+    // on, and energy and gradient still hold whatever the allocation found.
     if (cudaGetLastError() != cudaSuccess) return dg_probe_t::launch_failed_k;
 
     bool const copied = sft::download_from(custd::span<float> {out_energy, 1},

@@ -22,25 +22,22 @@ struct shard_data_t {
     std::vector<std::string_view> smiles;
 };
 
-/** Why an input shard was read, or which of five distinguishable refusals stopped it. */
+/** Why an input shard was read, or which of five distinguishable refusals stopped it. `column_not_string_k`
+ *  means the named column exists but is not UTF-8, so its values are not SMILES. */
 enum class input_read_t {
     read_k,
     cannot_open_k,
     not_parquet_k,
     column_missing_k,
     unreadable_table_k,
-    /** The named column exists but is not UTF-8, so its values are not SMILES. */
     column_not_string_k,
 };
 
 /** Sentence fragment naming the refusal, meant to follow the shard's path in a diagnostic. */
 char const *describe_input_read(input_read_t status);
 
-/**
- *  @brief Read @p path 's @p smiles_column into @p out as views over the table it keeps alive.
- *
- *  @p out is cleared first, and a null @p log falls back to a default one.
- */
+/** Read @p path 's @p smiles_column into @p out as views over the table it keeps alive. @p out is cleared
+ *  first, and a null @p log falls back to a default one. */
 [[nodiscard]] input_read_t read_shard(std::filesystem::path const &path, std::string const &smiles_column,
                                       shard_data_t &out, logger_t const *log = nullptr);
 

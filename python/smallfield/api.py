@@ -17,9 +17,8 @@ ConformerBatch = _smallfield.ConformerBatch
 ConformerStatus = _smallfield.ConformerStatus
 supports_cuda = _smallfield.supports_cuda
 
-#: Atom ceiling the warp pipeline supports, and the stride every conformer slot is padded to.
-#: Read from the extension rather than restated, because the two layers disagreeing about it means
-#: the same flat buffer is addressed with two different strides.
+#: Atom ceiling the warp pipeline supports, and the stride every conformer slot is padded to. Read from the extension
+#: rather than restated: the two layers disagreeing means one flat buffer addressed with two different strides.
 MAX_ATOMS_PER_MOLECULE = _smallfield.MAX_ATOMS_PER_MOLECULE
 
 

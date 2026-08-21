@@ -2,11 +2,13 @@
  *  @file src/smallfield/cuda/mmff94_energy_kernel.cuh
  *  @brief MMFF94 energy and gradient functor for ETKDG pipeline stage 9.
  *
- *  Uses per-atom interaction lists for zero-waste iteration. Full analytical gradients for VdW,
- *  electrostatic, bond, angle, torsion, OOP, and stretch-bend terms. Compatible with `fire_minimize_`
- *  (same functor interface).
+ *  Per-atom interaction lists for zero-waste iteration, with full analytical gradients for VdW, electrostatic,
+ *  bond, angle, torsion, OOP and stretch-bend terms. Positions in SoA float [x₀..xₙ, y₀..yₙ, z₀..zₙ], and the
+ *  functor interface is `fire_minimize_`'s.
  *
- *  Positions in SoA float: [x₀..xₙ, y₀..yₙ, z₀..zₙ].
+ *  Every `mmff_*_contribution_` takes the same shape: SoA @p positions with @p num_atoms as the row stride,
+ *  the @p atom this thread accumulates for, that atom's @p role in the term, and the running @p energy —
+ *  credited once per term, by role 0 — and @p gradient.
  */
 
 #pragma once
@@ -56,28 +58,23 @@ constexpr float mmff_radians_to_degrees_k = 180.0f / 3.14159265f;
 /**
  *  Stiffness of the chiral restraint, in kcal/mol per cubic angstrom squared.
  *
- *  It sets the height of the barrier between a stereoisomer and its mirror, since the path between
- *  them passes through a flat center where the penalty is `w * v_min^2` — 2,500 kcal/mol at a
- *  four-coordinate center's 5 cubic angstrom floor. That is far above the deepest descent the polish
- *  measures, so no relaxation buys its way through. It costs nothing anywhere the restraint is not
- *  violated, which is why the number can be this large without distorting geometry.
+ *  It sets the height of the barrier between a stereoisomer and its mirror, since the path between them passes
+ *  through a flat center where the penalty is `w * v_min^2` — 2,500 kcal/mol at a four-coordinate center's 5
+ *  cubic angstrom floor, far above the deepest descent the polish reaches. The bottom is flat, so it costs
+ *  nothing wherever the restraint holds, which is what lets the number be this large without distorting.
  */
 constexpr float mmff_chiral_volume_weight_k = 100.0f;
 
 /**
  *  Fraction of a center's `minimum_volume` the center-based volume is held to.
  *
- *  The two volumes a center carries are not the same size, so `minimum_volume` cannot serve both.
- *  Over 7,649 declared centers of one Enamine REAL shard the center-based magnitude has a median of
- *  2.57 cubic angstrom against the pivot-based 8.38, because the center sits inside the tetrahedron
- *  its neighbors span rather than at one of its corners; the unscaled floor would sit above the 37th
- *  percentile of that distribution and bend a third of the corpus to reach it.
- *
- *  At 0.3 the floor is 1.5 cubic angstrom on a four-coordinate center, which is the measured 0.5th
- *  percentile — the bottom is flat for 99.5 % of the centers that already ship, and 1.5 is thirty
- *  times the volume the half-precision coordinate quantum is worth for the rest. A three-coordinate
- *  center is its own fourth neighbor, so its two volumes are one expression and this floor sits below
- *  the one already holding it, contributing nothing.
+ *  The two volumes a center carries are not the same size, so `minimum_volume` cannot serve both: the center
+ *  sits inside the tetrahedron its neighbors span rather than at a corner, so its volume runs several times
+ *  smaller — a median 2.57 cubic angstrom against the pivot-based 8.38. The unscaled floor sits above the
+ *  37th percentile of that distribution and would bend a third of the corpus to reach it. The fraction measures
+ *  that distribution rather than converting between the two — `BENCH.md`, _A Centre Carries Two Signed
+ *  Volumes_, carries the percentiles it was read off. A three-coordinate center is its own fourth neighbor, so
+ *  its two volumes are one expression and this floor sits below the one already holding it, contributing none.
  */
 constexpr float mmff_center_volume_fraction_k = 0.3f;
 
@@ -96,13 +93,11 @@ __device__ __forceinline__ mmff94_atom_vdw_folded_t fold_atom_vdw_params_(mmff94
 /**
  *  @brief Compute one nonbonded pair's (VdW + electrostatic) energy and the force it exerts.
  *
- *  Inlines Halgren's R* combining rule (with the donor-suppression clause) and
- *  Slater-Kirkwood's epsilon combining rule, then applies donor-acceptor
- *  scaling, reproducing RDKit's `calcUnscaledVdWMinimum` + `calcUnscaledVdWWellDepth`
- *  + `scaleVdWParams` in registers.
+ *  Inlines Halgren's R* combining rule with its donor-suppression clause and Slater-Kirkwood's epsilon rule,
+ *  then donor-acceptor scaling: RDKit's `calcUnscaledVdWMinimum`, `calcUnscaledVdWWellDepth` and
+ *  `scaleVdWParams` in registers.
  *
- *  @param[in] positions SoA coordinate array [x0..xN, y0..yN, z0..zN].
- *  @param[in] num_atoms Number of atoms in the molecule.
+ *  @param[in] positions SoA coordinate array [x0..xN, y0..yN, z0..zN]; @p num_atoms is its row stride.
  *  @param[in] atom Index of the atom this thread is accumulating for.
  *  @param[in] other Other atom participating in the pair.
  *  @param[in] p_atom Folded per-atom VdW factors for @p atom.
@@ -190,13 +185,7 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(float const *positi
 /**
  *  @brief Compute bond stretching energy and gradient for one atom.
  *
- *  @param[in] positions SoA coordinate array [x0..xN, y0..yN, z0..zN].
- *  @param[in] num_atoms Number of atoms in the molecule.
- *  @param[in] atom Index of the atom this thread is accumulating for.
- *  @param[in] bond Bond stretching descriptor with force constant and equilibrium distance.
- *  @param[in] role This atom's role in the bond (atom_role_first_k, atom_role_second_k).
- *  @param[inout] energy Accumulated energy (incremented when @p role is 0).
- *  @param[inout] gradient Accumulated gradient for @p atom.
+ *  @p bond carries the force constant and equilibrium distance; @p role is first or second.
  */
 __device__ __forceinline__ void mmff_bond_contribution_(float const *positions, std::uint32_t num_atoms,
                                                         std::uint32_t atom, mmff94_bond_t const &bond, atom_role_t role,
@@ -225,13 +214,7 @@ __device__ __forceinline__ void mmff_bond_contribution_(float const *positions, 
 /**
  *  @brief Compute angle bending energy and gradient for one atom.
  *
- *  @param[in] positions SoA coordinate array [x0..xN, y0..yN, z0..zN].
- *  @param[in] num_atoms Number of atoms in the molecule.
- *  @param[in] atom Index of the atom this thread is accumulating for.
- *  @param[in] angle Angle bending descriptor with force constant and equilibrium angle.
- *  @param[in] role This atom's role in the angle (first atom, second atom (center), third atom).
- *  @param[inout] energy Accumulated energy (incremented when @p role is 0).
- *  @param[inout] gradient Accumulated gradient for @p atom.
+ *  @p angle carries the force constant and equilibrium angle; @p role is first, second for the center, third.
  */
 __device__ __forceinline__ void mmff_angle_contribution_(float const *positions, std::uint32_t num_atoms,
                                                          std::uint32_t atom, mmff94_angle_t const &angle,
@@ -256,16 +239,10 @@ __device__ __forceinline__ void mmff_angle_contribution_(float const *positions,
 
     float factor;
     if (angle.is_linear) {
-        // Linear centers — alkyne carbon, nitrile nitrogen, allene, CO₂ — use
-        //
-        // E = 143.9325 * ka * (1 + cos θ)
-        //
-        // The quadratic form over-stiffens badly here: at θ₀ = 180° and a 60° deviation it returns
-        // roughly 1.5× the correct energy,
-        //
-        // ∂E/∂θ = -143.9325 * ka * sin θ
-        //
-        // and the −1/sinθ chain rule below cancels the sine exactly, so the factor is constant in θ.
+        // Linear centers — alkyne carbon, nitrile nitrogen, allene, CO₂ — use E = 143.9325 * ka * (1 + cos θ),
+        // because the quadratic form over-stiffens badly here: at θ₀ = 180° and a 60° deviation it returns
+        // roughly 1.5× the correct energy. Then ∂E/∂θ = -143.9325 * ka * sin θ, and the −1/sinθ chain rule
+        // below cancels the sine exactly, so the factor is constant in θ.
         if (role == atom_role_first_k)
             *energy += mmff_linear_bend_prefactor_k * angle.force_constant * (1.0f + cos_theta);
         factor = mmff_linear_bend_prefactor_k * angle.force_constant;
@@ -278,9 +255,7 @@ __device__ __forceinline__ void mmff_angle_contribution_(float const *positions,
             *energy += 0.5f * mmff_angle_prefactor_k * angle.force_constant * dtheta_deg * dtheta_deg *
                        (1.0f + mmff_angle_cubic_bend_k * dtheta_deg);
 
-        // ∂E/∂r_i = ∂E/∂θ * ∂cosθ/∂r_i * (-1/sinθ)
-        //
-        // rad2deg converts the derivative to work with the −1/sinθ chain rule.
+        // ∂E/∂r_i = ∂E/∂θ * ∂cosθ/∂r_i * (-1/sinθ), with rad2deg putting the derivative in the chain rule's units.
         float const energy_gradient_angle = mmff_radians_to_degrees_k * mmff_angle_prefactor_k * angle.force_constant *
                                             dtheta_deg * (1.0f + 1.5f * mmff_angle_cubic_bend_k * dtheta_deg);
         factor = energy_gradient_angle * (-(1.0f / (sin_theta)));
@@ -304,15 +279,9 @@ __device__ __forceinline__ void mmff_angle_contribution_(float const *positions,
 }
 
 /**
- *  @brief Compute torsion energy and gradient for one atom (Wilson B-matrix).
+ *  @brief Compute torsion energy and gradient for one atom, by the Wilson B-matrix.
  *
- *  @param[in] positions SoA coordinate array [x0..xN, y0..yN, z0..zN].
- *  @param[in] num_atoms Number of atoms in the molecule.
- *  @param[in] atom Index of the atom this thread is accumulating for.
- *  @param[in] tor Torsion descriptor with barrier heights V1, V2, V3.
- *  @param[in] role This atom's role in the torsion (first through fourth in atom-list order).
- *  @param[inout] energy Accumulated energy (incremented when @p role is 0).
- *  @param[inout] gradient Accumulated gradient for @p atom.
+ *  @p tor carries the barrier heights V1, V2 and V3; @p role is first through fourth in atom-list order.
  */
 __device__ __forceinline__ void mmff_torsion_contribution_(float const *positions, std::uint32_t num_atoms,
                                                            std::uint32_t atom, mmff94_torsion_t const &tor,
@@ -349,8 +318,7 @@ __device__ __forceinline__ void mmff_torsion_contribution_(float const *position
                               tor.torsion_v3 * (1.0f + cos_3phi));
 
     // Both normals collapsing leaves the torsion undefined rather than planar, and an undefined torsion
-    // owes neither energy nor force. Accumulating the energy above this — which it did — meant a collapsed
-    // term still moved the total while contributing nothing to the gradient that would relax it.
+    // owes neither energy nor force — hence the return above the energy accumulation rather than below.
     if (fabsf(cos_phi) < 1e-8f && fabsf(sin_phi) < 1e-8f) return;
 
     if (role == atom_role_first_k) *energy += tor_energy;
@@ -362,16 +330,12 @@ __device__ __forceinline__ void mmff_torsion_contribution_(float const *position
                                            (-tor.torsion_v1 * sin_phi + 2.0f * tor.torsion_v2 * sin_2phi -
                                             3.0f * tor.torsion_v3 * sin_3phi);
 
-    // The chain rule wants -(∂E/∂φ)/sin(φ), and at φ = 0 or pi both go to zero together because every
-    // sin(nφ) does. L'Hopital gives the finite limit -(∂²E/∂φ²)/cos(φ), where
-    // ∂²E/∂φ² = 0.5 · (-V1·cos(φ) + 4V2·cos(2φ) - 9V3·cos(3φ)). Dividing the first derivative by cos(φ)
-    // there instead — which this did — evaluates to zero, so a planar torsion carried its energy with no
-    // force at all and could never restore a planarity it had lost. `copysignf` keeps the denominator's
-    // sign. Planarity leaves that limit in closed form rather than as a division: `sin φ` this small puts
-    // `cos φ` at ±1, so `cos 2φ` is 1 and `cos 3φ` shares `cos φ`'s sign, and the whole quotient collapses
-    // to one expression in the three barrier heights. Writing it out keeps the second derivative from
-    // ever existing — computed beside the first it costs eight registers on sm_120, where the polish
-    // kernel has none to give, and four even when confined to this branch.
+    // The chain rule wants -(∂E/∂φ)/sin(φ), and at φ = 0 or pi both go to zero because every sin(nφ) does.
+    // L'Hopital gives the finite limit -(∂²E/∂φ²)/cos(φ), with
+    // ∂²E/∂φ² = 0.5 · (-V1·cos(φ) + 4V2·cos(2φ) - 9V3·cos(3φ)). A `sin φ` this small puts `cos φ` at ±1, so
+    // `cos 2φ` is 1, `cos 3φ` shares `cos φ`'s sign, and the quotient collapses to the closed form below.
+    // Writing it out keeps the second derivative from ever existing: beside the first it costs eight registers
+    // on sm_120, where the polish kernel has none to give, and four even confined to this branch.
     float const planar_sign = copysignf(1.0f, cos_phi);
     float const sin_term = (fabsf(sin_phi) > torsion_planarity_threshold_k)
                                ? (-energy_gradient_dihedral / sin_phi)
@@ -383,8 +347,7 @@ __device__ __forceinline__ void mmff_torsion_contribution_(float const *position
     float3 const cos_grad_1 = scale_float3_(sub_float3_(normal_0, scale_float3_(normal_1, cos_phi)),
                                             inverse_normal_length_1);
 
-    // Wilson B-matrix chain rule for the atom at @p role; identical algebraic
-    // structure to compute_torsion_contribution_ in etk_kernel.cuh.
+    // Wilson B-matrix chain rule for @p role; same algebraic structure as `compute_torsion_contribution_`.
     float3 force {0.0f, 0.0f, 0.0f};
     switch (role) {
     case atom_role_first_k: force = cross_float3_(bond_vec_1, cos_grad_0); break;
@@ -405,16 +368,9 @@ __device__ __forceinline__ void mmff_torsion_contribution_(float const *position
 /**
  *  @brief OOP bending energy and gradient for one atom.
  *
- *  Energy and gradient share sin_chi / inverse-length intermediates — both
- *  paths run together and the energy increment is gated on the @p role.
- *
- *  @param[in] positions SoA coordinate array [x0..xN, y0..yN, z0..zN].
- *  @param[in] num_atoms Number of atoms in the molecule.
- *  @param[in] atom Index of the atom this thread is accumulating for (unused in body).
- *  @param[in] oop OOP bending descriptor with atom indices and force constant.
- *  @param[in] role This atom's role (first=out-of-plane, second=center, third/fourth=in-plane).
- *  @param[inout] energy Accumulated energy (incremented when @p role is 0).
- *  @param[inout] gradient Accumulated gradient for @p atom.
+ *  Energy and gradient share the sin_chi and inverse-length intermediates, so both run together with the
+ *  energy increment gated on @p role. @p oop carries the atom indices and force constant, and @p role is
+ *  first for out-of-plane, second for the center, third and fourth in-plane.
  */
 __device__ __forceinline__ void mmff_oop_contribution_(float const *positions, std::uint32_t num_atoms,
                                                        std::uint32_t /*atom*/, mmff94_oop_t const &oop,
@@ -470,13 +426,8 @@ __device__ __forceinline__ void mmff_oop_contribution_(float const *positions, s
 /**
  *  @brief Stretch-bend coupling energy and gradient for one atom.
  *
- *  @param[in] positions SoA coordinate array [x0..xN, y0..yN, z0..zN].
- *  @param[in] num_atoms Number of atoms in the molecule.
- *  @param[in] atom Index of the atom this thread is accumulating for.
- *  @param[in] sb Stretch-bend descriptor with coupling constants and equilibrium geometry.
- *  @param[in] role This atom's role (first atom end, second atom (center), third atom end).
- *  @param[inout] energy Accumulated energy (incremented when @p role is 0).
- *  @param[inout] gradient Accumulated gradient for @p atom.
+ *  @p sb carries the coupling constants and equilibrium geometry; @p role is first end, second for the
+ *  center, third end.
  */
 __device__ __forceinline__ void mmff_stretchbend_contribution_(float const *positions, std::uint32_t num_atoms,
                                                                std::uint32_t atom, mmff94_stretchbend_t const &sb,
@@ -542,18 +493,7 @@ __device__ __forceinline__ void mmff_stretchbend_contribution_(float const *posi
  *  @brief One declared chiral center's restraint contribution to @p atom, added to the MMFF94 terms.
  *
  *  Published MMFF94 has no chiral term, so its energy is blind to which of two mirror images it is
- *  scoring and the minimizer is free to descend into the reflected one. The restraint is what makes
- *  the declared handedness cost something.
- *
- *  A center carries two signed volumes over the same three neighbors, distinguished by the point the
- *  three edges are measured from, and two different stages read them. The pivot-based one is
- *  `DistGeom::ChiralSet`'s and is what the embedding and `count_invalid_chiral_centers_` hold; the
- *  center-based one is what RDKit's `assignChiralTypesFrom3D` will read back off the shipped
- *  coordinates, and is therefore the one that decides what the corpus is perceived to contain.
- *  Both are restrained, because holding only one is what the two stages disagreeing costs: the
- *  pivot-based term applies no force to the center atom at all, so a minimizer under it alone walks
- *  the center through its neighbors' plane and inverts the perceived handedness while satisfying
- *  every constraint it was given.
+ *  scoring. The restraint is what makes the declared handedness cost something.
  *
  *  @verbatim
  *  N         = (r_1 - r_0) x (r_2 - r_0),  r_i = neighbor_atoms[i], c = center_atom
@@ -562,21 +502,19 @@ __device__ __forceinline__ void mmff_stretchbend_contribution_(float const *posi
  *  E_chiral  = w * (V_pivot - s * v_min)^2 + w * (V_center - s * f * v_min)^2
  *  @endverbatim
  *
- *  The signed volume over a fixed base triangle is affine in its apex, so the two share one normal
- *  and each term's gradient with respect to its own apex is that normal negated — which is how the
- *  center atom acquires a force at all. Each of the three neighbors takes both terms' cross products.
+ *  Both volumes are restrained because two stages read different ones: the embedding and
+ *  `count_invalid_chiral_centers_` hold the pivot-based `DistGeom::ChiralSet` expression, RDKit's
+ *  `assignChiralTypesFrom3D` the center-based one off the shipped coordinates. The pivot term puts no force on
+ *  the center atom, so under it alone a minimizer satisfies every constraint given and still walks the center
+ *  through its neighbors' plane, inverting the perceived handedness.
  *
- *  Signing the floor puts both failures on one axis: an inverted center and a correctly handed but
- *  nearly flat one both land past it, and the distance to it is already the derivative. The pivot
- *  floor is `minimum_volume` unslacked while `count_invalid_chiral_centers_` calls a center flat below
- *  `chiral_volume_slack_k` of it, so the restraint pushes to the far side of the verdict rather than
- *  to its boundary; the center floor is `mmff_center_volume_fraction_k` of it, which is a measurement
- *  rather than a conversion. Both are flat-bottomed, so a center already handed correctly and far
- *  enough from planar contributes no energy and no force, and the geometry MMFF94 would have reached
- *  is unchanged.
+ *  Both floors are signed, putting an inverted center and a correctly handed but nearly flat one on one axis
+ *  whose distance is already the derivative, and both are flat-bottomed, so a correctly handed center far
+ *  enough from planar leaves the geometry MMFF94 would have reached untouched. The pivot floor is
+ *  `minimum_volume` unslacked where `count_invalid_chiral_centers_` calls a center flat below
+ *  `chiral_volume_slack_k` of it, so the restraint pushes past the verdict rather than to it.
  *
- *  @param[in] positions SoA coordinate array.
- *  @param[in] num_atoms Number of atoms, the stride between dimensions.
+ *  @param[in] positions SoA coordinate array; @p num_atoms is the stride between its dimensions.
  *  @param[in] atom The atom whose energy share and gradient this call accumulates.
  *  @param[in] center The declared center.
  *  @param[inout] energy Running energy, credited once per center by its central atom.
@@ -620,9 +558,8 @@ __device__ __forceinline__ void mmff_chiral_contribution_(float const *positions
     float const pivot_scale = 2.0f * mmff_chiral_volume_weight_k * pivot_shortfall;
     float const center_scale = 2.0f * mmff_chiral_volume_weight_k * center_shortfall;
 
-    // An apex takes the normal negated. A three-coordinate center is stored as its own pivot, so it is
-    // the apex of both terms at once and collects both; its two volumes are then one expression, and
-    // the smaller of the two floors can never be the binding one.
+    // An apex takes the normal negated. A three-coordinate center is stored as its own pivot, so it is the
+    // apex of both terms and collects both; its two volumes are one expression and the smaller floor never binds.
     float3 delta {0.0f, 0.0f, 0.0f};
     if (on_pivot) delta = scale_float3_(normal, -pivot_scale);
     if (scores) delta = add_float3_(delta, scale_float3_(normal, -center_scale));
@@ -647,9 +584,10 @@ __device__ __forceinline__ void mmff_chiral_contribution_(float const *positions
 /**
  *  @brief MMFF94 energy and gradient over per-atom interaction lists, in the shape `fire_minimize_` calls.
  *
- *  Bonded terms iterate the pre-built per-atom CSR (`interactions[]` / `atom_offsets[]`) first, then
- *  nonbonded pairs are enumerated on the fly from the `bond_distance` matrix, once per pair, with
- *  their parameters combined in registers. The order is what keeps the bonded write a plain store.
+ *  Bonded terms iterate the pre-built per-atom CSR (`interactions[]` / `atom_offsets[]`) first, then nonbonded
+ *  pairs are enumerated on the fly from the `bond_distance` matrix, once per pair, with their parameters
+ *  combined in registers; that order is what keeps the bonded write a plain store. `chiral_centers` may be null
+ *  exactly when `num_chiral_centers` is zero.
  *
  *  @see fire_minimize_
  */
@@ -664,7 +602,6 @@ struct mmff94_energy_functor_t {
     mmff94_stretchbend_t const *__restrict__ stretchbend_params;
     mmff94_atom_interaction_t const *__restrict__ interactions;
     mmff94_atom_offsets_t const *__restrict__ atom_offsets;
-    /** Declared centers of this molecule; may be null exactly when `num_chiral_centers` is zero. */
     chiral_center_descriptor_t const *__restrict__ chiral_centers;
     std::uint32_t num_atoms;
     std::uint32_t num_chiral_centers;
@@ -677,9 +614,8 @@ struct mmff94_energy_functor_t {
 
         float total_energy = 0.0f;
 
-        // Bonded terms walk the per-atom CSR, one lane per atom, so each writes only the three words its
-        // own atom owns and reads none another lane owns. Running them before the pair sweep is what
-        // keeps that write a plain store: the pair sweep below is the only pass that reaches a partner.
+        // Bonded terms walk the per-atom CSR, one lane per atom, writing only the three words its own atom
+        // owns; the pair sweep below is the only pass that reaches a partner, so this write stays a plain store.
         for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k) {
             float3 gradient_acc {0.0f, 0.0f, 0.0f};
             auto const &offsets = atom_offsets[atom];
@@ -708,10 +644,9 @@ struct mmff94_energy_functor_t {
                                                stretchbend_params[interactions[index].term_index],
                                                interactions[index].role, &total_energy, &gradient_acc);
 
-            // The restraint rides this sweep rather than a pass of its own: the atom's gradient is
-            // already accumulating in a register and the store below is still a plain one into the
-            // slot this lane owns, so the four atoms a center moves need no barrier and no atomic
-            // between them. A separate sweep was measured and costs `sm_100` one more register.
+            // The restraint rides this sweep rather than a pass of its own: the gradient is already
+            // accumulating in a register and the store below is still plain, into the slot this lane owns, so
+            // the four atoms a center moves need no barrier and no atomic. Its own sweep costs `sm_100` one more.
             for (std::uint32_t center = 0; center < num_chiral_centers; ++center)
                 mmff_chiral_contribution_(positions, num_atoms, atom, chiral_centers[center], &total_energy,
                                           &gradient_acc);
@@ -720,29 +655,23 @@ struct mmff94_energy_functor_t {
         }
         __syncwarp(full_mask_k);
 
-        // Nonbonded pairs, enumerated from bond_distance, which a warp BFS over the undirected bond
-        // graph fills (cuda/bond_distance_kernel.cuh) — so it is symmetric and one endpoint's read
-        // answers for both. Walking `other = (atom + offset) mod num_atoms` over the first half of the
-        // ring visits every pair exactly once with all 32 lanes productive, where an `other > atom`
-        // test would leave half the warp's issue slots idle on a warp-uniform predicate.
-        //
-        // The partner's share of the force is the exact negation of this atom's, so one evaluation
-        // delivers both. At a fixed offset the 32 lanes address 32 distinct atoms, whatever the atom
-        // count, so writing the partner's share into the shared gradient needs no atomic.
+        // Nonbonded pairs are enumerated from `bond_distance`, which a warp BFS over the undirected bond graph
+        // fills (cuda/bond_distance_kernel.cuh), so it is symmetric and one endpoint's read answers for both.
+        // Walking `other = (atom + offset) mod num_atoms` over the first half of the ring visits every pair
+        // exactly once with all 32 lanes productive, where an `other > atom` test would idle half the warp's
+        // issue slots on a warp-uniform predicate. The partner's share of the force is the exact negation of
+        // this atom's, so one evaluation delivers both, and at a fixed offset the 32 lanes address 32 distinct
+        // atoms whatever the atom count, so writing the partner's share needs no atomic.
         std::uint32_t const half_shell = num_atoms / 2;
         // An even atom count makes the last offset its own mirror, since atom and atom + N/2 reach each
         // other from both ends, so only the lower half of the ring speaks for that offset.
         bool const middle_offset_is_mirrored = (num_atoms % 2u) == 0u;
 
-        // The partner write below lands in a slot another lane owns, so the "32 distinct atoms" argument
-        // above holds only while every lane is on the same `offset`. Nothing enforced that: the outer
-        // bound is not a multiple of the warp, and both tests inside were `continue`s, so lanes reached
-        // different offsets and two of them could target one atom — lane 2 at offset 5 and lane 0 at
-        // offset 7 both address atom 7. Independent thread scheduling promises no reconvergence, and
-        // `compute-sanitizer --tool racecheck` reported the collision on every production entry point.
-        //
-        // Both trip counts are warp-uniform now and the tests are predicates, so all 32 lanes reach the
-        // barrier that separates one offset's partner writes from the next offset's reads.
+        // The partner write below lands in a slot another lane owns, so the "32 distinct atoms" argument holds
+        // only while every lane is on the same `offset`. Both trip counts are warp-uniform and every test
+        // inside is a predicate, not a `continue`: lanes at different offsets can target one atom — lane 2 at
+        // offset 5 and lane 0 at offset 7 both address atom 7 — and independent thread scheduling promises no
+        // reconvergence. As written all 32 lanes reach the barrier between one offset's writes and the next's.
         for (std::uint32_t base = 0; base < num_atoms; base += warp_size_k) {
             std::uint32_t const atom = base + lane;
             bool const owns_atom = atom < num_atoms;
@@ -771,9 +700,8 @@ struct mmff94_energy_functor_t {
                 __syncwarp(full_mask_k);
             }
             if (owns_atom) accumulate_gradient_into_(gradient, num_atoms, atom, own_force);
-            // This write is to the lane's own atom, but the next outer iteration's partner writes are
-            // not, and one of them can target exactly this slot. The inner barrier does not cover the
-            // gap between the two loops, so it is closed here.
+            // This write is to the lane's own atom, but the next outer iteration's partner writes are not and
+            // one can target exactly this slot; the inner barrier does not cover the gap between the loops.
             __syncwarp(full_mask_k);
         }
 

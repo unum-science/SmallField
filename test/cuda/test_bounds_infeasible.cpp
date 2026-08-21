@@ -2,19 +2,16 @@
  *  @file test/cuda/test_bounds_infeasible.cpp
  *  @brief Test that a bounds matrix no coordinates satisfy comes back as `bounds_infeasible_k`.
  *
- *  The metric prepass is the only stage that can tell an impossible bounds matrix from a hard one, and its
- *  verdict travels two launches before it becomes the status a shard carries. This walks that whole route:
- *  hand-built matrices whose feasibility is known by construction go through the production prepass driver,
- *  the production pipeline kernel and the stamp behind it, and each one's conformer slot has to name what
- *  its matrix was.
- *
- *  Each fixture is checked twice over — the status it lands on, and whether the smoothed matrix the prepass
- *  persisted actually holds a crossed pair — because a status that agrees while the matrix does not is a
+ *  The metric prepass is the only stage that tells an impossible bounds matrix from a hard one, and its
+ *  verdict travels two launches before becoming the status a shard carries. This walks that whole route:
+ *  hand-built matrices of known feasibility go through the production prepass driver, the production
+ *  pipeline kernel and the stamp behind it, and each conformer slot must name what its matrix was. Every
+ *  fixture is checked twice -- the status it lands on, and whether the smoothed matrix the prepass
+ *  persisted really holds a crossed pair -- because a status agreeing while the matrix does not is a
  *  verdict reached for the wrong reason.
  *
  *  The fixtures are those of `test_triangle_smooth`, which checks the same matrices against
- *  `DistGeom::triangleSmoothBounds` — so that this suite states what the verdict is worth and that one states
- *  that the verdict is right.
+ *  `DistGeom::triangleSmoothBounds`: this suite states what the verdict is worth, that one that it is right.
  */
 
 #include <cstddef> // `std::size_t`
@@ -60,27 +57,24 @@ struct bounds_fixture_t {
     custd::span<pair_bound_t const> pairs;
 };
 
-/* Two rigid 1 A bonds from atom 0 hold atoms 1 and 2 within 2 A of one another, and their own window asks
- * for at least 4. Nothing can satisfy both. */
+/** Two rigid 1 A bonds hold atoms 1 and 2 within 2 A; their own window asks 4. Nothing satisfies both. */
 static constexpr pair_bound_t three_atom_contradiction_k[] = {
     {0, 1, 1.0f, 1.0f}, {0, 2, 1.0f, 1.0f}, {1, 2, 4.0f, 5.0f}};
 
-/* The same two bonds with a window the triangle can meet: the upper falls from 5 to 2 and the lower holds. */
+/** The same two bonds with a window the triangle can meet: the upper falls from 5 to 2, the lower holds. */
 static constexpr pair_bound_t three_atom_tightened_k[] = {{0, 1, 1.0f, 1.0f}, {0, 2, 1.0f, 1.0f}, {1, 2, 0.5f, 5.0f}};
 
-/* A rigid four-bond chain of 1.5 A steps, whose non-bonded windows arrive wide open and close onto the chain
- * length that reaches them. */
+/** A rigid four-bond chain of 1.5 A steps, whose open non-bonded windows close onto the chain length. */
 static constexpr pair_bound_t five_atom_chain_k[] = {
     {0, 1, 1.5f, 1.5f},   {1, 2, 1.5f, 1.5f},   {2, 3, 1.5f, 1.5f},   {3, 4, 1.5f, 1.5f},   {0, 2, 1.0f, 100.0f},
     {0, 3, 1.0f, 100.0f}, {0, 4, 1.0f, 100.0f}, {1, 3, 1.0f, 100.0f}, {1, 4, 1.0f, 100.0f}, {2, 4, 1.0f, 100.0f}};
 
-/* The same chain with its two ends held at least 9 A apart, which four 1.5 A steps cannot reach. */
+/** The same chain with its two ends held at least 9 A apart, which four 1.5 A steps cannot reach. */
 static constexpr pair_bound_t five_atom_chain_overstretched_k[] = {
     {0, 1, 1.5f, 1.5f},   {1, 2, 1.5f, 1.5f},  {2, 3, 1.5f, 1.5f},   {3, 4, 1.5f, 1.5f},   {0, 2, 1.0f, 100.0f},
     {0, 3, 1.0f, 100.0f}, {0, 4, 9.0f, 12.0f}, {1, 3, 1.0f, 100.0f}, {1, 4, 1.0f, 100.0f}, {2, 4, 1.0f, 100.0f}};
 
-/* Both feasible fixtures are here to keep the refusal narrow: a guard that refused everything would satisfy
- * the two infeasible rows on its own. */
+/** The feasible fixtures keep the refusal narrow: a guard refusing everything would satisfy the rest. */
 static constexpr bounds_fixture_t fixtures_k[] = {
     {"three_atom_contradiction", 3, conformer_status_t::bounds_infeasible_k, three_atom_contradiction_k},
     {"three_atom_tightened", 3, conformer_status_t::success_k, three_atom_tightened_k},
@@ -94,10 +88,8 @@ static constexpr bounds_fixture_t fixtures_k[] = {
 
 /**
  *  @brief Lay a fixture's pair windows into the packed square the kernels read.
- *
  *  @param[in] fixture Pair windows; every unordered pair of its atoms appears exactly once.
  *  @param[inout] storage Caller-owned buffer, resized to N × N and fully overwritten.
- *  @return View over @p storage.
  */
 static packed_matrix<float> flatten_fixture_into_(bounds_fixture_t const &fixture, std::vector<float> &storage) {
     auto const matrix = smallfield::types::reset_square_matrix(storage, fixture.num_atoms, 0.0f);
@@ -110,8 +102,6 @@ static packed_matrix<float> flatten_fixture_into_(bounds_fixture_t const &fixtur
 
 /**
  *  @brief Widest amount by which a pair's lower bound overshoots its upper, zero when none does.
- *
- *  @param[in] matrix Smoothed bounds matrix.
  *  @return `max(lower - upper)` over every unordered pair, floored at zero.
  */
 static float widest_crossing_(packed_matrix<float const> matrix) {
@@ -127,7 +117,6 @@ static float widest_crossing_(packed_matrix<float const> matrix) {
 
 /**
  *  @brief Run every fixture through the three launches and compare the slot it lands in.
- *
  *  @param[inout] reporter Where a disagreeing fixture reports itself.
  *  @param[inout] bounds_storage Caller-owned bounds buffer, reused across fixtures.
  */

@@ -2,9 +2,9 @@
  *  @file bench/bench_reporting.hpp
  *  @brief The per-status breakdown every conformer benchmark prints beneath its throughput line.
  *
- *  A `conf/s` figure already divides by produced conformers, so only this breakdown makes a rejection class
- *  visible: the atom-count cap alone drops about 4 % of PubChem before any molecule reaches the GPU, and a
- *  class that grows quietly looks like a speed-up in every number except this table.
+ *  A `conf/s` figure already divides by produced conformers, so only this breakdown makes a rejection class visible —
+ *  the atom-count cap alone drops about 4 % of PubChem before any molecule reaches the GPU, and a class that grows
+ *  quietly looks like a speed-up in every number except this table.
  */
 
 #pragma once
@@ -25,8 +25,7 @@ namespace smallfield::bench {
 using types::conformer_status_name;
 using types::unnamed_status_k;
 
-/** Conformers per status code, indexed by the enumerator's own value; the trailing bucket collects the
- *  codes no enumerator claims. */
+/** Conformers per status code, indexed by the enumerator's own value; the last bucket collects unclaimed codes. */
 using status_histogram_t = std::array<std::uint64_t, types::conformer_status_count_k + 1>;
 
 /** Tally @p status by code in one pass; a code no enumerator claims lands in the last bucket. */

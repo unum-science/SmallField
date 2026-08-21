@@ -1,10 +1,9 @@
 /**
  *  @file bench/bench_mmff_kernels.cpp
- *  @brief GPU MMFF kernel-trio scaling benchmark: type-and-charge, term extraction and CSR build, timed
- *  against the CPU native path over the same batch.
+ *  @brief GPU MMFF kernel-trio scaling benchmark — type-and-charge, term extraction, CSR build — timed against the
+ *  CPU native path over the same batch.
  *
- *  The per-molecule fixed-stride output arrays are what bound the batch: ChEMBL scale, 240 K molecules,
- *  already takes about 12 GB of device memory.
+ *  The per-molecule fixed-stride output arrays bound the batch: ChEMBL scale, 240 K molecules, already takes ~12 GB.
  */
 
 #include <cstddef> // `std::size_t`
@@ -51,27 +50,22 @@ static double elapsed_ms_(clock_type_t::time_point start, clock_type_t::time_poi
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
-/**
- *  @brief Atom ceiling this benchmark admits.
- *
- *  Held at 128 rather than at `sft::max_atoms_per_molecule_k` so the batch composition — and therefore every
- *  published mol/s figure — stays comparable across runs when the library's dispatch tiers move.
- */
+/** Atom ceiling this benchmark admits, held at 128 rather than `sft::max_atoms_per_molecule_k` so batch composition,
+ *  and every published mol/s figure, stays comparable across runs when the library's dispatch tiers move. */
 static constexpr std::uint32_t benchmark_atom_ceiling_k = 128;
 
-/** How far a SMILES got before the timed section, so the batch can report what it dropped and why. */
+/** How far a SMILES got before the timed section, so the batch can report what it dropped and why. `parsed_k` is
+ *  sanitized, hydrogenated, within the atom ceiling and described; `unparseable_k` is `SmilesToMol` returning
+ *  nothing or throwing; `hydrogenation_failed_k` a throw from `MolOps::addHs`; `above_atom_ceiling_k` and its two
+ *  siblings an extent past `benchmark_atom_ceiling_k` or the descriptor's own limits once hydrogens are explicit;
+ *  `no_descriptor_k` any other `build_descriptor` refusal. */
 enum class parse_outcome_t {
-    /** Sanitized, hydrogenated, within the atom ceiling, and described. */
     parsed_k,
-    /** `SmilesToMol` returned nothing, or threw. */
     unparseable_k,
-    /** `MolOps::addHs` threw. */
     hydrogenation_failed_k,
-    /** Above `benchmark_atom_ceiling_k` once hydrogens are explicit. */
     above_atom_ceiling_k,
     too_many_bonds_k,
     too_many_rings_k,
-    /** `build_descriptor` refused the molecule for a reason this table does not tabulate. */
     no_descriptor_k,
 };
 
@@ -100,10 +94,10 @@ static parse_outcome_t outcome_of_descriptor_(sft::conformer_status_t status) {
     }
 }
 
+/** One corpus row after parsing; only `parsed_k` carries a usable `descriptor`. */
 struct parsed_molecule_t {
     std::unique_ptr<RDKit::RWMol> rdkit_molecule;
     sft::molecule_descriptor_t descriptor;
-    /** Only `parsed_k` carries a usable `descriptor`; every other outcome names why it is absent. */
     parse_outcome_t outcome = parse_outcome_t::unparseable_k;
 };
 
@@ -184,9 +178,9 @@ static constexpr std::size_t max_molecules_per_run_k = 1'000'000;
 
 #pragma region Command Line
 
-/** Everything this driver takes from the command line. */
+/** Everything this driver takes from the command line; `smiles_path` comes from `--smi` or
+ *  `SMALLFIELD_TEST_CORPUS`, with no default. */
 struct kernel_bench_arguments_t {
-    /** From `--smi` or from `SMALLFIELD_TEST_CORPUS`; there is no default. */
     std::string_view smiles_path;
     std::size_t max_molecules = 10'000;
 };
@@ -222,13 +216,9 @@ static arguments_parse_t parse_arguments_(int argc, char **argv, kernel_bench_ar
 
 #pragma region Timed Sections
 
-/**
- *  @brief The batch the kernels are timed over: one descriptor per molecule that parsed, with the atom
- *  offsets addressing the shared atom arena.
- *
- *  Both arrays are walked by the same molecule index, and an offset is the running sum of its
- *  predecessors' atom counts.
- */
+/** The batch the kernels are timed over: one descriptor per molecule that parsed, with the atom offsets addressing
+ *  the shared atom arena. Both arrays are walked by the same molecule index, and an offset is the running sum of its
+ *  predecessors' atom counts. */
 struct descriptor_batch_t {
     std::vector<sft::molecule_descriptor_t> descriptors;
     std::vector<std::uint32_t> atom_offsets;
@@ -256,10 +246,8 @@ static void fill_descriptor_batch_into_(std::vector<parsed_molecule_t> const &pa
 }
 
 /**
- *  @brief Time the CPU native extraction over the whole batch and report its throughput.
- *
- *  The term counts are summed into a reduction, and the sum is printed, so `-O3` cannot dead-code the call
- *  body it sees go out of scope.
+ *  @brief Time the CPU native extraction over the whole batch; term counts are summed into a reduction and the sum
+ *  printed, so `-O3` cannot dead-code the call body.
  *
  *  @return Molecules per second on the CPU path.
  */

@@ -2,34 +2,23 @@
  *  @file   src/smallfield/types/views.hpp
  *  @brief  The libcu++ namespace alias, and non-owning views over caller-owned molecule buffers.
  *
- *  Every matrix in this project is a flat buffer plus an extent the caller carries separately, which is
- *  three parameters where the data is one thing and lets an extent disagree with its storage undetected.
- *  These aliases put the extent inside the view.
+ *  Every matrix is a flat buffer plus an extent carried as one thing, so the two cannot disagree. The
+ *  standard types cannot serve: `std::mdspan` needs C++23, which `nvcc` 12.8 and 12.9 reject, and
+ *  `std::span`'s members are not `__host__ __device__`. libcu++ ships both at C++20 for host and device
+ *  and arrives with `CUDA::cudart`, already a `PUBLIC` dependency of `smallfield_objects`; `custd` names
+ *  it once, so the swap is one `#if` when `nvcc` 13 and libstdc++ 16 land together.
  *
- *  The standard library's own types cannot serve here. `std::mdspan` needs C++23, and `nvcc` 12.8 and 12.9
- *  both reject `-std=c++23` outright, so it cannot enter any translation unit `nvcc` touches; and
- *  `std::span`'s members are not `__host__ __device__`, so a device helper cannot take one. libcu++ ships
- *  both interfaces at C++20 for host and device alike and arrives with `CUDA::cudart`, which is already a
- *  `PUBLIC` dependency of `smallfield_objects`. `custd` names the namespace once — the namespace rather
- *  than one type in it, because it carries the span as well as the views — so the swap is one `#if` here
- *  when `nvcc` 13 and libstdc++ 16 land together.
+ *  `std::uint32_t` extents are a claim about scope: these view one molecule, capped at
+ *  `max_atoms_per_molecule_k` atoms and `max_bonds_k` bonds. The width is not free — a packed view is
+ *  16 bytes at `std::uint32_t` against 24 at `std::size_t`, and a strided one 24 against 40, per kernel
+ *  argument. @b Never view the conformer pool through them — it is indexed in `std::size_t` because 10 M
+ *  molecules at three conformers each pass `UINT32_MAX` elements around conformer 11.2 M, where a 32-bit
+ *  offset wraps into another molecule; `mmff94_atom_offsets_t` documents the same reasoning one size down,
+ *  where a `std::uint8_t` count wraps on an atom carrying over 255 torsions.
  *
- *  @section indexing Index width
- *
- *  Extents are `std::uint32_t`, which is a claim about scope rather than a micro-optimization: these view a
- *  single molecule, capped at `max_atoms_per_molecule_k` atoms and `max_bonds_k` bonds. The width is not
- *  free — a packed view is 16 bytes at `std::uint32_t` against 24 at `std::size_t`, and a strided one 24
- *  against 40, per kernel argument.
- *
- *  @b Never view the conformer pool through these. That pool is indexed in `std::size_t` on purpose: a
- *  10 M molecule run at three conformers each passes `UINT32_MAX` elements around conformer 11.2 M, and a
- *  32-bit offset wraps into another molecule's coordinates. `mmff94_atom_offsets_t` documents the same
- *  reasoning one size down, where a `std::uint8_t` count wraps on an atom carrying over 255 torsions.
- *
- *  @section bounds Bounds checking
- *
- *  `cuda::std::mdspan` performs none, even with `CCCL_ENABLE_ASSERTIONS` set — a `(9, 9)` access on a 4 × 4
- *  view reads out of bounds and returns whatever was there. Raw index arithmetic still wants `sf_assert_`.
+ *  `cuda::std::mdspan` bounds-checks nothing, even with `CCCL_ENABLE_ASSERTIONS` set — a `(9, 9)` access on
+ *  a 4 × 4 view reads out of bounds and returns whatever was there — so raw index arithmetic still wants
+ *  `sf_assert_`.
  */
 
 #pragma once
@@ -47,10 +36,8 @@
 #include "smallfield/utilities.hpp"
 
 /*
- *  At global scope on purpose. Every subsystem spells `custd::span`, and so does the pybind module, which
- *  sits outside `smallfield` entirely — an alias inside the project namespace would force that translation
- *  unit and every other global-scope consumer to write the prefix back out. One short, distinctive name in
- *  the global namespace is the price of the type being spellable everywhere it is used.
+ *  At global scope on purpose: the pybind module spells `custd::span` from outside `smallfield`, and an
+ *  alias inside the project namespace would make every global-scope consumer write the prefix back out.
  */
 namespace custd = cuda::std;
 
@@ -58,23 +45,19 @@ namespace smallfield::types {
 
 #pragma region Aliases
 
-/**
- *  @brief Row-major matrix whose rows are packed at the column extent.
- *
- *  The host layout: `build_bounds_matrix` and `fill_bond_distances` both write `matrix(row, column)` with
- *  no padding between rows.
- */
+/** Row-major matrix packed at the column extent, no padding between rows; the host layout
+ *  `build_bounds_matrix` and `fill_bond_distances` write as `matrix(row, column)`. */
 template <typename value_type_>
 using packed_matrix = custd::mdspan<value_type_, custd::dextents<std::uint32_t, 2>>;
 
 /**
  *  @brief Row-major matrix whose rows are padded to a stride the caller states.
  *
- *  The one thing `packed_matrix` cannot say is a row stride above the column extent, and two layouts here
- *  need exactly that: the device bounds matrix, whose rows `compute_bounds_row_stride` pads to an odd
- *  multiple of four so all 32 lanes of a warp land on distinct shared-memory banks, and a conformer slot,
- *  whose component planes are padded to `conformer_slot_layout_t::max_atoms` rather than to the molecule's
- *  own atom count. A strided view is 24 bytes against a packed view's 16, per kernel argument.
+ *  Two layouts need a row stride above the column extent, which `packed_matrix` cannot say: the device
+ *  bounds matrix, padded by `compute_bounds_row_stride` to an odd multiple of four so a warp's 32 lanes
+ *  land on distinct shared-memory banks, and a conformer slot, whose component planes pad to
+ *  `conformer_slot_layout_t::max_atoms` rather than the molecule's own atom count. A strided view is
+ *  24 bytes against a packed view's 16, per kernel argument.
  */
 template <typename value_type_>
 using strided_matrix = custd::mdspan<value_type_, custd::dextents<std::uint32_t, 2>, custd::layout_stride>;
@@ -88,28 +71,17 @@ inline constexpr std::size_t conformer_dimensions_k = 3;
 /** Rows a metric embedding carries: the three spatial ones plus the w the crush penalty flattens. */
 inline constexpr std::size_t embedding_dimensions_k = 4;
 
-/**
- *  @brief What a coordinate view holds.
- *
- *  Positions, velocities and a gradient are identical in shape and layout and ride adjacent through the
- *  FIRE driver, so nothing but this separates them and any two of them are mutually assignable without it.
- */
+/** What a coordinate view holds. Positions, velocities and gradients share one shape and ride adjacent
+ *  through the FIRE driver, so without this tag any two of them would be mutually assignable. */
 enum class coordinate_role_t : std::uint8_t { position_k, velocity_k, gradient_k, embedding_k };
 
-/**
- *  @brief Empty accessor carrying the role, so two roles are distinct types.
- *
- *  `custd::mdspan`'s converting constructor requires the accessors be constructible from one another, and
- *  the accessor is already one of its four template parameters, so the role costs no bytes and needs no
- *  wrapper class. It also closes what the layout policy alone cannot: an atom-major view is `layout_right`
- *  like `packed_matrix`, and a static extent always converts to a dynamic one.
- *
- *  It restates `custd::default_accessor`'s three members rather than deriving from it, and the difference
- *  is load-bearing. A derived empty struct is still an aggregate, so `role_accessor<gradient_k, float>` is
- *  aggregate-initializable from any sibling's base subobject, `is_constructible` reports true, and every
- *  role converts to every other — which is the whole guarantee, lost. Standing alone, only the one
- *  conversion below exists.
- */
+/** Empty accessor carrying the role, so two roles are distinct types. `custd::mdspan`'s converting
+ *  constructor requires accessors constructible from one another, and the accessor is one of its four
+ *  template parameters, so the role costs no bytes. It closes what the layout policy cannot: an atom-major
+ *  view is `layout_right` like `packed_matrix`, and a static extent always converts to a dynamic one.
+ *  @b Do not derive this from `custd::default_accessor` — a derived empty struct is still an aggregate, so
+ *  every role becomes aggregate-initializable from a sibling's base subobject and converts to every other,
+ *  losing the whole guarantee. Standing alone, only the one conversion below exists. */
 template <coordinate_role_t role_, typename value_type_>
 struct role_accessor {
     using offset_policy = role_accessor;
@@ -130,20 +102,13 @@ struct role_accessor {
     }
 };
 
-/**
- *  @brief Coordinates over one molecule, always addressed `(atom, axis)`.
- *
- *  The layout policy says where the elements sit, so a call site reads the same whichever storage it holds
- *  and the compiler performs the stride arithmetic that would otherwise be written by hand. Distinguishing
- *  the two layouts by which extent is static does not work: a static extent converts implicitly to a
- *  dynamic one, so both would pass where a `packed_matrix` was expected. `custd::layout_left` against
- *  `custd::layout_right` blocks that in both directions, because the cross-layout mapping constructor is
- *  constrained to rank one or lower and these are rank two.
- *
- *  The dimension count is a template parameter because it is a property of the algorithm rather than of the
- *  molecule: distance geometry works at four rows and everything downstream at three, and the two must not
- *  be interchangeable at a call site.
- */
+/** Coordinates over one molecule, always addressed `(atom, axis)`. The layout policy says where the
+ *  elements sit, so a call site reads the same whichever storage it holds, and `custd::layout_left` against
+ *  `custd::layout_right` keeps the two orders from converting into one another: the cross-layout mapping
+ *  constructor is constrained to rank one or lower and these are rank two, whereas a static extent would
+ *  convert implicitly to a dynamic one. The dimension count is a template parameter because it belongs to
+ *  the algorithm, not the molecule — distance geometry works at four rows and everything downstream at
+ *  three, and the two must not be interchangeable at a call site. */
 template <coordinate_role_t role_, typename value_type_, std::size_t dimensions_, typename layout_type_>
 using coordinates = custd::mdspan<value_type_, custd::extents<std::uint32_t, custd::dynamic_extent, dimensions_>,
                                   layout_type_, role_accessor<role_, value_type_>>;
@@ -170,37 +135,18 @@ using conformer_aos_t = coordinates_aos<coordinate_role_t::position_k, float>;
 #pragma region Distance Bounds
 
 /*
- *  A bounds matrix folds both ends of every atom pair into one square: the upper triangle holds the pair's
- *  upper bound and the lower triangle its lower bound, so reaching a bound means ordering the two atom
- *  indices and choosing which of them lands in the row. Written out at a call site that is a two-line dance
- *  whose correct and inverted forms differ in nothing but that choice, and both read plausible. Naming it
- *  takes the pair unordered instead, so a caller never states an order at all. Equal indices land on the
- *  diagonal, which the convention holds at zero in both roles.
- *
- *  They are `constexpr` rather than `__host__ __device__` because this header is compiled as plain C++ by
- *  `test/parameters/test_mmff94_tables.cpp`, where a CUDA attribute is not a keyword the host compiler
- *  knows. Device code reaches them through `--expt-relaxed-constexpr`, the same route `utilities.hpp` takes.
- *
- *  They read one bound each rather than returning both, and that is measured rather than assumed. Both
- *  smoothing loops branch on which inequality applies before it is known whether the lower bound is wanted,
- *  so a pair-returning form holds a value one branch never reads live across that branch, and `cuobjdump`
- *  charges `triangle_smooth_kernel` the extra registers for it. The packed view itself is free:
- *  `triangle_smooth_kernel` compiles to the same SASS through these as through raw index arithmetic.
- *
- *  Each name carries a second form over a mutable matrix, returning the cell rather than its value, so the
- *  sweeps that build a square name the triangle they land in exactly as the sweeps that read it do. A
- *  mutable matrix is an exact match for that form and a user-defined conversion away from the reading one,
- *  so it is chosen without ambiguity and no reader of a `packed_matrix<float const>` is affected.
+ *  A bounds matrix folds both ends of every atom pair into one square: upper triangle for the pair's upper
+ *  bound, lower triangle for its lower, and equal indices on the diagonal, held at zero in both roles.
+ *  These take the pair unordered, so a caller never states which index lands in the row — a choice whose
+ *  correct and inverted forms differ in nothing else and both read plausible. `constexpr` rather than
+ *  `__host__ __device__` because `test/parameters/test_mmff94_tables.cpp` compiles this header as plain
+ *  C++; device code reaches them through `--expt-relaxed-constexpr`. Each reads one bound rather than
+ *  returning both: the smoothing loops branch on which inequality applies before it is known whether the
+ *  lower bound is wanted, and a pair-returning form costs `triangle_smooth_kernel` registers for a value
+ *  one branch never reads.
  */
 
-/**
- *  @brief Upper distance bound of an atom pair, from the packed square's upper triangle.
- *
- *  @param[in] matrix Square bounds matrix over one molecule's atoms.
- *  @param[in] first_atom One end of the pair; the two ends are interchangeable.
- *  @param[in] second_atom The other end.
- *  @return Furthest apart the pair may go, in angstrom.
- */
+/** Upper distance bound of an atom pair, from the packed square's upper triangle, in angstrom. */
 constexpr float upper_distance_bound_at(packed_matrix<float const> matrix, std::uint32_t first_atom,
                                         std::uint32_t second_atom) noexcept {
     std::uint32_t const row = first_atom < second_atom ? first_atom : second_atom;
@@ -208,14 +154,8 @@ constexpr float upper_distance_bound_at(packed_matrix<float const> matrix, std::
     return matrix(row, column);
 }
 
-/**
- *  @brief The upper triangle's cell for an atom pair, for a caller that writes it.
- *
- *  @param[inout] matrix Square bounds matrix over one molecule's atoms.
- *  @param[in] first_atom One end of the pair; the two ends are interchangeable.
- *  @param[in] second_atom The other end.
- *  @return The cell holding how far apart the pair may go, in angstrom.
- */
+/** The upper triangle's cell for an atom pair, in angstrom, for a caller that writes it. @p matrix is the
+ *  square bounds matrix over one molecule's atoms. */
 constexpr float &upper_distance_bound_at(packed_matrix<float> matrix, std::uint32_t first_atom,
                                          std::uint32_t second_atom) noexcept {
     std::uint32_t const row = first_atom < second_atom ? first_atom : second_atom;
@@ -223,14 +163,7 @@ constexpr float &upper_distance_bound_at(packed_matrix<float> matrix, std::uint3
     return matrix(row, column);
 }
 
-/**
- *  @brief Lower distance bound of an atom pair, from the packed square's lower triangle.
- *
- *  @param[in] matrix Square bounds matrix over one molecule's atoms.
- *  @param[in] first_atom One end of the pair; the two ends are interchangeable.
- *  @param[in] second_atom The other end.
- *  @return Closest the pair may come, in angstrom.
- */
+/** Lower distance bound of an atom pair, from the packed square's lower triangle, in angstrom. */
 constexpr float lower_distance_bound_at(packed_matrix<float const> matrix, std::uint32_t first_atom,
                                         std::uint32_t second_atom) noexcept {
     std::uint32_t const row = first_atom < second_atom ? second_atom : first_atom;
@@ -238,14 +171,8 @@ constexpr float lower_distance_bound_at(packed_matrix<float const> matrix, std::
     return matrix(row, column);
 }
 
-/**
- *  @brief The lower triangle's cell for an atom pair, for a caller that writes it.
- *
- *  @param[inout] matrix Square bounds matrix over one molecule's atoms.
- *  @param[in] first_atom One end of the pair; the two ends are interchangeable.
- *  @param[in] second_atom The other end.
- *  @return The cell holding how close the pair may come, in angstrom.
- */
+/** The lower triangle's cell for an atom pair, in angstrom, for a caller that writes it. @p matrix is the
+ *  square bounds matrix over one molecule's atoms. */
 constexpr float &lower_distance_bound_at(packed_matrix<float> matrix, std::uint32_t first_atom,
                                          std::uint32_t second_atom) noexcept {
     std::uint32_t const row = first_atom < second_atom ? second_atom : first_atom;
@@ -258,15 +185,10 @@ constexpr float &lower_distance_bound_at(packed_matrix<float> matrix, std::uint3
 #pragma region Builders
 
 /**
- *  @brief Grow @p storage to hold a square matrix of @p extent, fill it, and view it.
+ *  @brief Grow @p storage to a square matrix of @p extent and write @p fill to every element, grown or not.
  *
- *  The view does not own, so sizing stays with the caller's buffer; doing it here rather than at each call
- *  site is what keeps an extent from disagreeing with the storage behind it.
- *
- *  @param[inout] storage Caller-owned buffer, reused across molecules so growth happens once.
- *  @param[in] extent Row and column count.
- *  @param[in] fill Value written to every element.
- *  @return View over @p storage.
+ *  Sizing here rather than at each call site keeps an extent from disagreeing with the storage behind it.
+ *  @p storage is caller-owned and reused across molecules, so growth happens once.
  */
 template <typename value_type_>
 inline packed_matrix<value_type_> reset_square_matrix(std::vector<value_type_> &storage, std::uint32_t extent,
@@ -275,13 +197,8 @@ inline packed_matrix<value_type_> reset_square_matrix(std::vector<value_type_> &
     return packed_matrix<value_type_> {storage.data(), extent, extent};
 }
 
-/**
- *  @brief Grow @p storage to hold @p num_atoms axis-major coordinates, zero it, and view it.
- *
- *  @param[inout] storage Caller-owned buffer, reused across molecules so growth happens once.
- *  @param[in] num_atoms Atoms the view spans.
- *  @return View over @p storage.
- */
+/** Grow @p storage to @p num_atoms axis-major coordinates, zero it, and view it. @p storage is
+ *  caller-owned and reused across molecules, so growth happens once. */
 template <coordinate_role_t role_, std::size_t dimensions_, typename value_type_>
 inline coordinates_soa<role_, value_type_, dimensions_> reset_coordinates_soa(std::vector<value_type_> &storage,
                                                                               std::uint32_t num_atoms) {
@@ -289,13 +206,8 @@ inline coordinates_soa<role_, value_type_, dimensions_> reset_coordinates_soa(st
     return coordinates_soa<role_, value_type_, dimensions_> {storage.data(), num_atoms};
 }
 
-/**
- *  @brief Grow @p storage to hold @p num_atoms atom-major coordinates, zero it, and view it.
- *
- *  @param[inout] storage Caller-owned buffer, reused across molecules so growth happens once.
- *  @param[in] num_atoms Atoms the view spans.
- *  @return View over @p storage.
- */
+/** Grow @p storage to @p num_atoms atom-major coordinates, zero it, and view it. @p storage is
+ *  caller-owned and reused across molecules, so growth happens once. */
 template <coordinate_role_t role_, typename value_type_>
 inline coordinates_aos<role_, value_type_> reset_coordinates_aos(std::vector<value_type_> &storage,
                                                                  std::uint32_t num_atoms) {
@@ -310,12 +222,8 @@ inline coordinates_aos<role_, value_type_> reset_coordinates_aos(std::vector<val
 /**
  *  @brief Scatter atom-major triples into the three spatial columns of an axis-major view.
  *
- *  Columns past the third keep whatever they already held, so a caller that fills the fourth first and the
- *  spatial three second gets the same buffer as one that does it the other way round.
- *
- *  Both views are addressed `(atom, axis)` and the layout supplies the stride, so the body says what it
- *  does rather than which storage order it assumes.
- *
+ *  Columns past the third keep what they held, so filling the fourth before or after the spatial three
+ *  yields the same buffer. Both views are addressed `(atom, axis)` and the layout supplies the stride.
  *  @param[in] atom_major Source, one xyz triple per atom.
  *  @param[out] axis_major Destination, at least three columns over the same atoms.
  */
@@ -334,9 +242,8 @@ inline void transpose_into(coordinates_aos<source_role_, source_type_> atom_majo
 /**
  *  @brief Gather the three spatial columns of an axis-major view back into atom-major triples.
  *
- *  Columns past the third have no atom-major counterpart and are not read; dropping the fourth is the
- *  projection that turns a metric embedding into a conformer.
- *
+ *  Columns past the third have no counterpart and are not read; dropping the fourth is the projection that
+ *  turns a metric embedding into a conformer.
  *  @param[in] axis_major Source, at least three columns over the atoms.
  *  @param[out] atom_major Destination, one xyz triple per atom.
  */
@@ -362,17 +269,11 @@ inline constexpr std::size_t pool_alignment_k = 256;
 /**
  *  @brief Cursor handing out typed subspans of one byte pool, each at `pool_alignment_k`.
  *
- *  One sequence of carves answers both questions a sub-allocated pool asks. Over a cursor holding no
- *  pool every carve hands back an empty span while `bytes` still advances, so the walk ends holding the
- *  size the allocation needs; over a cursor holding that allocation the same sequence hands back the
- *  real subspans. There is no second sequence to keep in step, so a carve added to the walk sizes the
- *  pool and fills the view in one edit.
- *
- *  Constness travels from the pool to the spans, so a cursor over `std::byte const` cannot hand out a
- *  writable view of it.
- *
- *  Here rather than in `utilities.hpp` because a carve hands out a `custd::span`, and that header's
- *  admission rule asks for nothing outside the standard ones — it includes no header at all today.
+ *  One sequence of carves answers both questions a sub-allocated pool asks: over a cursor holding no pool
+ *  every carve hands back an empty span while `bytes` still advances, so the walk ends holding the size the
+ *  allocation needs, and over a cursor holding that allocation the same sequence hands back the real
+ *  subspans. A carve added to the walk therefore sizes the pool and fills the view in one edit. Constness
+ *  travels from the pool to the spans, so a cursor over `std::byte const` cannot hand out a writable view.
  */
 template <typename byte_type_>
 struct pool_cursor {
@@ -386,12 +287,8 @@ struct pool_cursor {
 template <typename byte_type_, typename element_>
 using pool_element_t = std::conditional_t<std::is_const_v<byte_type_>, element_ const, element_>;
 
-/**
- *  @brief Place @p count elements of @p element_ at @p cursor's next aligned offset and advance past them.
- *
- *  A free function rather than a member so a walk written against a dependent cursor type spells the
- *  element once, without a `template` disambiguator at every carve.
- */
+/** Place @p count elements of @p element_ at @p cursor's next aligned offset and advance past them. Free
+ *  rather than a member, so a walk over a dependent cursor type needs no `template` disambiguator. */
 template <typename element_, typename byte_type_>
 [[nodiscard]] constexpr custd::span<pool_element_t<byte_type_, element_>> carve(pool_cursor<byte_type_> &cursor,
                                                                                 std::size_t count) noexcept {
@@ -399,9 +296,7 @@ template <typename element_, typename byte_type_>
     std::size_t const byte_offset = cursor.bytes;
     cursor.bytes += count * sizeof(element_);
     if (cursor.pool.empty()) return {};
-    // The sizing walk and the carving walk are one sequence, so a pool too small for the walk that
-    // measured it cannot happen by editing one and not the other. It can still happen by allocating
-    // against a different shape than the one carved here, and that reads as valid device memory.
+    // A pool allocated against a different shape overruns, and the overrun reads as valid device memory.
     sf_assert_(cursor.bytes <= cursor.pool.size());
     return {reinterpret_cast<pool_element_t<byte_type_, element_> *>(cursor.pool.data() + byte_offset), count};
 }

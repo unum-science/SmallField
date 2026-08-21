@@ -1,11 +1,9 @@
 /**
  *  @file cli/cli_arguments.hpp
- *  @brief `argparse` bindings shared by the `cli/` binaries, writing a parsed value straight into its
- *  destination.
+ *  @brief `argparse` bindings shared by the `cli/` binaries, writing a parsed value into its destination.
  *
- *  `argparse`'s own `scan` answers a malformed token without naming the flag that carried it, so every
- *  value-taking flag goes through `parse_number` from `smallfield/number_parse.hpp`, which names the refusal
- *  and enforces the caller's bounds in the same pass.
+ *  `argparse`'s own `scan` answers a malformed token without naming the flag, so every value-taking flag goes
+ *  through `parse_number` in `smallfield/number_parse.hpp`, which names the refusal and bounds in one pass.
  */
 
 #pragma once
@@ -27,12 +25,8 @@ enum class cli_parse_t {
     invalid_k,
 };
 
-/**
- *  @brief Bind a string flag straight to its destination.
- *
- *  `append` marks the flag repeatable, so the last occurrence wins; without it `argparse` refuses a second
- *  occurrence outright.
- */
+/** Bind a string flag straight to its destination. `append` marks it repeatable so the last occurrence wins;
+ *  without it `argparse` refuses a second occurrence outright. */
 template <typename string_type_>
 void add_string(argparse::ArgumentParser &parser, char const *flag, string_type_ &destination) {
     parser.add_argument(flag).append().action([&destination](std::string const &text) { destination = text; });

@@ -2,37 +2,24 @@
  *  @file src/smallfield/postprocess/shape_descriptors.hpp
  *  @brief Native USR / USRCAT molecular shape descriptors.
  *
- *  Implements the 12-number Ultrafast Shape Recognition descriptor, USR, and its 60-number CREDO-pharmacophore
- *  extension, USRCAT, so the conformer pipeline can emit shape fingerprints without a round trip through RDKit
- *  per conformer.
+ *  The 12-number Ultrafast Shape Recognition descriptor and its 60-number CREDO-pharmacophore extension,
+ *  matching `RDKit::Descriptors::USR` and `USRCAT` bit for bit, so the pipeline emits shape fingerprints
+ *  without a round trip through RDKit per conformer.
  *
- *  The numeric definitions match `RDKit::Descriptors::USR` and `USRCAT` bit for bit, as implemented in RDKit's
- *  `USRDescriptor.cpp`. There are four reference points — the centroid, the atom closest to the centroid, the
- *  atom farthest from the centroid, and the atom farthest from that one — and for each reference point three
- *  moments of the distance distribution: mean, standard deviation, and the signed cube root of the standardized
- *  third central moment, the skewness. The descriptor is reference-point major.
+ *  Four reference points — the centroid, the atom nearest it, the atom farthest from it, and the atom
+ *  farthest from that one — each carrying three moments of its distance distribution: mean, standard
+ *  deviation, and the signed cube root of the standardized third central moment. The layout is
+ *  reference-point major.
  *
- *  RDKit's `GetUSRCAT` re-types the four CREDO pharmacophore subsets on every call. A molecule with `k`
- *  conformers therefore pays for `k` typings. Here `build_shape_context_into` types the subsets and labels
- *  connected components exactly once; `usrcat_descriptor` then consumes that context per conformer.
+ *  `build_shape_context_into` types the four CREDO subsets and labels connected components once per
+ *  molecule, and `usrcat_descriptor` consumes that context per conformer, so `k` conformers cost one
+ *  typing rather than `k`. All four patterns are single-atom queries, so typing is one `Atom::Match` per
+ *  atom rather than the subgraph isomorphism `SubstructMatch` would run; anything wider still goes to
+ *  `SubstructMatch`, which today's four patterns never reach.
  *
- *  All four CREDO patterns are single-atom queries, so the typing is one `Atom::Match` per atom rather than
- *  the subgraph isomorphism `SubstructMatch` would run. The recursive `$()` environments inside two of them
- *  are filled the same way, an atom or a bond at a time; `SubstructMatch` is kept for anything wider, which
- *  today's four patterns never reach.
- *
- *  This header also owns `molecule_shape_context_t` and the coordinate primitives, because
+ *  This header owns `molecule_shape_context_t` and the coordinate primitives because
  *  `build_shape_context_into` is the only producer of the connected-component labels that
  *  `postprocess/fragment_separation.hpp` consumes.
- *
- *  @code{.cpp}
- *  namespace sfpost = smallfield::postprocess;
- *  sfpost::molecule_shape_context_t context;  // hoisted above the molecule loop, one per worker
- *  if (sfpost::build_shape_context_into(smiles, num_atoms, smallfield::keep_largest_fragment_k, context) ==
- *      sfpost::shape_typing_t::typed_k)
- *      sfpost::usrcat_descriptor(coordinates, context,
- *                                {rows.data() + slot * sfpost::usrcat_components_k, sfpost::usrcat_components_k});
- *  @endcode
  */
 
 #pragma once

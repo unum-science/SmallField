@@ -24,7 +24,6 @@ void *create_csd_torsion_device_table(std::size_t &table_bytes);
 void destroy_csd_torsion_device_table(void *handle);
 
 /** Run the device matcher over a batch of descriptors and copy the results back.
- *  @param[in] handle Table handle.
  *  @param[in] descriptors Host-side descriptors, one per molecule.
  *  @param[in] torsion_stride Output slots reserved per molecule.
  *  @param[out] torsions_out Host buffer of at least one stride per descriptor.

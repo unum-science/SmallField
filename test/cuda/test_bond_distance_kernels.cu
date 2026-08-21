@@ -28,7 +28,7 @@ void run_bond_distance_bfs_on_gpu(custd::span<std::byte const> host_uploaded, sf
     if (slice_bytes == 0 || molecule_count == 0) return;
 
     // The BFS launch and both transfers ride the legacy default stream, so this allocation is drawn from
-    // the device memory pool and released against that same stream, and needs no synchronize of its own.
+    // the pool and released against that same stream, needing no synchronize of its own.
     sft::device_bytes_t device_pool;
     if (device_pool.try_reserve(slice_bytes) == sft::reserve_outcome_t::failed_k) {
         fmt::println(stderr, "NOTE bond_distance_kernels field=device_pool bytes={} succeeded=0", slice_bytes);
@@ -37,8 +37,8 @@ void run_bond_distance_bfs_on_gpu(custd::span<std::byte const> host_uploaded, sf
     sfp::pool_cursor<std::byte> cursor {device_pool.view()};
     sfp::wave_slice_view_t const device_view = sfp::carve_wave_slice(shape, cursor);
 
-    // The uploaded prefix is exactly what production ships; the hop-count region past it is
-    // poisoned first so a kernel that fails to write a byte cannot pass by accident.
+    // The uploaded prefix is what production ships; the hop-count region past it is poisoned first so a
+    // kernel that fails to write a byte cannot pass by accident.
     if (!sft::upload_into(device_view.uploaded, host_uploaded, nullptr)) {
         fmt::println(stderr, "NOTE bond_distance_kernels field=upload bytes={} succeeded=0", host_uploaded.size());
         return;

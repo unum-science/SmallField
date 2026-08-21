@@ -2,10 +2,8 @@
  *  @file src/smallfield/cuda/fire_warp.cuh
  *  @brief FIRE, Fast Inertial Relaxation Engine, warp-level optimizer.
  *
- *  Bitzek et al., PRL 97, 170201 (2006). Gradient descent with adaptive momentum. Much lighter than
- *  L-BFGS: needs only positions, velocities and gradient, three arrays, no history.
- *
- *  Functor interface:
+ *  Bitzek et al., PRL 97, 170201 (2006). Gradient descent with adaptive momentum, much lighter than L-BFGS:
+ *  positions, velocities and gradient, three arrays, no history. The functor interface is
  *  @code
  *    float functor(positions, gradient, num_elements, lane)
  *  @endcode
@@ -20,8 +18,7 @@ namespace smallfield::cuda {
 /**
  *  @brief Why a FIRE stage stopped.
  *
- *  Outside the CUDA guard below because a host caller staging or reporting a stage's outcome needs
- *  to name the two states, and the enumerator is the name.
+ *  Outside the CUDA guard below so a host caller staging or reporting an outcome can name the two states.
  */
 enum class fire_status_t : std::int32_t {
     /** The RMS gradient fell below the stage's threshold. */
@@ -56,11 +53,10 @@ using fire_gradient = coordinates_soa<coordinate_role_t::gradient_k, float, dime
 /**
  *  @brief The three same-shaped arrays a FIRE stage walks together.
  *
- *  Positions, velocities and a gradient have identical shape, layout and element type, so as three
- *  bare pointers under one count nothing but their order tells them apart — and the order is
- *  restated at every call. Swapping the last two compiles and minimizes something else: the driver
- *  zeroes what it thinks are velocities and the functor overwrites what it thinks is the gradient.
- *  `coordinate_role_t` is an accessor rather than a wrapper, so naming them costs no bytes.
+ *  Positions, velocities and gradient share shape, layout and element type, so as three bare pointers under one
+ *  count only their order tells them apart, and that order is restated at every call. Swapping the last two
+ *  compiles and minimizes something else: the driver zeroes what it thinks are velocities and the functor
+ *  overwrites what it thinks is the gradient. `coordinate_role_t` is an accessor, so the names cost no bytes.
  *
  *  @tparam dimensions_ Rows per atom: four while the fourth dimension is live, three afterwards.
  */
@@ -74,29 +70,22 @@ struct fire_scratch {
 /**
  *  @brief Outcome of a FIRE minimization stage, taken at the positions it hands back.
  *
- *  All fields are warp-uniform: every lane returns the same struct value because energy and
- *  `rms_gradient` are warp-reduced inside the loop and the other two are derived from the uniform
- *  loop counter.
+ *  All fields are warp-uniform: `energy` and `rms_gradient` are warp-reduced inside the loop and the rest come
+ *  from the uniform loop counter. The energy and the gradient norm describe the @b same geometry, the one in
+ *  `positions` on return, which is why the loop stops one step short rather than taking a move it has not
+ *  measured.
  *
- *  The energy and the gradient norm describe the @b same geometry, which is the geometry in
- *  `positions` on return. That is not free: it is why the loop stops one step short rather than
- *  taking a move it has not measured.
+ *  `rms_gradient` is a root mean square over @b elements, so one threshold is a different absolute norm per
+ *  stage: distance geometry and the fourth-dimension crush run at four elements per atom against three for ETK
+ *  and MMFF, a factor of sqrt(4/3) for one molecule. `select_refinement_policy_` sets the ETK and MMFF
+ *  thresholds separately and the distance-geometry stages carry their own, so the four are calibrated apart.
+ *  `final_timestep` is the step length the driver last used, in its own update's units, reported because a
+ *  stalled stage and a descending one are indistinguishable from the iteration count alone, and that decides
+ *  whether more budget would buy anything.
  */
 struct fire_result_t {
     float energy;
-    /**
-     *  Root-mean-square gradient over @b elements, so the same threshold is a different absolute
-     *  norm per stage: distance geometry and the fourth-dimension crush run at four elements per
-     *  atom and the ETK and MMFF stages at three, which is a factor of sqrt(4/3) between them for
-     *  one molecule. `select_refinement_policy_` sets the ETK and MMFF thresholds separately and the
-     *  distance-geometry stages carry their own, so the four are calibrated apart rather than shared.
-     */
     float rms_gradient;
-    /**
-     *  The step length the driver last used, in the units its own update takes it in. Reported because
-     *  a stage that has stalled and a stage that is still descending are indistinguishable from the
-     *  iteration count alone, and the distinction decides whether more budget would buy anything.
-     */
     float final_timestep;
     std::int32_t iterations;
     fire_status_t status;
@@ -105,10 +94,9 @@ struct fire_result_t {
 /**
  *  Largest root-mean-square displacement one step may apply, in angstrom.
  *
- *  It bounds the step's length and leaves its direction alone. Bounding each component instead
- *  bounds a box rather than a ball, so a step whose components differ in magnitude comes out
- *  rotated: the components that clipped shrank and the ones that did not kept their length, and the
- *  minimizer then walks somewhere the energy never pointed.
+ *  It bounds the step's length and leaves its direction alone. Bounding each component instead bounds a box
+ *  rather than a ball, so a step whose components differ in magnitude comes out rotated — the clipped ones
+ *  shrank, the rest kept their length — and the minimizer walks somewhere the energy never pointed.
  */
 constexpr float max_root_mean_square_step_k = 0.5f;
 
@@ -131,9 +119,8 @@ template <std::size_t dimensions_, typename energy_gradient_functor_>
 __device__ __forceinline__ fire_result_t fire_minimize_(fire_scratch<dimensions_> scratch, std::int32_t max_iterations,
                                                         float gradient_threshold, std::uint32_t lane,
                                                         energy_gradient_functor_ &&compute_energy_gradient) {
-    // The evaluators take the flat arrays a kernel formal parameter can carry `__restrict__` on, so
-    // the roles stop here: they exist to keep the three apart at every call site, which is where a
-    // transposition would otherwise compile.
+    // The evaluators take the flat arrays a kernel parameter can carry `__restrict__` on, so the roles stop
+    // here; they exist to keep the three apart at the call sites where a transposition would compile.
     float *const positions = scratch.positions.data_handle();
     float *const velocities = scratch.velocities.data_handle();
     float *const gradient = scratch.gradient.data_handle();
@@ -142,10 +129,9 @@ __device__ __forceinline__ fire_result_t fire_minimize_(fire_scratch<dimensions_
     // FIRE parameters (Bitzek et al., PRL 2006)
     constexpr float initial_timestep_k = 0.05f;
     constexpr float max_timestep_k = 0.5f;
-    // Below this the step is shorter than single precision can resolve against a coordinate of a few
-    // angstrom, so the geometry stops moving while the budget keeps draining. Nothing in the captured
-    // corpus reaches it — the measured floor of the distribution is 1e-3 — so this is a guard rail
-    // rather than a lever, and it is here because an unbounded halving has no other end.
+    // Below this a step is shorter than single precision resolves against a coordinate of a few angstrom, so
+    // the geometry stops moving while the budget drains. Nothing in the captured corpus reaches it — the
+    // measured floor of the distribution is 1e-3 — so it is a guard rail on an unbounded halving, not a lever.
     constexpr float min_timestep_k = 1e-5f;
     constexpr float timestep_increase_factor_k = 1.1f;
     constexpr float timestep_decrease_factor_k = 0.5f;
@@ -196,15 +182,13 @@ __device__ __forceinline__ fire_result_t fire_minimize_(fire_scratch<dimensions_
                     .iterations = iteration,
                     .status = fire_status_t::converged_k};
 
-        // The last budgeted evaluation has happened, so a step now would move the structure past the
-        // only state this call has measured, and the caller would read an energy and a gradient norm
-        // belonging to two different geometries.
+        // The last budgeted evaluation has happened, so stepping now would move past the only state this call
+        // measured, and the caller would read an energy and a gradient norm from two different geometries.
         if (iteration + 1 == max_iterations) break;
 
-        // P = F·v = -∇E·v. The comparison admits equality because entry zeroes the velocities, so the
-        // first iteration of every stage has `power == -0.0f` and a strict test would send it down the
-        // decelerating branch before a single step had been taken — halving the initial timestep to
-        // 0.025 on every stage and every restart, for every molecule, unconditionally.
+        // P = F·v = -∇E·v. Equality is admitted because entry zeroes the velocities, so every stage's first
+        // iteration has `power == -0.0f`, and a strict test would take the decelerating branch before a single
+        // step — halving the initial timestep to 0.025 on every stage, restart and molecule, unconditionally.
         float const power = -gradient_dot_velocity;
         if (power >= 0.0f) {
             float const inverse_force_norm = rsqrtf(fmaxf(gradient_dot_gradient, 1e-20f));
@@ -224,11 +208,9 @@ __device__ __forceinline__ fire_result_t fire_minimize_(fire_scratch<dimensions_
             }
         }
         else {
-            // Decelerating: the momentum has carried the geometry past the point where the force still
-            // agreed with it, so undo half of the last step before dropping the velocity. Zeroing alone
-            // leaves the overshoot in the positions and lets the next stretch of downhill steps spend
-            // itself walking back — this is FIRE 2.0's correction, Guénolé et al. 2020, and it is the
-            // half of the two the halving alone never performs.
+            // Decelerating: momentum carried the geometry past where the force still agreed with it, so undo
+            // half the last step before dropping the velocity. Zeroing alone leaves the overshoot in the
+            // positions for the next downhill stretch to walk back — FIRE 2.0's correction, Guénolé et al. 2020.
             for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) {
                 positions[element] -= 0.5f * timestep * velocities[element];
                 velocities[element] = 0.0f;
@@ -239,11 +221,9 @@ __device__ __forceinline__ fire_result_t fire_minimize_(fire_scratch<dimensions_
         }
         __syncwarp(full_mask_k);
 
-        // velocity Verlet: x += v·dt − ½·g·dt², then v -= g·dt, with the whole step held to a
-        // trust region on its length. Its length is not known until the step is built, so the sweep
-        // runs twice: once to measure, once to apply. The second pass rebuilds the step rather than
-        // parking it, because a fourth shared array of `num_elements` floats would cost more than
-        // the arithmetic does.
+        // Velocity Verlet: x += v·dt − ½·g·dt², then v -= g·dt, with the whole step held to a trust region on
+        // its length. That length is unknown until the step is built, so the sweep runs twice, once to measure
+        // and once to apply; the second rebuilds the step because a fourth `num_elements` array costs more.
         float const half_timestep_squared = 0.5f * timestep * timestep;
         float step_dot_step = 0.0f;
         for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) {
@@ -257,8 +237,7 @@ __device__ __forceinline__ fire_result_t fire_minimize_(fire_scratch<dimensions_
                                      ? max_root_mean_square_step_k / root_mean_square_step
                                      : 1.0f;
 
-        // The scale rides the velocity increment too: a bounded step is a shorter step, and the
-        // momentum it feeds into the next iteration has to agree with how far it actually went.
+        // The scale rides the velocity increment too: the momentum must agree with how far the step went.
         for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) {
             float const step = fmaf(velocities[element], timestep, -gradient[element] * half_timestep_squared);
             positions[element] += step * step_scale;
@@ -277,23 +256,20 @@ __device__ __forceinline__ fire_result_t fire_minimize_(fire_scratch<dimensions_
 /**
  *  @brief Barzilai-Borwein gradient descent, warp-level, same three arrays and same functor.
  *
- *  FIRE carries one timestep for every degree of freedom, so a molecular force field holds it at the
- *  stability limit of its stiffest bond stretch and the soft torsions relax at that rate. The
- *  measured consequence is a residual RMS gradient three decades above any threshold after the whole
- *  budget. Barzilai-Borwein reads a curvature out of the last step instead of tuning a timestep by
- *  heuristic: with @f$ s = x_k - x_{k-1} @f$ and @f$ y = g_k - g_{k-1} @f$ the step is
- *  @f$ \langle s,y \rangle / \langle y,y \rangle @f$, a secant estimate of the inverse curvature
- *  along the direction the minimizer is actually travelling.
+ *  FIRE carries one timestep for every degree of freedom, so a molecular force field holds it at the stiffest
+ *  bond stretch's stability limit while the soft torsions relax at that rate — measured as a residual RMS
+ *  gradient three decades above any threshold after the whole budget. Barzilai-Borwein reads curvature out of
+ *  the last step instead: with @f$ s = x_k - x_{k-1} @f$ and @f$ y = g_k - g_{k-1} @f$ the step is
+ *  @f$ \langle s,y \rangle / \langle y,y \rangle @f$, a secant estimate of inverse curvature along the
+ *  direction actually travelled.
  *
- *  It costs nothing extra to compute. The previous gradient lives in the array FIRE used for
- *  velocities, so @f$ s @f$ is @f$ -\text{step} \cdot g_{k-1} @f$ and both inner products fall out of
- *  the same three reductions FIRE already performs — and the position update is one sweep rather than
- *  the two a trust region on a Verlet step needs, because a step of @f$ -\alpha g @f$ has RMS length
+ *  It costs nothing extra: the previous gradient lives in FIRE's velocity array, so @f$ s @f$ is
+ *  @f$ -\text{step} \cdot g_{k-1} @f$ and both inner products fall out of the three reductions FIRE already
+ *  performs, and the position update is one sweep since @f$ -\alpha g @f$ has RMS length
  *  @f$ \alpha \cdot \mathrm{rms}(g) @f$ analytically.
  *
- *  The method is not monotone: a Barzilai-Borwein step may raise the energy on the way to a far
- *  better point, which is where its speed comes from. The caller owns that — `mmff_polish_warp_kernel`
- *  keeps the geometry it staged and declines the write-back when the result is worse.
+ *  The method is not monotone — a step may raise the energy on the way to a far better point, which is where
+ *  its speed comes from — so `mmff_polish_warp_kernel` keeps the staged geometry and declines a worse write.
  *
  *  @param[inout] scratch Positions, the previous gradient in the velocity slot, and the gradient.
  *  @param[in] max_iterations Maximum energy evaluations; the last one is measured, not stepped from.
@@ -312,9 +288,9 @@ barzilai_borwein_minimize_(fire_scratch<dimensions_> scratch, std::int32_t max_i
     float *const gradient = scratch.gradient.data_handle();
     std::uint32_t const num_elements = scratch.positions.extent(0) * static_cast<std::uint32_t>(dimensions_);
 
-    /** RMS displacement the opening step is allowed, before any curvature has been observed. */
+    // RMS displacement the opening step is allowed, before any curvature has been observed.
     constexpr float opening_root_mean_square_step_k = 0.01f;
-    /** Widest and narrowest inverse curvature the secant estimate may report, in Å² per kcal/mol. */
+    // Widest and narrowest inverse curvature the secant estimate may report, in Å² per kcal/mol.
     constexpr float min_step_k = 1e-6f;
     constexpr float max_step_k = 1.0f;
 
@@ -333,13 +309,10 @@ barzilai_borwein_minimize_(fire_scratch<dimensions_> scratch, std::int32_t max_i
         __syncwarp(full_mask_k);
 
         float gradient_dot_gradient = 0.0f;
-        // The secant needs `<p, g - p>`, and forming it as `<p,p> - <g,p>` from two separately reduced
-        // sums is where the step used to lose its meaning: near a stationary point `g` approaches `p`,
-        // so the two sums approach each other while each still carries the rounding of its own
-        // magnitude. Once the true gap falls under about 1e-7 of them the difference is noise, and
-        // since the step is `applied_step * <p,p> / <p, g - p>` a noisy denominator returns an
-        // arbitrarily large step or flips the convexity test outright. Differencing per element
-        // instead costs the rounding of one element rather than of the whole sum.
+        // The secant needs `<p, g - p>` differenced per element, not formed as `<p,p> - <g,p>` from two
+        // separately reduced sums: near a stationary point those sums approach each other while each keeps the
+        // rounding of its own magnitude, and under about 1e-7 of them the difference is noise — the step it
+        // denominates then comes back arbitrarily large or with its convexity test flipped.
         float previous_dot_difference = 0.0f;
         float previous_dot_previous = 0.0f;
         for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) {
@@ -368,30 +341,23 @@ barzilai_borwein_minimize_(fire_scratch<dimensions_> scratch, std::int32_t max_i
         // only state this call has measured.
         if (iteration + 1 == max_iterations) break;
 
-        // `s = -applied_step * p`, so `<s, y> = -applied_step * <p, g - p>` and `<s, s>` is a sum of
-        // squares that carries no cancellation — which is why only the first needed the elementwise
-        // treatment above, and why `<y, y>` is reconstructed here rather than reduced separately.
+        // `s = -applied_step * p`, so `<s,y> = -applied_step * <p, g-p>` and `<s,s>` is a sum of squares with
+        // no cancellation — hence only the first needed the elementwise pass, and `<y,y>` is reconstructed.
         float const step_dot_difference = -applied_step * previous_dot_difference;
         float const step_dot_step = applied_step * applied_step * previous_dot_previous;
         bool const secant_is_convex = step_dot_difference > 0.0f && step_dot_step > 0.0f;
 
-        // `<s,y>/<y,y>`, the short Barzilai-Borwein step, which lies near `1/lambda_max`. Its sibling
-        // `<s,s>/<s,y>` lies near `1/lambda_min` and looks like the better choice on paper: MMFF spans
-        // bond stretches around 2000 kcal/mol/A^2 against torsions near unity, so tracking the stiffest
-        // mode sizes every step for bonds and leaves the soft torsional directions barely moving.
-        //
-        // Measured, on 36 drug-like molecules from RDKit embeddings at the 800-evaluation cap, the long
-        // step is worse on every axis that describes a geometry: median RMS gradient 0.49 against 0.049,
-        // worst case 8.8e4 against 0.58 — it diverges outright on a subset — and a median energy gap to
-        // RDKit's basin of 3.0 kcal/mol against 1.5, with 97 % of molecules landing within 10 kcal/mol
-        // here against 69 %. Unguarded, the long step needs a line search that this kernel has no
-        // registers for; the short step is stable without one. It also flatters the convergence counter
-        // on small well-conditioned molecules while degrading the geometry, so judge a change here by
-        // the energy gap and never by the converged share.
-        //
-        // Without history, or along a direction the secant reports as non-convex, fall back to the
-        // trust region alone — a fixed RMS displacement, which is the one step length that needs no
-        // curvature to be safe.
+        // `<s,y>/<y,y>`, the short Barzilai-Borwein step, near `1/lambda_max`. Its sibling `<s,s>/<s,y>` sits
+        // near `1/lambda_min` and looks better on paper, but unguarded it needs a line search this kernel has
+        // no registers for and diverges outright on part of the corpus; the long step also flatters the
+        // convergence counter on small well-conditioned molecules while degrading the geometry, so judge a
+        // change here by the energy gap and never by the converged share. Measured over 36 drug-like
+        // molecules at the 800-evaluation cap: median RMS gradient 0.49 against 0.049, worst case 8.8e4
+        // against 0.58, a median energy gap to RDKit's basin of 3.0 kcal/mol against 1.5, and 97 % landing
+        // within 10 kcal/mol of it against 69 %. Without history,
+        // or along a
+        // direction the secant reports as non-convex, the fallback is the trust region alone — a fixed RMS
+        // displacement, the one step length that needs no curvature to be safe.
         float const difference_dot_difference = gradient_dot_gradient - previous_dot_previous -
                                                 2.0f * previous_dot_difference;
         float step = secant_is_convex ? step_dot_difference / difference_dot_difference

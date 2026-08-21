@@ -2,20 +2,18 @@
  *  @file test/preprocess/test_descriptor.cpp
  *  @brief Validate `molecule_descriptor_t` against the RDKit accessors it is derived from.
  *
- *  Every field the descriptor carries for an atom, a bond, a neighbour list and a ring is compared against
- *  RDKit's own answer, and the derived bond-hop matrix against `MolOps::getDistanceMat`, RDKit's Floyd-Warshall.
- *  The builtin drug-like set runs unconditionally; naming a `.smi` file on the command line, or in
- *  `SMALLFIELD_TEST_CORPUS`, adds a second section over that corpus.
+ *  Every field the descriptor carries for an atom, a bond, a neighbour list and a ring is compared against RDKit's
+ *  own answer, and the derived bond-hop matrix against `MolOps::getDistanceMat`, RDKit's Floyd-Warshall. The builtin
+ *  drug-like set runs unconditionally; a `.smi` file named on the command line or in `SMALLFIELD_TEST_CORPUS` adds a
+ *  second section over that corpus.
  *
- *  A third pair of sections covers `fill_mmff_perception`, which is the one writer that puts two aromatic
- *  models in one descriptor: that it moves nothing outside `mmff_bond_type` and `atom_flag_mmff_aromatic_k`,
- *  which is what keeps ETKDG reading the perception it is defined on, and that those two fields land where
- *  RDKit's own MMFF force field would have read them.
+ *  A third pair of sections covers `fill_mmff_perception`, the one writer putting two aromatic models in one
+ *  descriptor: that it moves nothing outside `mmff_bond_type` and `atom_flag_mmff_aromatic_k`, which keeps ETKDG
+ *  reading the perception it is defined on, and that those two land where RDKit's own MMFF force field reads them.
  *
- *  `build_descriptor` answers a `conformer_status_t`, so this suite forwards that answer rather than re-deriving
- *  it: a corpus line it refuses is counted under the status it was refused with, and a builtin it refuses is a
- *  defect, since the builtin set is curated to fit. The return is never discarded, because a refusal writes
- *  nothing and the descriptor still holds the previous molecule's fields.
+ *  `build_descriptor` answers a `conformer_status_t`, forwarded rather than re-derived: a corpus line it refuses is
+ *  counted under that status, and a builtin it refuses is a defect, the builtin set being curated to fit. The return
+ *  is never discarded, because a refusal writes nothing and the descriptor still holds the previous molecule.
  */
 
 #include <cstddef> // `std::size_t`
@@ -67,12 +65,12 @@ struct descriptor_scratch_t {
     std::vector<std::uint8_t> bond_hops;
 };
 
-/** Where every corpus line went, so a section that compared little says why. */
+/** Where every corpus line went, so a section that compared little says why. `perceived` counts compared lines whose
+ *  MMFF perception also reached RDKit's own answer, the rest being ones RDKit will not type; `refused` is indexed by
+ *  the status that kept a line out. */
 struct descriptor_tally_t {
     std::size_t compared = 0;
-    /** Compared lines whose MMFF perception also reached RDKit's own answer; the rest RDKit will not type. */
     std::size_t perceived = 0;
-    /** Lines left out of the comparison, indexed by the status that refused them. */
     std::size_t refused[sft::conformer_status_count_k] = {};
 };
 
@@ -161,18 +159,9 @@ static void compare_bond_hops_(RDKit::ROMol const &molecule, descriptor_scratch_
     }
 }
 
-/**
- *  @brief Build the descriptor for one molecule, then compare every field it carries.
- *
- *  A refusal writes nothing, so it returns before the comparisons rather than reading the previous
- *  molecule's descriptor against this molecule's RDKit answers.
- *
- *  @param[in] molecule Sanitized molecule with hydrogens added.
- *  @param[in] smiles The molecule's SMILES, carried into every diagnostic key.
- *  @param[inout] reporter Reporter counting and printing the comparisons.
- *  @param[inout] scratch Buffers reused across molecules.
- *  @return What `build_descriptor` answered, so the caller decides whether a refusal is a defect.
- */
+/** Build the descriptor for one molecule, then compare every field it carries. A refusal writes nothing, so it
+ *  returns before the comparisons rather than reading the previous molecule's descriptor against this one's.
+ *  @return What `build_descriptor` answered, so the caller decides whether a refusal is a defect. */
 static sft::conformer_status_t check_molecule_(RDKit::ROMol const &molecule, std::string const &smiles,
                                                diagnostic_reporter_t &reporter, descriptor_scratch_t &scratch) {
     sft::conformer_status_t const built = sft::build_descriptor(molecule, scratch.descriptor);
@@ -212,18 +201,14 @@ static void blank_mmff_fields_(sft::molecule_descriptor_t &descriptor) {
 /**
  *  @brief Perceive MMFF's aromaticity onto a copy of one molecule's descriptor and check what moved.
  *
- *  Two claims. The first is what keeps the geometry out of it: outside the two MMFF fields, every byte is
- *  the byte `build_descriptor` wrote, so the bounds matrix, the CSD torsion match and the chirality pass
- *  read the perception ETKDG is defined on. The second is that those two fields carry what RDKit's own
- *  force field reads, which is the molecule `MMFFMolProperties` leaves behind — taken from a second parse,
- *  because that constructor perceives once and `MolOps::setMMFFAromaticity` is not idempotent on every
- *  molecule.
+ *  Two claims. First, what keeps the geometry out of it: outside the two MMFF fields every byte is the byte
+ *  `build_descriptor` wrote, so the bounds matrix, the CSD torsion match and the chirality pass read the perception
+ *  ETKDG is defined on. Second, those two fields carry what RDKit's own force field reads, the molecule
+ *  `MMFFMolProperties` leaves behind — taken from a second parse, because that constructor perceives once and
+ *  `MolOps::setMMFFAromaticity` is not idempotent on every molecule.
  *
- *  @param[inout] molecule Molecule already compared against RDKit; its aromaticity is rewritten here.
- *  @param[in] smiles The molecule's SMILES, carried into every diagnostic key and reparsed for the oracle.
- *  @param[inout] etkdg_reporter Reporter for the fields that must not move.
- *  @param[inout] mmff_reporter Reporter for the two fields against RDKit's own perception.
- *  @param[inout] scratch Descriptors reused across molecules.
+ *  @param[inout] molecule Already compared against RDKit; its aromaticity is rewritten here, and @p smiles is
+ *      reparsed for the oracle. @p etkdg_reporter takes the fields that must not move, @p mmff_reporter the two.
  *  @return Whether the molecule reached the comparison against RDKit at all.
  */
 static bool check_mmff_perception_(RDKit::RWMol &molecule, std::string const &smiles,
@@ -299,8 +284,8 @@ static void check_builtin_(std::string const &smiles, diagnostic_reporter_t &rep
 static void check_corpus_line_(std::string const &smiles, diagnostic_reporter_t &reporter,
                                descriptor_scratch_t &scratch, descriptor_tally_t &tally,
                                diagnostic_reporter_t &perception_reporter, perception_scratch_t &perception) {
-    // `SmilesToMol` throws on some malformed input rather than returning null, so it belongs inside the
-    // guard alongside `addHs`.
+    // `SmilesToMol` throws on some malformed input instead of returning null, so it belongs inside the
+    // guard beside `addHs`.
     std::unique_ptr<RDKit::RWMol> molecule;
     try {
         molecule.reset(RDKit::SmilesToMol(smiles));
@@ -346,8 +331,8 @@ int main(int argc, char **argv) {
 
     sftest::diagnostic_reporter_t reporter {"rdkit", "ours"};
     reporter.limit_printed_lines(max_printed_lines_k);
-    // Its own reporter, because the two operands here are one descriptor before and after a pass of ours,
-    // and calling either of them "rdkit" would misname the thing that is being asserted.
+    // Its own reporter: the operands are one descriptor before and after a pass of ours, so calling either
+    // "rdkit" would misname what is asserted.
     sftest::diagnostic_reporter_t perception_reporter {"before", "after"};
     perception_reporter.limit_printed_lines(max_printed_lines_k);
     sftest::descriptor_scratch_t scratch;
@@ -361,8 +346,8 @@ int main(int argc, char **argv) {
     perception_reporter.summarize("mmff_perception_builtin");
 
     if (selection.knob == sftest::corpus_knob_t::named_k) {
-        // Naming a corpus is a request to validate against it, so a path that does not open is a failure
-        // rather than an empty run: the sections would otherwise close with nothing compared.
+        // Naming a corpus is a request to validate against it, so a path that does not open fails rather
+        // than closing every section with nothing compared.
         std::vector<std::string> corpus;
         auto const outcome = sftest::load_smiles_into(selection.path, selection.max_molecules, corpus);
         if (outcome != sftest::smiles_load_t::loaded_k)

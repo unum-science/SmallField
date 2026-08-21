@@ -2,29 +2,20 @@
  *  @file test/api/test_seed_determinism.cpp
  *  @brief Assert that a fixed `random_seed` reproduces conformers bit for bit, whatever surrounds them.
  *
- *  Three properties, each its own section, because each has its own way of failing:
+ *  Three properties, each its own section, because each fails its own way. `repeat` runs one batch twice
+ *  through one `context_t`: preprocess schedules molecules dynamically over host threads and atom-count-sorts
+ *  them per device, so a molecule's offset inside the device batch tracks thread timing, while the kernel
+ *  keys Philox off its position in the caller's input instead. OpenMP stays at its default width, and the
+ *  corpus spans the atom-count bins widely enough that the dynamic chunks interleave differently between
+ *  the two calls. `fresh_context`
+ *  repeats it against a second `context_t` built after the first is destroyed, which is what a second process
+ *  sees and the only section that catches a divergence carried by persistent per-device scratch or by a wave
+ *  size chosen from whatever VRAM was free. `composition` runs a prefix alone, then as the head of a longer
+ *  batch: appending must leave the prefix's coordinates unchanged to the bit.
  *
- *  `repeat` runs the same batch twice through one `context_t`. The threading matters: preprocess hands
- *  molecules to host threads with a dynamic schedule and then atom-count-sorts them per device, so a
- *  molecule's offset inside the device batch is a function of thread timing and nothing keyed off that
- *  offset can reproduce. The kernel therefore keys Philox off the molecule's position in the caller's
- *  input, and this section is what holds it there: OpenMP stays at its default width, and the corpus is
- *  large enough and spread widely enough across the atom-count bins for the dynamic chunks to interleave
- *  differently between the two calls.
- *
- *  `fresh_context` repeats the same batch against a second `context_t` built after the first is destroyed.
- *  That is what a second process does, and it is the only section that can see a divergence carried by
- *  persistent per-device scratch or by a wave size chosen from whatever VRAM happened to be free.
- *
- *  `composition` runs a prefix of the corpus alone, then again as the head of a longer batch. The kernel
- *  keys Philox off a molecule's position in the caller's input rather than its offset inside the device
- *  batch, so appending molecules behind a prefix must leave that prefix's coordinates unchanged to the bit.
- *  A molecule whose geometry moves when its neighbours change is the failure this section names.
- *
- *  Every section compares the coordinate buffer element by element, not only statuses and energies: a
- *  divergence that reshuffles which rows move is invisible to any check coarser than that. The two runs of a
- *  section are stamped with different poison bytes beforehand, so a slot neither run wrote is reported as a
- *  mismatch rather than passing as agreement.
+ *  Every section compares coordinates element by element, since a divergence that reshuffles which rows move
+ *  is invisible to anything coarser, and stamps the two runs with different poison bytes so a slot neither
+ *  wrote is a mismatch rather than agreement.
  */
 
 #include <cstddef> // `std::size_t`
@@ -70,8 +61,7 @@ static constexpr std::uint64_t random_seed_k = 4242;
 static constexpr std::uint32_t composition_prefix_k = 64;
 static constexpr std::uint32_t composition_extension_k = 32;
 
-/** The byte each run's buffers carry before the pipeline writes them; two runs never share one, so a
- *  slot neither run filled differs and is reported instead of agreeing by default. */
+/** Pre-run stamp over each run's buffers; the two differ, so a slot neither filled cannot agree by default. */
 static constexpr int first_run_poison_k = 0xa5;
 static constexpr int second_run_poison_k = 0x5a;
 
@@ -83,15 +73,12 @@ using api::conformer_status_t;
 #pragma region Corpus
 
 /**
- *  @brief Build a corpus of distinct, valid SMILES large enough to expose scheduling jitter.
+ *  @brief Build @p num_molecules distinct, valid SMILES into @p corpus_out, cleared first, large enough
+ *  to expose scheduling jitter.
  *
- *  Cycles a handful of scaffolds and grows an alkyl tail so no two entries are the same molecule, and
- *  repeats the scaffold up to four times so the atom counts run from a dozen to near the pipeline's
- *  largest bin. Spanning the bins is the point: every bin is a separate kernel launch over a separate
- *  group, and a corpus that lands in one bin exercises one of them.
- *
- *  @param[in] num_molecules How many SMILES to produce.
- *  @param[out] corpus_out Filled with the generated strings; cleared first.
+ *  Cycles scaffolds and grows an alkyl tail so no two entries repeat, up to four scaffold repeats, running
+ *  atom counts from a dozen to near the largest bin — each bin is its own kernel launch over its own group,
+ *  so a corpus landing in one bin exercises one of them.
  */
 static void fill_corpus_into(std::size_t num_molecules, std::vector<std::string> &corpus_out) {
     static char const *const scaffolds[] = {"c1ccccc1", "C1CCCCC1", "c1ccncc1", "C1CCNCC1", "c1ccsc1", "C1COCCN1"};
@@ -127,14 +114,9 @@ struct generation_outputs_t {
     std::uint64_t cuda_errors = 0;
 
     /**
-     *  @brief Size every buffer for @p num_molecules and stamp it with @p poison.
-     *
-     *  The poison is what makes an unwritten slot visible: two runs stamped with different bytes agree
-     *  only where the pipeline actually wrote, so a section can never pass on buffers nobody filled.
-     *
-     *  @param[in] num_molecules Molecules the next run will be handed.
-     *  @param[in] layout Slot addressing the run writes through.
-     *  @param[in] poison Byte written over every buffer before the run.
+     *  @brief Size every buffer for @p num_molecules through @p layout and stamp it with @p poison.
+     *  The poison makes an unwritten slot visible: runs stamped with different bytes agree only where the
+     *  pipeline actually wrote, so a section can never pass on buffers nobody filled.
      */
     void reset_for(std::size_t num_molecules, conformer_slot_layout_t layout, int poison) {
         std::size_t const num_slots = num_molecules * layout.num_conformers;
@@ -142,7 +124,7 @@ struct generation_outputs_t {
         energies.resize(num_slots);
         statuses.resize(num_slots);
         num_atoms.resize(num_molecules);
-        /*  `__half` keeps its storage `protected`, so the byte stamp goes through a `void *`. */
+        // `__half` keeps its storage `protected`, so the byte stamp goes through a `void *`.
         std::memset(static_cast<void *>(coordinates.data()), poison, coordinates.size() * sizeof(__half));
         std::memset(energies.data(), poison, energies.size() * sizeof(float));
         std::memset(statuses.data(), poison, statuses.size() * sizeof(conformer_status_t));
@@ -150,15 +132,9 @@ struct generation_outputs_t {
     }
 };
 
-/**
- *  @brief Run one batch through @p context and record what it produced.
- *
- *  @param[in] context GPU context to drive; its CUDA error counter is read and reset around the call.
- *  @param[in] corpus SMILES handed to the pipeline, in the order that keys the seed.
- *  @param[in] layout Slot addressing the outputs are sized for.
- *  @param[in] poison Byte the outputs are stamped with before the call.
- *  @param[out] outputs_out Sized, stamped, then filled by the pipeline.
- */
+/** Run one batch through GPU @p context — whose CUDA error counter is read and reset around the call — over
+ *  @p corpus in the input order that keys the seed, into @p outputs_out sized for @p layout and stamped
+ *  with @p poison first. */
 static void generate_into(sfapi::context_t &context, custd::span<std::string_view const> corpus,
                           conformer_slot_layout_t layout, int poison, generation_outputs_t &outputs_out) {
     sfapi::config_t config;
@@ -186,12 +162,12 @@ static std::size_t count_successes(generation_outputs_t const &outputs, std::siz
 
 #pragma region Comparison
 
-/** What one section counted, in the units its diagnostics are read in. */
+/** What one section counted, in its diagnostics' units. The `unwritten_on_one_side` count is differing
+ *  elements one run left at zero, separating a geometry that moved from one never written. */
 struct divergence_tally_t {
     std::size_t slots_compared = 0;
     std::size_t slots_with_moved_coordinates = 0;
     std::size_t coordinate_elements_differing = 0;
-    /** Differing elements one run left at zero, which separates a geometry that moved from one never written. */
     std::size_t coordinate_elements_unwritten_on_one_side = 0;
     std::size_t coordinate_elements_compared = 0;
     std::size_t successes_first = 0;
@@ -206,14 +182,10 @@ struct slot_difference_t {
 };
 
 /**
- *  @brief Locate and count the halves that differ between one slot of two runs.
- *
- *  Compared as raw bytes rather than as floats, because a bitwise reproduction is the claim: two halves
- *  that both decode to a NaN are still a divergence, and `==` would call them equal.
- *
- *  @param[in] first Slot of the first run.
- *  @param[in] second Slot of the second run.
- *  @return Where the slots first part company, how far apart they are, and how much of that is a zero.
+ *  @brief Locate and count the halves that differ between slot @p first and slot @p second: where they
+ *  first part company, how far apart they are, and how much of that is a zero.
+ *  Raw bytes rather than floats, because bitwise reproduction is the claim: two halves that both decode
+ *  to a NaN are still a divergence, and `==` would call them equal.
  */
 static slot_difference_t compare_slot_(custd::span<__half const> first, custd::span<__half const> second) {
     slot_difference_t difference;
@@ -230,19 +202,12 @@ static slot_difference_t compare_slot_(custd::span<__half const> first, custd::s
 }
 
 /**
- *  @brief Compare two runs slot by slot and report every field that did not reproduce.
+ *  @brief Compare reference @p first against @p second slot by slot, reporting every field that did not
+ *  reproduce through @p reporter under @p subject and counting into @p tally_out.
  *
- *  Walks the first @p num_molecules molecules of both runs, which is what lets a longer batch be compared
- *  against the prefix it contains. Coordinates are addressed through the layout rather than by a flat read,
- *  and the differing element is named by its atom and axis so a report says where the geometry moved.
- *
- *  @param[in] reporter Owns the diagnostic grammar and the section's counters.
- *  @param[in] subject Section name the lines carry.
- *  @param[in] layout Slot addressing shared by both runs.
- *  @param[in] num_molecules Molecules to compare, at the same input index in both runs.
- *  @param[in] first Reference run.
- *  @param[in] second Run under test.
- *  @param[out] tally_out Filled with what the section counted.
+ *  Walks the first @p num_molecules molecules of both at the same input index, which is what lets a longer
+ *  batch be compared against the prefix it contains. Coordinates are addressed through @p layout rather than
+ *  by a flat read, and the differing element is named by its atom and axis so a report says where it moved.
  */
 static void compare_runs_into(diagnostic_reporter_t &reporter, std::string_view subject, conformer_slot_layout_t layout,
                               std::size_t num_molecules, generation_outputs_t const &first,
@@ -261,9 +226,8 @@ static void compare_runs_into(diagnostic_reporter_t &reporter, std::string_view 
             std::uint32_t const atom = static_cast<std::uint32_t>(reported - axis * layout.max_atoms);
 
             reporter
-                /*  `num_atoms` opens the keys as well as being compared below, because whether the atom a
-                 *  line names lies inside the molecule or out in the slot's padding is the first thing a
-                 *  reader asks, and keys are what a log is filtered on. */
+                // `num_atoms` keys the line as well as being compared below, since a log is filtered on
+                // keys and whether the named atom is inside the molecule or in padding is asked first.
                 .mismatch(subject, "molecule={} conformer={} atom={} axis={} num_atoms={}", molecule, conformer, atom,
                           axis, static_cast<std::uint32_t>(first.num_atoms[molecule]))
                 .field("status", static_cast<std::uint32_t>(first.statuses[slot]),
@@ -274,8 +238,7 @@ static void compare_runs_into(diagnostic_reporter_t &reporter, std::string_view 
                        [](float reference, float observed) {
                            return std::memcmp(&reference, &observed, sizeof(float)) == 0;
                        })
-                /*  The predicate is the byte comparison already made over the whole slot, so the pair
-                 *  printed beside it is the first element that comparison rejected. */
+                // The predicate is the whole-slot byte compare, so the pair printed is the first it rejected.
                 .field("coordinate_angstrom", __half2float(first_slot[reported]), __half2float(second_slot[reported]),
                        [coordinates_agree](float, float) { return coordinates_agree; });
 
@@ -306,14 +269,8 @@ static void print_section_summary(std::string_view subject, divergence_tally_t c
 
 #pragma region Sections
 
-/**
- *  @brief Same batch, same seed, twice through one context, then once more through a fresh one.
- *
- *  @param[in] corpus SMILES handed to every run.
- *  @param[in] layout Slot addressing shared by every run.
- *  @param[in] reporter Section counters and diagnostics.
- *  @param[out] first_out The first run, kept so the caller can gate on what it produced.
- */
+/** Same @p corpus, same seed, twice through one context and once through a fresh one, all at @p layout;
+ *  @p first_out keeps the first run so the caller can gate on what it produced. */
 static void check_repeatability(custd::span<std::string_view const> corpus, conformer_slot_layout_t layout,
                                 diagnostic_reporter_t &reporter, generation_outputs_t &first_out) {
     generation_outputs_t second, third;
@@ -328,8 +285,7 @@ static void check_repeatability(custd::span<std::string_view const> corpus, conf
     compare_runs_into(reporter, "repeat", layout, corpus.size(), first_out, second, repeat_tally);
     print_section_summary("repeat", repeat_tally);
 
-    /*  A second context after the first is destroyed is what a second process sees: fresh per-device
-     *  scratch, and a wave size resolved against whatever VRAM is free at that moment. */
+    // A fresh context is what a second process sees: new per-device scratch, wave size re-resolved from VRAM.
     {
         sfapi::context_t context(custd::span<int const>(&device_id, 1));
         generate_into(context, corpus, layout, second_run_poison_k, third);
@@ -341,23 +297,18 @@ static void check_repeatability(custd::span<std::string_view const> corpus, conf
 }
 
 /**
- *  @brief The same molecules at the same input indices, alone and then followed by more molecules.
+ *  @brief The same molecules of @p corpus at the same input indices, alone and then followed by more,
+ *  at @p layout and counted into @p tally_out.
  *
- *  The prefix keeps its input positions, so the seed stream of every conformer in it is unchanged and the
- *  only difference is who else rode along. Anything that moves is a batch-composition dependency.
- *
- *  @param[in] corpus SMILES the prefix and the extension are taken from, in order.
- *  @param[in] layout Slot addressing shared by both runs.
- *  @param[in] reporter Section counters and diagnostics.
- *  @param[out] tally_out Filled with what the section counted.
+ *  The prefix keeps its input positions, so every conformer's seed stream is unchanged and the only
+ *  difference is who else rode along. Anything that moves is a batch-composition dependency.
  */
 static void check_batch_composition(custd::span<std::string_view const> corpus, conformer_slot_layout_t layout,
                                     diagnostic_reporter_t &reporter, divergence_tally_t &tally_out) {
     std::size_t const prefix_size = std::min<std::size_t>(composition_prefix_k, corpus.size());
     std::size_t const extended_size = std::min<std::size_t>(prefix_size + composition_extension_k, corpus.size());
 
-    /*  A context of its own for each run, so neither the order of the two calls nor anything a context
-     *  carries between them can stand in for the one variable under test: who else was in the batch. */
+    // A context per run, so call order and carried state cannot stand in for the variable: who else rode along.
     generation_outputs_t alone, extended;
     int const device_id = 0;
     {

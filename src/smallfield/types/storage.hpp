@@ -2,31 +2,19 @@
  *  @file   src/smallfield/types/storage.hpp
  *  @brief  Owning storage, allocated and released in stream order.
  *
- *  `types/views.hpp` describes memory nobody here owns. This header owns it, and hands out the views that
- *  header defines. The two are deliberately separate: a view is a shape over someone else's bytes, while
- *  owning storage drags in the CUDA runtime, so a header that only names a shape must not pay for it.
+ *  `types/views.hpp` names shapes nobody owns; this header owns the memory and hands out those views, kept
+ *  apart because owning storage drags in the CUDA runtime a shape-only header must not pay for.
  *
- *  @section stream_ordered Why the allocator carries a stream
- *
- *  `cudaMalloc` and `cudaFree` both synchronize the whole device. Under the per-device OpenMP fan-out that
- *  means every allocation on any device serializes against every other device's in-flight work, which is the
- *  driver-lock contention the pre-allocation discipline exists to avoid rather than merely postpone.
- *
- *  `cudaMallocAsync` takes the allocation from a per-device pool and orders it against one stream's other
- *  work, so it neither synchronizes nor contends. The stream also @b carries the device, so a free reaches
- *  the context that made the allocation without anyone storing a device id and switching to it by hand.
- *
- *  The consequence is larger than the signature: a slab carved by hand into typed regions exists mostly to
- *  amortize `cudaMalloc`, and stream-ordered allocation removes that cost. Sub-allocation is worth keeping
- *  only where one allocation is what makes an upload a single `cudaMemcpyAsync` instead of many — true of
- *  the wave pool, which carves itself, and of nothing else in this project.
- *
- *  @section failure Where failure is reported
- *
- *  `try_reserve` says whether the buffer grew, and nothing more. A stream-ordered allocation's reason for
- *  failing belongs to the stream, and is read at the sync point the caller already has, rather than being
- *  copied into a return value at every call site that cannot act on it. `upload_into` and `download_from`
- *  take a sink because a `cudaMemcpyAsync` argument error is a programming mistake worth naming immediately.
+ *  Every allocation is stream-ordered and the allocator carries the stream. `cudaMalloc` and `cudaFree`
+ *  synchronize the whole device, so under the per-device OpenMP fan-out one allocation serializes against
+ *  every other device's in-flight work, while `cudaMallocAsync` draws from a per-device pool and orders
+ *  against one stream that also @b carries the device, so a free reaches the context that made the
+ *  allocation with no device id stored and switched to by hand. That removes the cost a hand-carved slab
+ *  amortizes, leaving sub-allocation worth keeping only where one allocation makes an upload a single
+ *  `cudaMemcpyAsync` — the wave pool, which carves itself, and nothing else here. `try_reserve` says only
+ *  whether the buffer grew, a stream-ordered allocation's reason for failing belonging to the stream and
+ *  read at the caller's existing sync point, while `upload_into` and `download_from` take a sink because a
+ *  `cudaMemcpyAsync` argument error is a programming mistake worth naming immediately.
  */
 
 #pragma once
@@ -46,13 +34,10 @@ namespace smallfield::types {
 
 #pragma region Policies
 
-/**
- *  @brief Where an allocation lives, and therefore who may dereference it.
- *
- *  A compile-time property read by `requires`-clauses, never by a branch on the allocation path. Host code
- *  dereferencing a device pointer is the failure this exists to make unspellable, and a runtime enum inside
- *  the buffer would only let it be detected, one wave too late.
- */
+/** Where an allocation lives, and therefore who may dereference it. A compile-time property read by
+ *  `requires`-clauses, never by a branch on the allocation path: host code dereferencing a device pointer
+ *  is the failure this makes unspellable, where a runtime enum inside the buffer would only let it be
+ *  detected, one wave too late. */
 enum class memory_residence_t : std::uint8_t {
     /** Reachable by the CPU. Pinned host memory is still host memory. */
     host_k,
@@ -60,13 +45,10 @@ enum class memory_residence_t : std::uint8_t {
     device_k,
 };
 
-/**
- *  @brief What `try_reserve` did, and what the caller must do about interior pointers.
- *
- *  A `bool` folds "already large enough" — the steady-state answer, which makes no driver call — into the
- *  same `true` as "grew", which is an allocation on a path the pre-reservation exists to keep clear. Naming
- *  them separately makes that invariant assertable rather than a comment nothing re-checks.
- */
+/** What `try_reserve` did, and what the caller must do about interior pointers. A `bool` would fold
+ *  "already large enough", the steady-state answer making no driver call, into the same `true` as "grew",
+ *  an allocation on the path pre-reservation exists to keep clear; naming them apart makes that invariant
+ *  assertable rather than a comment nothing re-checks. */
 enum class reserve_outcome_t : std::uint8_t {
     /** Already large enough. Nothing allocated, every interior pointer still valid. */
     unchanged_k,
@@ -76,14 +58,10 @@ enum class reserve_outcome_t : std::uint8_t {
     failed_k,
 };
 
-/**
- *  @brief Whether a table an uploader was asked to stage is readable by a kernel.
- *
- *  A length cannot carry this: a legitimately empty table uploads nothing and yields an empty span, which
- *  every lookup already reads as "no entry", while a refused reservation or copy yields the same empty span
- *  and means the caller holds no parameters at all. The two call for opposite responses, so the uploader
- *  answers with a state and the caller drops the device on `refused_k`.
- */
+/** Whether a table an uploader was asked to stage is readable by a kernel. A length cannot carry this: a
+ *  legitimately empty table and a refused reservation or copy both yield an empty span, one meaning "no
+ *  entry" to every lookup and the other that the caller holds no parameters at all. They call for opposite
+ *  responses, so the uploader answers with a state and the caller drops the device on `refused_k`. */
 enum class table_residency_t : std::uint8_t {
     /** Every table landed. An empty span among them is an empty table, not a lost one. */
     resident_k,
@@ -91,11 +69,8 @@ enum class table_residency_t : std::uint8_t {
     refused_k,
 };
 
-/**
- *  @brief Acquires and releases raw bytes, returning the pointer and leaving the reason to the stream.
- *
- *  `allocate` is not `const`: a stream-ordered allocator may record the pool it drew from.
- */
+/** Acquires and releases raw bytes, returning the pointer and leaving the reason to the stream. `allocate`
+ *  is not `const`, because a stream-ordered allocator may record the pool it drew from. */
 template <typename allocator_type_>
 concept memory_allocator = requires(allocator_type_ allocator, void *pointer, std::size_t bytes) {
     { allocator_type_::residence_k } -> std::convertible_to<memory_residence_t>;
@@ -107,11 +82,10 @@ concept memory_allocator = requires(allocator_type_ allocator, void *pointer, st
  *  @brief Page-locked host memory, so a `cudaMemcpyAsync` out of it is genuinely asynchronous.
  *
  *  A copy from pageable memory degrades to a synchronous staging copy inside the driver, which is why the
- *  wave pool is one pinned allocation rather than a `std::vector`.
- *
- *  There is no stream here, and that is not an omission. `cudaHostAlloc` has no stream-ordered form — pinning
- *  pages is a host-side kernel operation — so carrying a stream would suggest an ordering the call does not
- *  have. Pinned buffers are reserved once during construction, off the wave path, where blocking is free.
+ *  wave pool is one pinned allocation rather than a `std::vector`. There is no stream here and that is no
+ *  omission: `cudaHostAlloc` has no stream-ordered form — pinning pages is a host-side kernel operation — so
+ *  carrying one would suggest an ordering the call lacks. Pinned buffers are reserved once at construction,
+ *  off the wave path, where blocking is free.
  */
 struct pinned_allocator_t {
     static constexpr memory_residence_t residence_k = memory_residence_t::host_k;
@@ -123,17 +97,13 @@ struct pinned_allocator_t {
     void deallocate(void *pointer) noexcept { [[maybe_unused]] cudaError_t const status = cudaFreeHost(pointer); }
 };
 
-/**
- *  @brief Device memory drawn from the per-device pool and released in stream order.
- *
- *  The stream must outlive the buffer — `cudaFreeAsync` against a destroyed stream is undefined, so a buffer
- *  built on a per-wave stream is released before that stream is, which is the same lifetime rule every other
- *  stream-ordered resource in the pipeline already follows.
- */
+/** Device memory drawn from the per-device pool, allocated and freed against `stream`, whose error state
+ *  reports their failure. That stream must outlive the buffer: `cudaFreeAsync` against a destroyed stream is
+ *  undefined, so a buffer built on a per-wave stream is released before the stream is — the lifetime rule
+ *  every other stream-ordered resource in the pipeline already follows. */
 struct device_allocator_t {
     static constexpr memory_residence_t residence_k = memory_residence_t::device_k;
 
-    /** Allocations and frees are ordered against this stream, whose error state reports their failure. */
     cudaStream_t stream = nullptr;
 
     void *allocate(std::size_t bytes) noexcept {
@@ -150,16 +120,11 @@ struct device_allocator_t {
 
 #pragma region Stream
 
-/**
- *  @brief Owning CUDA stream, so the ordering `device_allocator_t` depends on is a lifetime rather than
- *  a sequence of statements.
- *
- *  A raw `cudaStream_t` member destroyed by hand puts the deallocations of every buffer built on it at
- *  the mercy of statement order in some destructor's body, and a member freed after that body runs is
- *  then a `cudaFreeAsync` against a destroyed stream. Owning the handle moves the question to member
- *  declaration order, which the compiler settles: declare the stream before the buffers ordered against
- *  it and it is destroyed after them.
- */
+/** Owning CUDA stream, so the ordering `device_allocator_t` depends on is a lifetime rather than a sequence
+ *  of statements. A raw `cudaStream_t` destroyed by hand leaves every buffer built on it at the mercy of
+ *  statement order in some destructor's body, and a member freed after that body runs is a `cudaFreeAsync`
+ *  against a destroyed stream. Owning it moves the question to member declaration order, which the compiler
+ *  settles — declare the stream before the buffers ordered against it and it is destroyed after them. */
 class device_stream_t {
     cudaStream_t handle_ = nullptr;
 
@@ -177,12 +142,8 @@ class device_stream_t {
     }
     ~device_stream_t() noexcept { release_(); }
 
-    /**
-     *  @brief Create the stream on the current device, replacing whatever this held.
-     *
-     *  @param[in] sink Routes a refused creation to the logger and the error counter.
-     *  @return Whether the stream exists afterward; a refusal leaves this empty.
-     */
+    /** Create the stream on the current device, replacing whatever this held, and answer whether it exists
+     *  afterward; a refusal leaves this empty and reaches @p sink's logger and error counter. */
     [[nodiscard]] bool create(cuda_error_sink_t const &sink = {}) noexcept {
         release_();
         return sink.check(cudaStreamCreate(&handle_), "cudaStreamCreate");
@@ -202,24 +163,16 @@ class device_stream_t {
 
 #pragma region Buffer
 
-/**
- *  @brief Grow-only typed storage over one allocator.
- *
- *  Contents do not survive a grow, and a grow that fails changes nothing: the replacement is acquired before
- *  the old allocation is released, so an out-of-memory condition costs a wave rather than the working buffer
- *  the next wave would have reused.
- *
- *  Not copyable, because a copy would have to choose between sharing an allocation two destructors will free
- *  and silently issuing a second one the size of the first.
- */
+/** Grow-only typed storage over one allocator. Contents do not survive a grow, and a grow that fails
+ *  changes nothing: the replacement is acquired before the old allocation is released, so out of memory
+ *  costs a wave rather than the working buffer the next wave would have reused. Not copyable, because a copy
+ *  would have to choose between sharing an allocation two destructors will free and silently issuing a
+ *  second one the size of the first. The allocator moves with the pointer, holding the stream that decides
+ *  which device and which ordering the free runs against; leaving it behind leaks across devices. */
 template <typename value_type_, memory_allocator allocator_type_>
 class buffer {
     value_type_ *pointer_ = nullptr;
     std::size_t capacity_ = 0;
-    /*
-     *  Moves with the pointer. A stream-ordered allocator holds the stream deciding which device and which
-     *  ordering the free runs against, and leaving it behind is how a buffer leaks across devices.
-     */
     [[no_unique_address]] allocator_type_ allocator_ {};
 
   public:
@@ -257,13 +210,9 @@ class buffer {
     [[nodiscard]] custd::span<value_type_> view() noexcept { return {pointer_, capacity_}; }
     [[nodiscard]] custd::span<value_type_ const> view() const noexcept { return {pointer_, capacity_}; }
 
-    /**
-     *  @brief Grow to span at least @p count elements, allocating before releasing.
-     *
-     *  @param[in] count Elements, not bytes.
-     *  @return What happened, and with it whether interior pointers survived. On `failed_k` the stream
-     *          carries the reason, read at whatever sync point the caller already has.
-     */
+    /** Grow to span at least @p count elements — elements, not bytes — allocating before releasing.
+     *  Answers what happened, and with it whether interior pointers survived; on `failed_k` the stream
+     *  carries the reason, read at whatever sync point the caller already has. */
     [[nodiscard]] reserve_outcome_t try_reserve(std::size_t count) noexcept {
         if (count <= capacity_) return reserve_outcome_t::unchanged_k;
 
@@ -305,13 +254,10 @@ using device_indices_t = buffer<std::uint32_t, device_allocator_t>;
 /**
  *  @brief Copy host elements onto the device along @p stream.
  *
- *  Both extents come from the spans, so a caller cannot restate one and get it wrong; a destination smaller
- *  than the source is refused rather than truncated.
- *
- *  A pageable source silently degrades this to a blocking staged copy inside the driver, which is why the
- *  wave pool stages through `pinned_bytes_t`. The call still belongs on an explicit stream either way: the
- *  legacy default stream would serialize against every other stream on the device.
- *
+ *  Both extents come from the spans, so a caller cannot restate one and get it wrong, and a destination
+ *  smaller than the source is refused rather than truncated. A pageable source silently degrades this to a
+ *  blocking staged copy inside the driver, which is why the wave pool stages through `pinned_bytes_t`; the
+ *  call belongs on an explicit stream either way, the legacy default one serializing against every other.
  *  @param[out] destination Device elements to overwrite.
  *  @param[in] source Host elements to read.
  *  @param[in] stream Orders this copy against the rest of the wave's work.
@@ -330,7 +276,6 @@ template <typename element_>
 
 /**
  *  @brief Copy device elements back to the host along @p stream.
- *
  *  @param[out] destination Host elements to overwrite, pinned if the copy is to overlap anything.
  *  @param[in] source Device elements to read.
  *  @param[in] stream Orders this copy after the kernels that produced @p source.

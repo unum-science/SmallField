@@ -3,18 +3,16 @@
  *  @brief Validate the batch-layout arithmetic against 32-bit wrap, with no GPU and no RDKit corpus.
  *
  *  Two regions a batch carries are quadratic in the atom count — the N × N distance bounds matrix and the
- *  N × N hop-count matrix — and every other region is linear. A `std::uint32_t` running total of a
- *  quadratic region wraps inside a single `embedding-wave` at drug-like sizes, and a wrapped total
- *  under-sizes the pinned allocation rather than failing, so the test drives `accumulate_sizes` and the
- *  slice walk at molecule counts either side of the wrap and checks the totals against arithmetic done
- *  in 64 bits.
+ *  N × N hop-count matrix — and every other is linear. A `std::uint32_t` running total of a quadratic
+ *  region wraps inside a single `embedding-wave` at drug-like sizes and under-sizes the pinned allocation
+ *  rather than failing, so `accumulate_sizes` and the slice walk are driven at molecule counts either side
+ *  of the wrap and checked against arithmetic done in 64 bits.
  *
- *  Nothing here allocates the batch it describes: the walk over an unallocated cursor hands out empty
- *  spans and totals bytes, so a 17 GB slice costs the test a few microseconds. One walk over a
- *  one-molecule allocation follows, which is what ties those byte totals to the spans they pay for.
- *
- *  A slice sized past what a host can page lock is the other half of the same arithmetic, so the pack
- *  pass is driven at one and checked to refuse its device's molecules by name rather than silently.
+ *  Nothing here allocates the batch it describes: an unallocated cursor hands out empty spans and only
+ *  totals bytes, so a 17 GB slice costs a few microseconds, and one walk over a one-molecule allocation
+ *  then ties those byte totals to the spans they pay for. A slice sized past what a host can page lock is
+ *  the same arithmetic's other half, so the pack pass is driven at one and checked to refuse its device's
+ *  molecules by name rather than silently.
  */
 
 #include <cstddef> // `std::byte`, `std::size_t`
@@ -44,7 +42,7 @@ static constexpr std::uint32_t sweep_molecule_count_k = 120'000;
 /** Atoms per molecule at which the wrap first bites inside the shipped 400000-molecule wave clamp. */
 static constexpr std::uint32_t drug_like_atom_count_k = 104;
 
-/** The clamp `compute_wave_size_` applies before this cap was derived. */
+/** The molecule-count clamp `compute_wave_size_` applies, which the cap and the wrap point sit under. */
 static constexpr std::uint32_t wave_size_clamp_k = 400'000;
 
 namespace smallfield::tests {
@@ -84,12 +82,8 @@ static sfp::per_mol_sizes_t accumulate_uniform_batch_(uniform_batch_expectation_
     return totals;
 }
 
-/**
- *  @brief Check that the accumulators reproduce the 64-bit arithmetic for one uniform batch.
- *
- *  @param[in] expectation Counts the batch must total.
- *  @param[inout] reporter Sink for the per-field diagnostics and the section's comparison count.
- */
+/** Check that the accumulators reproduce the 64-bit arithmetic for one uniform batch, @p expectation naming the
+ *  counts it must total and @p reporter taking the per-field diagnostics. */
 static void check_accumulators_(uniform_batch_expectation_t const &expectation, diagnostic_reporter_t &reporter) {
     sfp::per_mol_sizes_t const totals = accumulate_uniform_batch_(expectation);
     reporter.mismatch("accumulate", "molecules={} atoms={}", expectation.molecules, expectation.atoms_per_molecule)
@@ -103,14 +97,10 @@ static void check_accumulators_(uniform_batch_expectation_t const &expectation, 
 /**
  *  @brief Check that the walk sizes every region the accumulators counted, past the 32-bit ceiling.
  *
- *  The walk is driven over an unallocated cursor, which is how it is driven to size the pool: every
- *  carve hands back an empty span and only the byte total advances. The bounds matrix is the first
- *  region placed and the hop-count matrix the last, so a total that wrapped shows up as an uploaded
- *  prefix too small for the bounds matrix, or a device-only remainder too small for the hop counts.
- *  A carve that also fits the pool is what `check_carve_` covers.
- *
- *  @param[in] expectation Counts the batch must total.
- *  @param[inout] reporter Sink for the per-field diagnostics and the section's comparison count.
+ *  Driven over an unallocated cursor, which is how the pool is sized: every carve hands back an empty span and only
+ *  the byte total advances. The bounds matrix is placed first and the hop-count matrix last, so a wrapped total shows
+ *  up as an uploaded prefix too small for the bounds matrix or a device-only remainder too small for the hop counts.
+ *  A carve that also fits the pool is `check_carve_`'s job.
  */
 static void check_layout_(uniform_batch_expectation_t const &expectation, diagnostic_reporter_t &reporter) {
     // One torsion slot per molecule keeps the device-only torsion region out of the comparison.
@@ -128,16 +118,10 @@ static void check_layout_(uniform_batch_expectation_t const &expectation, diagno
         .field("device_only_bytes", bond_distance_bytes, slice_bytes - uploaded_bytes, at_least);
 }
 
-/**
- *  @brief Check that a walk over an allocation hands back the same regions the sizing walk paid for.
- *
- *  Run at one molecule, because the point is the relation between the two walks rather than the
- *  arithmetic width: every span has to land inside the pool the sizing walk asked for, the uploaded
- *  prefix has to stop before the first device-only region, and both extents have to be the element
- *  counts the shape stated.
- *
- *  @param[inout] reporter Sink for the per-field diagnostics and the section's comparison count.
- */
+/** Check that a walk over an allocation hands back the same regions the sizing walk paid for. Run at one molecule,
+ *  since the point is the relation between the two walks, not the arithmetic width: every span lands inside the pool
+ *  the sizing walk asked for, the uploaded prefix stops before the first device-only region, and both extents are the
+ *  element counts the shape stated. */
 static void check_carve_(diagnostic_reporter_t &reporter) {
     auto const single = expect_uniform_batch_(1u, drug_like_atom_count_k);
     sfp::wave_slice_shape_t const shape {.totals = accumulate_uniform_batch_(single), .torsion_stride = 1u};
@@ -163,20 +147,15 @@ static void check_carve_(diagnostic_reporter_t &reporter) {
                exactly_equal)
         .field("bounds_inside_pool", slice_bytes, bounds_end, at_most)
         .field("hops_inside_pool", slice_bytes, hops_end, at_most)
-        // The bounds matrix crosses PCIe and the hop counts do not, so the prefix the transfer rides
-        // has to cover the first and stop before the second.
+        // The bounds matrix crosses PCIe and the hop counts do not, so the transfer's prefix covers the
+        // first and stops before the second.
         .field("uploaded_covers_bounds", bounds_end, static_cast<std::uint64_t>(view.uploaded.size()), at_least)
         .field("uploaded_stops_before_hops", static_cast<std::uint64_t>(view.uploaded.size()), hops_start, at_least);
 }
 
-/**
- *  @brief Check that `max_molecules_per_batch_k` is exactly what the 32-bit offset fields can address.
- *
- *  The cap is the last molecule count whose final bounds offset still fits a `std::uint32_t`, so both
- *  sides of it are asserted: the cap itself fits and one more does not.
- *
- *  @param[inout] reporter Sink for the per-field diagnostics and the section's comparison count.
- */
+/** Check that `max_molecules_per_batch_k` is exactly what the 32-bit offset fields can address: the cap is the last
+ *  molecule count whose final bounds offset still fits a `std::uint32_t`, so both sides are asserted - the cap fits,
+ *  one more does not. */
 static void check_offset_cap_(diagnostic_reporter_t &reporter) {
     constexpr std::uint64_t offset_ceiling_k = std::numeric_limits<std::uint32_t>::max();
     constexpr std::uint64_t square_elements_k = static_cast<std::uint64_t>(sweep_atom_count_k) * sweep_atom_count_k;
@@ -188,8 +167,8 @@ static void check_offset_cap_(diagnostic_reporter_t &reporter) {
     reporter.mismatch("cap", "cap={} atoms={}", cap_k, sweep_atom_count_k)
         .field("offset_at_cap", offset_ceiling_k, cap_k * square_elements_k, fits)
         .field("offset_past_cap", offset_ceiling_k, (cap_k + 1u) * square_elements_k, exceeds)
-        // Every linear region is bounded per molecule by the MMFF interaction reservation, which is
-        // what makes the bounds matrix the region the cap has to be derived from.
+        // The MMFF interaction reservation bounds every linear region per molecule, which is what makes
+        // the bounds matrix the region the cap derives from.
         .field("mmff_interactions_at_cap", offset_ceiling_k, cap_k * smallfield::types::max_mmff_interactions_per_mol_k,
                fits)
         // The cap has to bind before the wave clamp does, or it never gets a chance to.
@@ -199,39 +178,30 @@ static void check_offset_cap_(diagnostic_reporter_t &reporter) {
 /**
  *  @brief Check the bound across atom capacities, which is where a wave and a slice have to agree.
  *
- *  Two independent sites read this function at the caller's own atom capacity — the wave sizing that
- *  decides how many molecules a wave carries, and the preprocess refusal that drops whatever a slice
- *  hands it past the bound. They agree only while it answers identically for every spelling of "no
- *  capacity of my own" and never rises as the capacity widens, so both are asserted here rather than
- *  left to the one call site each happens to take.
- *
- *  @param[inout] reporter Sink for the per-field diagnostics and the section's comparison count.
+ *  Two sites read this at the caller's own atom capacity — the wave sizing that decides how many molecules a wave
+ *  carries, and the preprocess refusal that drops whatever a slice hands it past the bound. They agree only while it
+ *  answers identically for every spelling of "no capacity of my own" and never rises as the capacity widens, so both
+ *  are asserted here rather than left to one call site each.
  */
 static void check_capacity_bound_(diagnostic_reporter_t &reporter) {
     constexpr std::uint64_t cap_k = sfp::max_molecules_per_batch_k;
 
     auto const at_least = [](std::uint64_t reference, std::uint64_t observed) { return observed >= reference; };
-    // Zero is how a caller says it imposes no capacity of its own, and a capacity wider than the
-    // pipeline's own cap cannot buy room the pipeline does not have; both fold onto the cap.
+    // Zero says the caller imposes no capacity of its own, and a capacity wider than the pipeline's cap
+    // cannot buy room the pipeline lacks; both fold onto the cap.
     reporter.mismatch("capacity", "atoms={} cap={}", sweep_atom_count_k, cap_k)
         .field("unbounded_equals_cap", cap_k, static_cast<std::uint64_t>(sfp::max_molecules_for_atom_capacity(0u)),
                exactly_equal)
         .field("above_cap_equals_cap", cap_k,
                static_cast<std::uint64_t>(sfp::max_molecules_for_atom_capacity(sweep_atom_count_k + 1u)), exactly_equal)
-        // The bound is quadratic in the capacity, so halving the capacity admits at least four times
-        // the molecules — which is what makes the cap at the pipeline's own atom cap the tightest one.
+        // The bound is quadratic in the capacity, so halving it admits at least four times the molecules,
+        // which is what makes the cap at the pipeline's own atom cap the tightest.
         .field("half_capacity_admits_four_times", 4u * cap_k,
                static_cast<std::uint64_t>(sfp::max_molecules_for_atom_capacity(sweep_atom_count_k / 2u)), at_least);
 }
 
-/**
- *  @brief Check the molecule count at which a 32-bit total first wraps for drug-like molecules.
- *
- *  The figure is what makes the defect concrete rather than theoretical: it sits below the wave clamp,
- *  so a shipped configuration reaches it.
- *
- *  @param[inout] reporter Sink for the per-field diagnostics and the section's comparison count.
- */
+/** Check the molecule count at which a 32-bit total first wraps for drug-like molecules. The figure makes the defect
+ *  concrete: it sits below the wave clamp, so a shipped configuration reaches it. */
 static void check_drug_like_wrap_(diagnostic_reporter_t &reporter) {
     constexpr std::uint64_t wrap_at_k = std::uint64_t {1} << 32;
     constexpr std::uint64_t square_elements_k = static_cast<std::uint64_t>(drug_like_atom_count_k) *
@@ -250,22 +220,17 @@ static void check_drug_like_wrap_(diagnostic_reporter_t &reporter) {
 /**
  *  @brief Check that a device whose pinned staging cannot be reserved refuses its batch out loud.
  *
- *  The pack pass sizes each device's pinned pool from the molecules assigned to it, and the one thing
- *  it cannot do is hand the launch a pool it never allocated: the pool then carries no molecules, the
- *  launch skips the device, and every molecule of it keeps whatever the caller pre-filled. So the
- *  refusal is filed per molecule under `batch_overflow_k` — the status whose producer this is, and a
- *  terminal one, so the shard parks and is re-run at a wave that fits.
- *
- *  Driven by fabricating molecules whose bounds matrices alone span more bytes than any host can page
- *  lock, which is what a mis-sized wave looks like from inside the pack pass. Nothing is allocated to
- *  reach it: the reservation is refused before a single byte is packed, so the check needs neither a
- *  GPU nor a corpus.
- *
- *  @param[inout] reporter Sink for the per-field diagnostics and the section's comparison count.
+ *  The pack pass sizes each device's pinned pool from the molecules assigned to it, and the one thing it cannot do is
+ *  hand the launch a pool it never allocated: the pool then carries no molecules, the launch skips the device, and
+ *  every molecule keeps whatever the caller pre-filled. So the refusal is filed per molecule under `batch_overflow_k`
+ *  — this is that status's producer, and it is terminal, so the shard parks and is re-run at a wave that fits. It is
+ *  driven by fabricating molecules whose bounds matrices alone outspan what any host can page lock, which is what a
+ *  mis-sized wave looks like from inside the pack pass; the reservation is refused before a byte is packed, so the
+ *  check needs neither a GPU nor a corpus.
  */
 static void check_pinned_refusal_(diagnostic_reporter_t &reporter) {
-    // Four molecules of 400000 atoms ask for 2.5 TB of bounds matrix, and `per_mol_sizes_t::bounds`
-    // is 64-bit, so the total states that size rather than wrapping down to a reservable one.
+    // Four molecules of 400000 atoms ask 2.5 TB of bounds matrix, and `per_mol_sizes_t::bounds` is
+    // 64-bit, so the total states that size instead of wrapping down to a reservable one.
     constexpr std::uint32_t refused_molecule_count_k = 4;
     constexpr std::uint32_t unpinnable_atom_count_k = 400'000;
 
@@ -276,8 +241,8 @@ static void check_pinned_refusal_(diagnostic_reporter_t &reporter) {
         record.original_index = molecule;
         record.metadata.num_atoms = unpinnable_atom_count_k;
         contribution.mols.push_back(record);
-        // A zeroed descriptor claims no bonds and no neighbours, so every device-filled region is
-        // empty and the bounds matrix is the whole of what the reservation is asked for.
+        // A zeroed descriptor claims no bonds and no neighbours, so every device-filled region is empty
+        // and the bounds matrix is the whole reservation.
         contribution.descriptors.push_back(smallfield::types::molecule_descriptor_t {});
     }
 
@@ -332,8 +297,8 @@ int main() {
     sftest::check_drug_like_wrap_(reporter);
     reporter.summarize("drug_like");
 
-    // The headline sweep: 120000 molecules at the per-molecule atom cap, which totals 4423680000
-    // elements in each N × N region and wraps a 32-bit accumulator to 128712704.
+    // The headline sweep: 120000 molecules at the per-molecule atom cap totals 4423680000 elements in
+    // each N × N region and wraps a 32-bit accumulator to 128712704.
     auto const sweep = sftest::expect_uniform_batch_(sweep_molecule_count_k, sweep_atom_count_k);
     fmt::println("Sweep: {} molecules x {} atoms = {} elements per N x N region", fmt::group_digits(sweep.molecules),
                  sweep.atoms_per_molecule, fmt::group_digits(sweep.bounds));

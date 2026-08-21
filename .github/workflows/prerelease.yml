@@ -88,11 +88,11 @@ jobs:
       - name: Confirm sm_120 reached the binary
         run: cuobjdump --list-elf build/test/test_pipeline | grep -q sm_120
 
-      # Ten of the twenty-five test binaries never open a device: they link `CUDA::cudart` for the
-      # libcu++ headers behind `smallfield/types/views.hpp` and never call into it, and nothing here
-      # links `CUDA::cuda_driver`, so they load and run on a GPU-less runner. The other fifteen carry
-      # `LABELS gpu`, written beside the resource lock that already marked them, and their results
-      # come from the hardware runs recorded in BENCH.md.
+      # The host-only test binaries never open a device: they link `CUDA::cudart` for the libcu++
+      # headers behind `smallfield/types/views.hpp` and never call into it, and nothing here links
+      # `CUDA::cuda_driver`, so they load and run on a GPU-less runner. The rest carry `LABELS gpu`,
+      # written beside the resource lock that already marked them, and their results come from the
+      # hardware runs recorded in BENCH.md.
       - name: Run the host-only C++ suite
         run: pixi run test-host
 

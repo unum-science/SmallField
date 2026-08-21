@@ -2,23 +2,20 @@
  *  @file src/smallfield/cuda/bond_distance_kernel.cuh
  *  @brief Warp-parallel all-pairs bond-hop matrix over the batch pool's bond list.
  *
- *  The MMFF nonbonded sweep enumerates pairs on the fly and needs the hop count between
- *  every atom pair: 1-2 and 1-3 are excluded, 1-4 is scaled, everything further apart is
- *  a full interaction, and an unreachable pair — the two halves of a salt — is a full
- *  interaction too. That matrix is N x N bytes per molecule, sixteen kilobytes at the
- *  128-atom cap, against the two bytes per bond it is derived from, so it is cheaper
- *  to rebuild it on the device than to ship it across PCIe.
+ *  The MMFF nonbonded sweep enumerates pairs on the fly and needs each pair's hop count: 1-2 and 1-3 excluded,
+ *  1-4 scaled, anything further a full interaction, an unreachable pair — the two halves of a salt — included.
+ *  That matrix is N x N bytes per molecule against the two bytes per bond it derives from, so rebuilding it on
+ *  the device is cheaper than shipping it across PCIe.
  *
  *  The bond list comes from the molecule descriptor rather than from the MMFF bond terms, so this
  *  pass depends on nothing but the upload and can run while the MMFF extractor is still working.
  *
- *  One warp owns one molecule and one lane owns one source atom, striding by the warp
- *  width when the molecule has more than 32 atoms. A lane keeps its visited and frontier
- *  sets as four 32-bit words covering the 128-atom cap and expands a level by sweeping the
- *  molecule's bond list once: every lane of the warp reads the same bond, so the sweep is a
- *  broadcast out of L1 rather than 32 independent streams. Bond counts are small — a
- *  drug-like molecule with explicit hydrogens carries well under 160 — and the level count
- *  is the graph's eccentricity, so the sweep costs far less than the N x N stores it feeds.
+ *  One warp owns a molecule and one lane a source atom, striding by the warp width past 32 atoms. A lane keeps
+ *  visited and frontier as `bond_distance_mask_words_k` 32-bit words and expands a level by sweeping the bond
+ *  list once: every lane reads the same bond, so the sweep broadcasts out of L1 rather than running 32
+ *  independent streams. Bond counts are small — well under 160 for a drug-like molecule with explicit
+ *  hydrogens — and the level count is the graph's eccentricity, so the sweep costs far less than the N x N
+ *  stores it feeds.
  */
 
 #pragma once
@@ -48,18 +45,16 @@ inline constexpr std::uint8_t bond_distance_unreachable_k = types::unreachable_h
 /**
  *  @brief Fill the batch pool's per-molecule N x N hop-count blocks.
  *
- *  Reads the molecule's own bond list out of its descriptor and writes `num_atoms` squared
- *  bytes at `bond_distance_offset`, packed with no padding stride: row `i` of molecule
- *  `m` starts at `bond_distance_offset + i * num_atoms`.
+ *  Reads the molecule's bond list out of its descriptor and writes `num_atoms` squared bytes at
+ *  `bond_distance_offset`, with no padding stride: row `i` starts at `bond_distance_offset + i * num_atoms`.
  *
  *  @param[in] descriptors Batch-wide molecule descriptors; only the bond atom pairs are read.
  *  @param[in] metadata One entry per molecule, carrying both region offsets and the atom count.
  *  @param[out] bond_distance Batch-wide hop-count region, one N x N block per molecule.
  *  @param[in] molecule_count Number of molecules in @p metadata.
  *
- *  Internal linkage: every translation unit that includes this header gets its own copy, so a
- *  test that compiles the header and also links the library does not hand nvlink two definitions
- *  of one device symbol.
+ *  Internal linkage: each including translation unit gets its own copy, so a test that compiles the header and
+ *  also links the library does not hand nvlink two definitions of one device symbol.
  */
 static __global__ void bond_distance_bfs_kernel(molecule_descriptor_t const *__restrict__ descriptors,
                                                 etkdg_molecule_metadata_t const *__restrict__ metadata,
@@ -88,13 +83,13 @@ static __global__ void bond_distance_bfs_kernel(molecule_descriptor_t const *__r
             std::uint8_t *const row = block + source * num_atoms;
             row[source] = 0;
 
-            std::uint32_t visited[bond_distance_mask_words_k] = {0u, 0u, 0u, 0u};
-            std::uint32_t frontier[bond_distance_mask_words_k] = {0u, 0u, 0u, 0u};
+            std::uint32_t visited[bond_distance_mask_words_k] = {};
+            std::uint32_t frontier[bond_distance_mask_words_k] = {};
             visited[source / 32u] = 1u << (source % 32u);
             frontier[source / 32u] = visited[source / 32u];
 
             for (std::uint32_t depth = 1; depth < num_atoms; ++depth) {
-                std::uint32_t next[bond_distance_mask_words_k] = {0u, 0u, 0u, 0u};
+                std::uint32_t next[bond_distance_mask_words_k] = {};
                 for (std::uint32_t bond = 0; bond < bond_count; ++bond) {
                     std::uint32_t const atom_i = descriptor.bond_atom_i[bond];
                     std::uint32_t const atom_j = descriptor.bond_atom_j[bond];
@@ -130,13 +125,9 @@ static __global__ void bond_distance_bfs_kernel(molecule_descriptor_t const *__r
 }
 
 /**
- *  @brief Enqueue `bond_distance_bfs_kernel` over a whole batch.
+ *  @brief Enqueue `bond_distance_bfs_kernel` on @p stream over a whole batch.
  *
- *  @param[in] descriptors Device pointer to the batch's molecule-descriptor region.
- *  @param[in] metadata Device pointer to the batch's per-molecule metadata region.
- *  @param[out] bond_distance Device pointer to the batch's hop-count region.
- *  @param[in] molecule_count Number of molecules in the batch.
- *  @param[in] stream Stream to enqueue on.
+ *  The first four arguments are the kernel's own, as device pointers into the batch's regions.
  */
 inline void launch_bond_distance_bfs(molecule_descriptor_t const *descriptors,
                                      etkdg_molecule_metadata_t const *metadata, std::uint8_t *bond_distance,

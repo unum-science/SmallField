@@ -191,9 +191,8 @@ inline constexpr float uff_bond_order_lambda_k = 0.1332f;
  *  @brief UFF rest length in Å for a bond of order @p bond_order between two typed atoms.
  *
  *  `calcBondRestLength` upstream: the two valence radii, plus Pauling's logarithmic bond-order term, minus
- *  O'Keefe and Breese's electronegativity term. Aromatic bonds arrive here at order 1.5, which is what
- *  retires a separate aromatic case — the shortening it applied was a worse approximation than the
- *  single-bond one it sat beside, giving 1.3984 Å for aromatic C-C against upstream's 1.3793.
+ *  O'Keefe and Breese's electronegativity term. Aromatic bonds arrive at order 1.5 and need no case of
+ *  their own — the bond-order term alone puts aromatic C-C at upstream's 1.3793 Å.
  *
  *  @param[in] first UFF row of one end; must not be `untyped_k`.
  *  @param[in] second UFF row of the other end; must not be `untyped_k`.

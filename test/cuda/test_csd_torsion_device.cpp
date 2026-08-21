@@ -2,14 +2,14 @@
  *  @file test/cuda/test_csd_torsion_device.cpp
  *  @brief Gate the device CSD torsion matcher against the host extractor, molecule for molecule.
  *
- *  The device kernel and `extract_etk_torsions_native` read the same flat descriptor and the same compiled
- *  pattern corpus, one through a device arena and one through the host pattern objects, so their torsion sets
- *  must agree exactly — same four atom indices in the same order, same six Fourier coefficients bit for bit.
- *  Anything less means the POD mirror of a pattern lost something on the way to the device.
+ *  The device kernel and `extract_etk_torsions_native` read the same flat descriptor and compiled pattern
+ *  corpus, one through a device arena and one through host pattern objects, so their torsion sets must agree
+ *  exactly -- same four atom indices in the same order, same six Fourier coefficients bit for bit. Anything
+ *  less means the POD mirror of a pattern lost something on the way to the device.
  *
- *  Corpus: the built-in standards by default, so a fresh clone stays green; name a `.smi` file in `argv[1]` or in
- *  `SMALLFIELD_TEST_CORPUS`, colon-separated for several, for a wide sweep. A named path that does not open is a
- *  failure, never an empty run.
+ *  Corpus: the built-in standards by default, so a fresh clone stays green; name a `.smi` in `argv[1]` or
+ *  `SMALLFIELD_TEST_CORPUS`, colon-separated for several. A named path that does not open is a failure,
+ *  never an empty run.
  */
 
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
@@ -88,7 +88,6 @@ static std::vector<std::string> split_paths_(std::string_view value) {
 }
 
 /** Parse and hydrogenate one SMILES into a descriptor.
- *  @param[in] smiles Molecule to build.
  *  @param[out] descriptor Filled on success.
  *  @return True when the molecule parsed and fits the descriptor's capacity. */
 static bool build_descriptor_from_smiles_(std::string const &smiles, sft::molecule_descriptor_t &descriptor) {
@@ -157,10 +156,9 @@ int main(int argc, char **argv) {
     std::size_t compared = 0;
     std::size_t mismatches = 0;
     std::size_t total_torsions = 0;
-    // Correctness is the gate, but the port only earns its place if the device is faster than the
-    // host it replaces, so both sides are timed over the same molecules. The device figure covers
-    // the launch and the synchronize; the host figure is one thread, which is what the preprocess
-    // fan-out gives each molecule.
+    // Correctness gates, but the port earns its place only if the device beats the host, so both are timed
+    // over the same molecules: the device figure covers launch and synchronize, the host figure one thread,
+    // which is what the preprocess fan-out gives each molecule.
     double host_microseconds = 0.0;
     double device_microseconds = 0.0;
 

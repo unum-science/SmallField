@@ -2,18 +2,16 @@
  *  @file test/cuda/test_triangle_smooth.cpp
  *  @brief Test GPU triangle smoothing, and the verdict it returns, against the RDKit reference.
  *
- *  Compiled with g++, not nvcc, to avoid RDKit C++20 header conflicts. The CUDA kernel calls are in
- *  test_triangle_smooth_kernels.cu.
+ *  Compiled with g++, not nvcc, to avoid RDKit C++20 header conflicts; the CUDA kernel calls are in
+ *  test_triangle_smooth_kernels.cu. Two sections: `fixture` smooths hand-built matrices whose verdict is
+ *  known by construction and confirms each against `DistGeom::triangleSmoothBounds`, the project's only
+ *  independent answer to "is this matrix impossible"; `corpus` sweeps real molecules, compares every cell
+ *  against RDKit's so a verdict agreeing for the wrong reason still fails, and re-smooths each to pin what
+ *  a second sweep may move.
  *
- *  Two sections, in the order a reader wants them. `fixture` smooths hand-built matrices whose verdict is
- *  known by construction and confirms each one against `DistGeom::triangleSmoothBounds`, which is the only
- *  independent answer to "is this matrix impossible" the project has. `corpus` sweeps real molecules,
- *  compares every cell of the smoothed matrix against RDKit's so a verdict that agrees for the wrong reason
- *  still fails, and re-smooths each one to pin what a second sweep may and may not move.
- *
- *  Corpus: the built-in standards by default, so a bare `ctest` run stays self-contained; name a `.smi` file
- *  in `argv[1]` or in `SMALLFIELD_TEST_CORPUS` for a wider sweep. Molecules the warp kernel cannot hold are
- *  counted and skipped rather than failing the run, and a sweep that smoothed none of them fails.
+ *  Corpus: the built-in standards by default, so a bare `ctest` run stays self-contained; name a `.smi` in
+ *  `argv[1]` or `SMALLFIELD_TEST_CORPUS` for a wider sweep. Molecules the warp kernel cannot hold are
+ *  counted and skipped rather than failing the run, and a sweep that smoothed none fails.
  */
 
 #include <cmath>   // `std::fabs`
@@ -76,23 +74,21 @@ struct bounds_fixture_t {
     custd::span<pair_bound_t const> pairs;
 };
 
-/* Two rigid 1 A bonds from atom 0 hold atoms 1 and 2 within 2 A of one another, and their own window asks
- * for at least 4. Nothing can satisfy both. */
+/** Two rigid 1 A bonds hold atoms 1 and 2 within 2 A; their own window asks 4. Nothing satisfies both. */
 static constexpr pair_bound_t three_atom_contradiction_k[] = {{0, 1, 1.0, 1.0}, {0, 2, 1.0, 1.0}, {1, 2, 4.0, 5.0}};
 
-/* The same two bonds with a window the triangle can meet: the upper falls from 5 to 2 and the lower holds. */
+/** The same two bonds with a window the triangle can meet: the upper falls from 5 to 2, the lower holds. */
 static constexpr pair_bound_t three_atom_tightened_k[] = {{0, 1, 1.0, 1.0}, {0, 2, 1.0, 1.0}, {1, 2, 0.5, 5.0}};
 
-/* The same geometry stated at its closure already, so every inequality holds on arrival and nothing moves. */
+/** The same geometry stated at its closure, so every inequality holds on arrival and nothing moves. */
 static constexpr pair_bound_t three_atom_already_tight_k[] = {{0, 1, 1.0, 1.0}, {0, 2, 1.0, 1.0}, {1, 2, 0.0, 2.0}};
 
-/* A rigid four-bond chain of 1.5 A steps. Every non-bonded window arrives wide open and smoothing closes
- * each one onto the chain length that reaches it. */
+/** A rigid four-bond chain of 1.5 A steps; every non-bonded window arrives open and closes onto the chain. */
 static constexpr pair_bound_t five_atom_chain_k[] = {
     {0, 1, 1.5, 1.5},   {1, 2, 1.5, 1.5},   {2, 3, 1.5, 1.5},   {3, 4, 1.5, 1.5},   {0, 2, 1.0, 100.0},
     {0, 3, 1.0, 100.0}, {0, 4, 1.0, 100.0}, {1, 3, 1.0, 100.0}, {1, 4, 1.0, 100.0}, {2, 4, 1.0, 100.0}};
 
-/* The same chain with its two ends held at least 9 A apart, which four 1.5 A steps cannot reach. */
+/** The same chain with its two ends held at least 9 A apart, which four 1.5 A steps cannot reach. */
 static constexpr pair_bound_t five_atom_chain_overstretched_k[] = {
     {0, 1, 1.5, 1.5},   {1, 2, 1.5, 1.5},  {2, 3, 1.5, 1.5},   {3, 4, 1.5, 1.5},   {0, 2, 1.0, 100.0},
     {0, 3, 1.0, 100.0}, {0, 4, 9.0, 12.0}, {1, 3, 1.0, 100.0}, {1, 4, 1.0, 100.0}, {2, 4, 1.0, 100.0}};
@@ -121,13 +117,16 @@ struct bounds_scratch_t {
     std::vector<float> previous;
 };
 
-/** What the sweep did with each molecule, so a run that smoothed nothing cannot read like a pass. */
+/**
+ *  @brief What the sweep did with each molecule, so a run that smoothed nothing cannot read like a pass.
+ *  `widest_crossing` is the widest `lower - upper` any satisfiable molecule ended on, which `main` gates
+ *  against `bounds_crossing_tolerance_k`.
+ */
 struct run_counts_t {
     std::size_t smoothed_molecules = 0;
     std::size_t oversized_molecules = 0;
     std::size_t unparsed_molecules = 0;
     std::size_t infeasible_molecules = 0;
-    /** Widest `lower - upper` any satisfiable molecule ended on, against `bounds_crossing_tolerance_k`. */
     float widest_crossing = 0.0f;
 };
 
@@ -136,15 +135,12 @@ struct run_counts_t {
 #pragma region Reference
 
 /**
- *  @brief Copy an RDKit bounds matrix into the packed square the kernel reads.
- *
- *  Upper triangle holds upper bounds and lower triangle lower bounds, matching what the kernel expects.
- *  Reference and device inputs both come through here, so the host smoothing is the only way they differ.
- *
+ *  @brief Copy an RDKit bounds matrix into the packed square the kernel reads, upper bounds in the upper
+ *  triangle and lower in the lower. Reference and device inputs both come through here, so host smoothing
+ *  is the only way they differ.
  *  @param[in] bounds RDKit's own matrix, smoothed or not.
  *  @param[in] num_atoms Row and column count of @p bounds.
  *  @param[inout] storage Caller-owned buffer, resized to N × N and fully overwritten.
- *  @return View over @p storage.
  */
 template <typename scalar_type_>
 static packed_matrix<scalar_type_> flatten_bounds_into_(DistGeom::BoundsMatrix const &bounds, std::uint32_t num_atoms,
@@ -160,7 +156,6 @@ static packed_matrix<scalar_type_> flatten_bounds_into_(DistGeom::BoundsMatrix c
 
 /**
  *  @brief Lay a fixture's pair windows into an RDKit bounds matrix.
- *
  *  @param[in] fixture Pair windows; every unordered pair of its atoms appears exactly once.
  *  @param[out] bounds Matrix of the fixture's atom count, fully written.
  */
@@ -172,12 +167,8 @@ static void apply_fixture_(bounds_fixture_t const &fixture, DistGeom::BoundsMatr
 }
 
 /**
- *  @brief RDKit's topological bounds for @p molecule, before any smoothing.
- *
- *  Returns RDKit's own owning handle because `setTopolBounds` takes nothing else, the same boundary the
- *  naming rules draw around that library.
- *
- *  @param[inout] molecule Molecule to derive topological bounds for.
+ *  @brief RDKit's topological bounds for @p molecule, before any smoothing. Returns RDKit's own owning
+ *  handle because `setTopolBounds` takes nothing else.
  *  @return A freshly built bounds matrix over the molecule's atoms.
  */
 static DistGeom::BoundsMatPtr topological_bounds_(RDKit::RWMol &molecule) {
@@ -194,8 +185,6 @@ static DistGeom::BoundsMatPtr topological_bounds_(RDKit::RWMol &molecule) {
 
 /**
  *  @brief Widest amount by which a pair's lower bound overshoots its upper, zero when none does.
- *
- *  @param[in] matrix Smoothed bounds matrix.
  *  @return `max(lower - upper)` over every unordered pair, floored at zero.
  */
 static float widest_crossing_(packed_matrix<float const> matrix) {
@@ -210,11 +199,8 @@ static float widest_crossing_(packed_matrix<float const> matrix) {
 
 /**
  *  @brief Assert every smoothed upper bound satisfies the triangle inequalities it was smoothed against.
- *
- *  A post-condition rather than a comparison, so it aborts on the first violation instead of counting: one
- *  violated triangle means the sweep did not reach closure and the rest of the matrix then says nothing.
- *
- *  @param[in] matrix Smoothed bounds matrix.
+ *  A post-condition, not a comparison, so it aborts on the first violation: one violated triangle means
+ *  the sweep never reached closure and the rest of the matrix says nothing.
  */
 static void verify_triangle_closure_(packed_matrix<float const> matrix) {
     using smallfield::types::upper_distance_bound_at;
@@ -232,16 +218,13 @@ static void verify_triangle_closure_(packed_matrix<float const> matrix) {
 /**
  *  @brief Smooth an already-smoothed matrix again and check which way each bound is allowed to move.
  *
- *  Smoothing is monotone, and that is the property the crossing scan rests on: an upper bound is only ever
- *  assigned a strictly smaller value and a lower bound a strictly larger one, so a pair that crosses at any
- *  point in a sweep is still crossed when the sweep ends, and no later sweep can un-cross it.
- *
- *  A second sweep is not a no-op, and neither is RDKit's. The lower-bound update reads upper bounds the same
- *  sweep is still lowering, so a pivot visited early leaves a lower bound a further sweep raises again; and
- *  in float even the upper bounds shed a last ULP, because `u_ik + u_kj` recomputed from the already-rounded
- *  legs can land just under the sum that set `u_ij`. Monotonicity is what survives both, so it is what is
- *  asserted.
- *
+ *  Monotonicity is the property the crossing scan rests on: an upper bound is only ever assigned a smaller
+ *  value and a lower bound a larger one, so a pair crossed at any point in a sweep is still crossed at the
+ *  end and no later sweep un-crosses it.
+ *  A second sweep is not a no-op, and neither is RDKit's: the lower-bound update reads upper bounds the
+ *  same sweep is still lowering, so an early pivot leaves a lower bound a further sweep raises again, and
+ *  in float the upper bounds shed a last ULP when `u_ik + u_kj` recomputed from rounded legs lands under
+ *  the sum that set `u_ij`. Monotonicity survives both, so it is what is asserted.
  *  @param[inout] matrix Smoothed matrix, smoothed once more in place.
  *  @param[inout] previous Caller-owned buffer holding the matrix as it stood before this sweep.
  *  @param[inout] reporter Where a bound that moved the wrong way prints.
@@ -270,7 +253,6 @@ static void resmooth_(packed_matrix<float> matrix, std::vector<float> &previous,
 
 /**
  *  @brief Smooth every hand-built fixture and check its verdict against construction and against RDKit.
- *
  *  @param[inout] reporter Where a disagreeing verdict or cell prints.
  *  @param[inout] scratch Bounds buffers reused across the fixtures.
  */
@@ -291,8 +273,8 @@ static void compare_fixtures_(sftest::diagnostic_reporter_t &reporter, bounds_sc
                     exactly_equal);
         group.field("satisfiable", rdkit_satisfiable, verdict != smoothing_t::infeasible_k, exactly_equal);
 
-        // RDKit returns the moment it finds a crossed pair, so an unsatisfiable fixture's reference matrix is
-        // only partly smoothed and there is nothing to compare it against. A satisfiable one reached closure.
+        // RDKit returns the moment it finds a crossed pair, so an unsatisfiable fixture's reference is only
+        // partly smoothed and has nothing to compare against; a satisfiable one reached closure.
         if (!rdkit_satisfiable) continue;
         for (std::uint32_t row = 0; row < fixture.num_atoms; ++row)
             for (std::uint32_t column = 0; column < fixture.num_atoms; ++column) {
@@ -305,12 +287,9 @@ static void compare_fixtures_(sftest::diagnostic_reporter_t &reporter, bounds_sc
 }
 
 /**
- *  @brief Smooth one molecule on the device and compare every cell against the host reference.
- *
- *  A molecule the kernel cannot hold, or one that does not parse, is counted in @p counts and compared
- *  against nothing — it is the tally in `main`, not this function, that keeps a silent sweep from passing.
- *
- *  @param[in] smiles Molecule under test.
+ *  @brief Smooth one molecule on the device and compare every cell against the host reference. One the
+ *  kernel cannot hold, or that does not parse, is counted in @p counts and compared against nothing; the
+ *  tally in `main` is what keeps a silent sweep from passing.
  *  @param[inout] scratch Bounds buffers reused across the corpus.
  *  @param[inout] counts Running tally of smoothed and skipped molecules.
  *  @param[inout] reporter Where a disagreeing verdict or cell prints.
@@ -354,8 +333,7 @@ static void compare_molecule_(std::string const &smiles, bounds_scratch_t &scrat
         for (std::uint32_t row = 0; row < num_atoms; ++row)
             for (std::uint32_t column = 0; column < num_atoms; ++column) {
                 if (row == column) continue;
-                // The upper triangle holds upper bounds and the lower triangle lower bounds, so the field
-                // name says which of the two disagreed rather than leaving it inferred from row < column.
+                // The field name says which bound disagreed rather than leaving it inferred from row < column.
                 reporter.mismatch("corpus_cell", "smiles={} row={} column={}", smiles, row, column)
                     .field(row < column ? "upper_bound" : "lower_bound", reference(row, column), device(row, column),
                            within_bound_tolerance);

@@ -2,16 +2,13 @@
  *  @file test/cli/test_fallback_policy.cpp
  *  @brief Pin every verdict of `fallback_disposition`, and the ordering rule `fallback_dispatch_cause` runs.
  *
- *  Thirteen statuses each carry an argued verdict about whether spending a CPU embedding on a refused slot can
- *  recover it, and getting one wrong is invisible in production: a `terminal_k` that should retry silently
- *  drops recoverable molecules, and a `retry_k` that should be terminal spends ~20 ms of CPU per molecule to
- *  re-derive the verdict the slot already carries. `-Wswitch` catches a status appended to the enum; nothing
- *  catches a verdict that changed, which is what this file is.
+ *  Thirteen statuses each carry an argued verdict on whether a CPU embedding recovers a refused slot, and a
+ *  wrong one is invisible in production: a `terminal_k` that should retry drops recoverable molecules, and a
+ *  `retry_k` that should be terminal spends ~20 ms of CPU per molecule re-deriving a verdict the slot already
+ *  carries. `-Wswitch` catches an appended status; a changed verdict is caught only here.
  *
- *  The dispositions are pinned at compile time because `fallback_disposition` is `constexpr`, so the whole
- *  section's verdict is that this translation unit compiles -- which is also why the test needs no device and
- *  no `SMALLFIELD_BUILD_CLI`. Only `fallback_dispatch_cause` has anything to run: a loop and a rule about
- *  which of a molecule's slots decides its fate.
+ *  `fallback_disposition` is `constexpr`, so verdicts pin at compile time and the section passes by compiling
+ *  -- no device, no `SMALLFIELD_BUILD_CLI`. Only the rule for which slot decides a molecule's fate runs.
  */
 
 #include <cstddef> // `std::size_t`
@@ -35,10 +32,9 @@ static constexpr std::string_view test_name_k = "test_fallback_policy";
 
 #pragma region Dispositions
 
-/*  One `static_assert` per enumerator, in the enum's own order, so the roster below and
- *  `conformer_status_t` can be read against each other line by line. The count assertion is what makes a
- *  status appended to that append-only enum land here as well as at the `-Wswitch` in the header: without
- *  it, a new status would inherit a verdict this file never states. */
+/*  One `static_assert` per enumerator in the enum's own order, so the roster and `conformer_status_t` read
+ *  line by line. The count assertion lands an appended status here as well as at the header's `-Wswitch`,
+ *  so it cannot inherit a verdict this file never states. */
 
 static_assert(sft::conformer_status_count_k == 15,
               "every `conformer_status_t` carries one pinned verdict below, so a new one is pinned here too");
@@ -89,9 +85,8 @@ static_assert(sfcli::fallback_disposition(sft::conformer_status_t::nonphysical_e
                   sfcli::fallback_disposition_t::retry_k,
               "RDKit reaches the geometry by its own embedding and its own minimizer");
 
-/* The one terminal verdict that is not re-derived: RDKit would embed these, and the refusal is refused
- * anyway because a single mis-sized wave refuses a whole device's batch and an unbounded population at
- * 20 ms of CPU each would read as a hang rather than as the re-runnable sizing error it is. */
+/*  The one terminal verdict not re-derived: RDKit would embed these, but a mis-sized wave refuses a whole
+ *  device's batch, and that population at 20 ms of CPU each reads as a hang, not a re-runnable sizing error. */
 static_assert(sfcli::fallback_disposition(sft::conformer_status_t::batch_overflow_k) ==
                   sfcli::fallback_disposition_t::terminal_k,
               "a mis-sized wave parks the shard, and is not laundered one molecule at a time");
@@ -134,8 +129,7 @@ constexpr types::conformer_status_t unnamed_status_byte_k = static_cast<types::c
     types::conformer_status_count_k);
 
 constexpr std::array<dispatch_probe_t, 5> dispatch_probes_k {{
-    // The rule the loop encodes: the earliest `retry_k` slot decides, and terminal slots before it are
-    // stepped over rather than answered with.
+    // The rule: the earliest `retry_k` slot decides, and terminal slots before it are stepped over.
     {"first_retry_wins",
      {types::conformer_status_t::success_k, types::conformer_status_t::too_many_atoms_k,
       types::conformer_status_t::stereo_failure_k, types::conformer_status_t::invalid_smiles_k},

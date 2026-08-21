@@ -2,12 +2,12 @@
  *  @file test/cuda/test_embedding_determinism.cpp
  *  @brief Assert that the 4D metric embedding is bitwise reproducible.
  *
- *  The metric prepass seeds every later ETKDG stage, so an order-dependent block reduction inside it — a
- *  shared-memory float `atomicAdd`, say, whose commit order the scheduler picks and whose addition does not
- *  associate — makes the coordinates of a shipped shard unregenerable. A dataset that cannot be reproduced byte
- *  for byte cannot be audited, so this test pins the property twice over: the same bounds matrix embedded in two
- *  separate launches must agree, and thousands of identical copies embedded inside one launch must agree with
- *  each other, since they differ only in which streaming multiprocessor and which neighbours they draw.
+ *  The metric prepass seeds every later ETKDG stage, so an order-dependent block reduction inside it -- a
+ *  shared-memory float `atomicAdd` whose commit order the scheduler picks and whose addition does not
+ *  associate -- makes a shipped shard's coordinates unregenerable, and an unreproducible dataset cannot be
+ *  audited. The property is pinned twice: one bounds matrix embedded in two separate launches must agree,
+ *  and thousands of identical copies inside one launch must agree with each other, differing only in which
+ *  streaming multiprocessor and which neighbours they draw.
  */
 
 #include <cmath>   // `std::sqrt`
@@ -54,10 +54,9 @@ static std::vector<float> synthetic_bounds(std::uint32_t num_atoms) {
 }
 
 /**
- *  @brief How many replicated copies diverged, and which one diverged first.
- *
- *  `count` is the "nothing found" answer, so `first_copy` never has to double as one: an index
- *  standing in for its own absence is read correctly once and misread thereafter.
+ *  @brief How many replicated copies diverged, and which one diverged first. `count` is the "nothing found"
+ *  answer, so `first_copy` never doubles as one: an index standing in for its own absence is read correctly
+ *  once and misread thereafter.
  */
 struct divergence_t {
     std::uint32_t count = 0;

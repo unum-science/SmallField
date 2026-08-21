@@ -1,7 +1,6 @@
 /**
  *  @file cli/shard_inventory.cpp
- *  @brief Walks the input directory, matches each shard to its deterministic output path, and checks
- *  `.encoded` sentinels to find already-complete shards.
+ *  @brief Maps each input shard to its deterministic output path and checks `.encoded` sentinels for completion.
  */
 
 #include <algorithm>   // `std::sort`

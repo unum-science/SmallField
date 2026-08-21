@@ -2,11 +2,10 @@
  *  @file test/test_helpers.hpp
  *  @brief One machine-readable grammar for every diagnostic the C++ tests print.
  *
- *  A diagnostic is read twice: once by a person scanning a CI log, and once by `grep`, `awk`, or a
- *  diff between two runs.  Prose serves the first reader and defeats the second, so every line here
- *  opens with a verb at column zero, carries ASCII `key=value` pairs separated by exactly one space,
- *  and names the single field that disagreed rather than dumping every field of the record it
- *  belongs to:
+ *  A diagnostic is read twice: by a person scanning a CI log, and by `grep`, `awk` or a diff between two runs.
+ *  Prose serves the first and defeats the second, so every line opens with a verb at column zero, carries ASCII
+ *  `key=value` pairs one space apart, and names the single field that disagreed rather than every field of its
+ *  record:
  *
  *      MISMATCH vdw atom_type=12 field=alpha rdkit=1.5 ours=1.5000001 delta=+1.19e-07
  *      MISMATCH bond bond_type=0 atom_i=3 atom_j=7 field=force_constant rdkit=4.928 ours=6.947 delta=+2.019
@@ -15,18 +14,16 @@
  *      PASS test_mmff94_tables
  *      FAIL test_mmff94_tables: 3 mismatches over 4838 comparisons
  *
- *  `^MISMATCH` filters, `awk -F'[ =]'` parses, and the failing field names itself instead of leaving
- *  the reader to spot which of five printed numbers moved.  Nothing carries a timestamp: ctest stamps
- *  its own, and a varying prefix would destroy the column alignment and make two runs undiffable.
+ *  `^MISMATCH` filters, `awk -F'[ =]'` parses, and the failing field names itself instead of leaving the reader
+ *  to spot which of five printed numbers moved. Nothing carries a timestamp -- ctest stamps its own, and a
+ *  varying prefix would destroy the column alignment and make two runs undiffable.
  *
- *  `MISMATCH` and `DIVERGENCE` are counted apart because they mean different things. A mismatch is an
- *  unexplained difference and fails its section; a divergence is one the suite asserts on purpose,
- *  because upstream is wrong and we are right, and it carries the citation that says so. Folding the
- *  second into the first would leave a suite only able to widen a tolerance until the disagreement
- *  stopped failing, which is what destroys the tolerance's meaning.
+ *  `MISMATCH` and `DIVERGENCE` count apart because they mean different things: a mismatch is an unexplained
+ *  difference and fails its section, a divergence is one the suite asserts on purpose because upstream is wrong
+ *  and we are right, and it carries the citation saying so. Folding the second into the first leaves a suite
+ *  able only to widen a tolerance until the disagreement stops failing, destroying the tolerance's meaning.
  *
- *  Precision belongs to a value's role, never to the call site, so no call site writes a format
- *  specifier.  The roles and their specs:
+ *  Precision belongs to a value's role, never to the call site, so no call site writes a format specifier:
  *
  *      compared value  `{}`      shortest round-trip, so two distinct floats can never render alike
  *      delta           `{:+.3g}` floating, or `{:+}` when both operands are integral
@@ -35,8 +32,8 @@
  *      duration in ms  `{:.1f}`  reserved until a timing line is migrated
  *      percentage      `{:.3f}`  reserved until a rate line is migrated
  *
- *  Mismatches and failures go to stderr and passes and narration to stdout, which keeps the readable
- *  story on one stream and the machine-readable complaints on the other.
+ *  Mismatches and failures go to stderr, passes and narration to stdout, keeping the readable story on one
+ *  stream and the machine-readable complaints on the other.
  */
 #pragma once
 
@@ -91,8 +88,8 @@ inline std::FILE *diagnostic_stream(diagnostic_verb_t verb) noexcept {
     switch (verb) {
     case diagnostic_verb_t::mismatch_k:
     case diagnostic_verb_t::fail_k: return stderr;
-    /*  `DIVERGENCE` joins `PASS` and `NOTE` on stdout. It is an asserted and cited difference rather
-     *  than a complaint, so a reader watching stderr sees only the differences nobody has explained. */
+    // `DIVERGENCE` joins `PASS` and `NOTE` on stdout: it is asserted and cited, not a complaint, so stderr
+    // carries only the differences nobody has explained.
     default: return stdout;
     }
 }
@@ -122,15 +119,13 @@ inline void append_delta(fmt::memory_buffer &out, reference_type_ const &referen
 
 #pragma region Predicates
 
-/*  The predicates `comparison_group_t::field` is handed, which is why each is a `constexpr` callable rather
- *  than a function carrying a default argument: a function name decays to a pointer whose type does not
- *  include the default, so it cannot be passed where a two-argument callable is wanted and every call site
- *  grows a lambda to bind what the declaration already said.
+/*  The predicates `comparison_group_t::field` is handed, each a `constexpr` callable rather than a function
+ *  with a default argument: a function name decays to a pointer whose type omits the default, so every call
+ *  site would grow a lambda binding what the declaration already said.
  *
- *  The two tolerance predicates narrow to `float` before subtracting. A reference tabulated in `double` is
- *  being asked whether our `float` reproduces it at our own precision, and subtracting in `double` would
- *  charge us for the narrowing itself -- at `1e-5` over the MMFF94 angle table, half an ULP of `theta0` is
- *  most of that budget. */
+ *  The two tolerance predicates narrow to `float` before subtracting -- a `double` reference is being asked
+ *  whether our `float` reproduces it at our precision, and subtracting in `double` would charge us for the
+ *  narrowing itself, half an ULP of `theta0` being most of a `1e-5` budget over the MMFF94 angle table. */
 
 /** Exact equality, promoted so a signed operand and an unsigned one still compare as numbers. */
 inline constexpr auto exactly_equal = [](auto const &reference, auto const &observed) {
@@ -149,10 +144,9 @@ inline constexpr auto bitwise_equal = [](auto const &reference, auto const &obse
 /**
  *  @brief Agreement at `1e-3`, scaled by the larger operand once that passes unit magnitude.
  *
- *  For a quantity whose error grows with itself, and which spans orders of magnitude -- a force constant, an
- *  equilibrium distance, a torsion amplitude. A quantity whose error is instead a fixed accumulation of
- *  rounding, such as an MMFF94 partial charge, takes `equal_within` and names its threshold, so that a large
- *  operand cannot quietly buy slack the arithmetic behind it never spent.
+ *  For a quantity whose error grows with itself across orders of magnitude -- a force constant, an equilibrium
+ *  distance, a torsion amplitude. One whose error is a fixed accumulation of rounding, such as an MMFF94
+ *  partial charge, takes `equal_within` and names its threshold, so a large operand cannot buy unspent slack.
  */
 inline constexpr auto approximately_equal = [](auto const &reference, auto const &observed) {
     float const expected = static_cast<float>(reference), measured = static_cast<float>(observed);
@@ -175,9 +169,8 @@ class diagnostic_reporter_t;
 /**
  *  @brief One group of diagnostic lines sharing a verb, a subject, and the caller's key columns.
  *
- *  A group is opened per record under test and costs one short string; its fields decide, one by one,
- *  whether a line appears.  Opening a group that emits nothing is the normal case and is free of any
- *  output, which is what lets a call site drop the `if` that used to guard a hand-rolled `println`.
+ *  Opened per record under test at the cost of one short string; its fields decide one by one whether a line
+ *  appears, and a group emitting nothing is the normal case, so a call site needs no `if` around it.
  */
 class diagnostic_group_t {
   public:
@@ -206,10 +199,9 @@ class diagnostic_group_t {
 /**
  *  @brief A `MISMATCH` group whose fields print only where the caller's predicate says they disagree.
  *
- *  The predicate is the caller's on purpose.  The suites compare bit patterns, absolute error under a
- *  strict `<` at 1e-5, and absolute error rejected by a `>` at 1e-2 -- three boundaries no single
- *  built-in tolerance reproduces without silently moving one of them.  It is invoked as
- *  `equals(reference, observed)` and must answer "these agree".
+ *  The predicate is the caller's on purpose: the suites compare bit patterns, absolute error under a strict `<`
+ *  at 1e-5, and absolute error rejected by a `>` at 1e-2, three boundaries no single built-in tolerance
+ *  reproduces without silently moving one. It is invoked as `equals(reference, observed)` and answers "agree".
  */
 class comparison_group_t final : public diagnostic_group_t {
   public:
@@ -232,10 +224,9 @@ class comparison_group_t final : public diagnostic_group_t {
 /**
  *  @brief A `NOTE` group whose fields print whether they agree or not.
  *
- *  For the operand pairs a passing run still wants to see -- a reference energy beside ours -- where the
- *  number itself is the point and nothing is being asserted about it. Nothing here counts as a
- *  comparison, so narration can never make a validator look busier than it is. A difference that @b is
- *  asserted, and cited, is a `divergence_group_t` instead.
+ *  For operand pairs a passing run still wants to see -- a reference energy beside ours -- where the number is
+ *  the point and nothing is asserted about it. Nothing here counts as a comparison, so narration can never make
+ *  a validator look busier than it is; a difference that @b is asserted and cited is a `divergence_group_t`.
  */
 class narration_group_t final : public diagnostic_group_t {
   public:
@@ -254,11 +245,10 @@ class narration_group_t final : public diagnostic_group_t {
 /**
  *  @brief A `DIVERGENCE` group whose fields print unconditionally and are counted apart from mismatches.
  *
- *  Where a `NOTE` is narration nobody asserts, a divergence is an assertion the caller has already
- *  made: it has established that the two operands differ, that the reference is the one that is wrong,
- *  and that a citation says why. The caller therefore supplies no predicate, exactly as with a note,
- *  but the line is counted -- as a comparison, so `compared=` stays the number of comparisons actually
- *  performed, and as a divergence, so `mismatches=` keeps meaning "differences nobody has explained".
+ *  Where a `NOTE` is narration nobody asserts, a divergence is an assertion already made: the operands differ,
+ *  the reference is the wrong one, and a citation says why. The caller supplies no predicate, as with a note,
+ *  but the line counts twice -- as a comparison, keeping `compared=` the number actually performed, and as a
+ *  divergence, keeping `mismatches=` "differences nobody has explained".
  */
 class divergence_group_t final : public diagnostic_group_t {
   public:
@@ -284,11 +274,10 @@ struct section_counts_t {
 /**
  *  @brief Formats diagnostics for one pair of operand roles; it never compares anything itself.
  *
- *  Constructed with the two labels its lines carry -- the reference first, then what is under test --
- *  because a delta is only readable when its sign has a fixed meaning: `delta = observed - reference`.
- *
- *  The counters are the point as much as the lines are.  A validator that silently checks nothing
- *  passes every run, so `summarize` prints what it compared and fails a section that compared zero.
+ *  Constructed with the two labels its lines carry -- the reference first, then what is under test -- because
+ *  a delta only reads when its sign has a fixed meaning: `delta = observed - reference`. The counters matter as
+ *  much as the lines: a validator that silently checks nothing passes every run, so `summarize` prints what it
+ *  compared and fails a section that compared zero.
  */
 class diagnostic_reporter_t {
   public:
@@ -319,10 +308,10 @@ class diagnostic_reporter_t {
     /**
      *  @brief Close a section with `PASS <subject> compared=… mismatches=… divergences=… suppressed=…`.
      *
-     *  Counts run from the previous `summarize`, so one reporter can close several sections in order.
-     *  A section that compared nothing fails: it is indistinguishable from a passing one otherwise.
-     *  They are returned as well as printed, so a caller gating on its own section does not recompute them;
-     *  most callers ignore the result, so this is deliberately not `[[nodiscard]]`.
+     *  Counts run from the previous `summarize`, so one reporter closes several sections in order, and a
+     *  section that compared nothing fails -- it is otherwise indistinguishable from a passing one. They are
+     *  returned as well as printed for a caller gating on its own section; most ignore them, hence no
+     *  `[[nodiscard]]`.
      */
     section_counts_t summarize(std::string_view subject) {
         std::size_t const compared = comparison_count_ - section_comparison_mark_;
@@ -423,15 +412,12 @@ void diagnostic_group_t::report_(std::string_view name, reference_type_ const &r
 /**
  *  @brief Close a test with `PASS <test_name>` and answer `main` with its exit code.
  *
- *  Every test prints exactly one verdict, as its last line, and every verdict names the test.  A
- *  thirty-test CI log then answers `grep '^PASS test_'` with the roster that passed and
- *  `grep '^FAIL test_'` with the roster that did not, which a bare `PASS` or an `ALL TESTS PASSED`
- *  cannot do: they say that something passed without saying what.  Anchoring at column zero is the
- *  other half of it, because it is what stops a narration line that merely contains the word --
- *  `Device upload unavailable`, a `[PASS]` table cell -- from answering the same grep.
- *
- *  Section summaries share the verb but never the `test_` prefix: `PASS vdw compared=…` closes a
- *  section, `PASS test_mmff94_tables` closes the process.
+ *  Every test prints exactly one verdict, as its last line, naming the test, so a thirty-test CI log answers
+ *  `grep '^PASS test_'` and `grep '^FAIL test_'` with the two rosters -- which a bare `PASS` or an `ALL TESTS
+ *  PASSED` cannot, saying something passed without saying what. Column zero is the other half: it stops a
+ *  narration line merely containing the word -- `Device upload unavailable`, a `[PASS]` table cell -- from
+ *  answering the same grep. Section summaries share the verb but never the `test_` prefix: `PASS vdw
+ *  compared=…` closes a section, `PASS test_mmff94_tables` closes the process.
  */
 inline int report_pass(std::string_view test_name) {
     fmt::println(diagnostic_stream(diagnostic_verb_t::pass_k), "{} {}", diagnostic_verb_name(diagnostic_verb_t::pass_k),
@@ -442,8 +428,8 @@ inline int report_pass(std::string_view test_name) {
 /**
  *  @brief Close a test with `FAIL <test_name>: <reason>` on stderr, and answer `main` with its exit code.
  *
- *  The reason is the one thing the exit code cannot carry, so it states what was expected against what
- *  was seen rather than repeating that the test failed.
+ *  The reason is the one thing the exit code cannot carry, so it states expected against seen rather than
+ *  repeating that the test failed.
  */
 template <typename... reason_types_>
 inline int report_fail(std::string_view test_name, fmt::format_string<reason_types_...> reason,
@@ -469,17 +455,14 @@ inline int report_fail(std::string_view test_name, fmt::format_string<reason_typ
 /**
  *  @brief Fail the test with a message and the source location when @p condition is false.
  *
- *  Carries the `sf_` prefix so it cannot collide with RDKit's own `TEST_ASSERT`, which keeps the
- *  tests free of any framework dependency.
+ *  The `sf_` prefix keeps it from colliding with RDKit's own `TEST_ASSERT`, so the tests carry no framework
+ *  dependency. Aborting still spends the test's one verdict, so this prints the same `FAIL <test_name>:
+ *  <reason>` a `main` would have returned -- otherwise `grep '^FAIL test_'` would omit every test that
+ *  asserted its way out. The name comes from the `test_name_k` each test declares beside its `main`.
  *
- *  Aborting still spends the test's one verdict, so this prints the same `FAIL <test_name>: <reason>`
- *  a `main` would have returned -- otherwise `grep '^FAIL test_'` would list every test that returned
- *  a failure and silently omit every test that asserted its way out. The name comes from the
- *  `test_name_k` each test declares beside its `main`.
- *
- *  @p message is a reason, not an operand: it says what the code expected, so a path, a SMILES or a
- *  SMARTS belongs inside a sentence rather than standing in for one. It is evaluated only on the
- *  failing branch, so composing it with `fmt::format` costs a passing run nothing.
+ *  @p message is a reason, not an operand: it says what the code expected, so a path, a SMILES or a SMARTS
+ *  belongs inside a sentence rather than standing in for one. Evaluated only on the failing branch, so
+ *  composing it with `fmt::format` costs a passing run nothing.
  */
 #define sf_verify_(condition, message)                                                                            \
     do {                                                                                                          \

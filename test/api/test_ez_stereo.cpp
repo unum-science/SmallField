@@ -2,10 +2,9 @@
  *  @file test/api/test_ez_stereo.cpp
  *  @brief Confirm, round-trip through RDKit, that generated conformers honour defined E/Z double bonds.
  *
- *  Generates conformers for a set of E/Z isomer pairs, hands the coordinates back to RDKit, re-perceives
- *  stereochemistry from 3D, and asserts the perceived bond stereo matches what the input SMILES declared. Without
- *  a stereo-aware 1-4 bounds envelope both isomers of a pair collapse to whichever geometry the minimizer happens
- *  to reach.
+ *  Conformers for E/Z isomer pairs go back to RDKit, stereo is re-perceived from 3D, and it must match what
+ *  the SMILES declared. Without a stereo-aware 1-4 bounds envelope both isomers of a pair collapse onto
+ *  whichever geometry the minimizer happens to reach.
  */
 
 #include <string>      // `std::string`
@@ -30,9 +29,8 @@ static constexpr std::string_view test_name_k = "test_ez_stereo";
 /**
  *  @brief A double bond's configuration, including the answer "the geometry carries none".
  *
- *  The third state is the point. Split across a `bool` return and a `bool` out-parameter, "not cis"
- *  and "nothing to perceive" render identically, so a caller that consults only the return classifies
- *  every unperceived conformer as trans and the suite silently stops testing what it was written for.
+ *  The third state is the point: over a `bool` return and out-parameter, "not cis" and "nothing to perceive"
+ *  render alike, so reading only the return calls every unperceived conformer trans and the suite goes blind.
  */
 enum class bond_stereo_t {
     /** Z / cis. */
@@ -72,8 +70,7 @@ static bond_stereo_t perceived_bond_stereo(RDKit::RWMol &molecule) {
 int main() {
     fmt::println("{}: generated conformers round-tripped through RDKit against their declared E/Z", test_name_k);
 
-    // Each pair differs only in double-bond configuration, so a stereo-blind bounds
-    // envelope produces indistinguishable geometry for both members.
+    // Each pair differs only in double-bond configuration, so a stereo-blind envelope makes them alike.
     std::vector<ez_case_t> const cases = {
         {"C/C=C/C", bond_stereo_t::trans_k},        // trans-2-butene
         {"C/C=C\\C", bond_stereo_t::cis_k},         // cis-2-butene
@@ -116,8 +113,7 @@ int main() {
             auto molecule = sftest::mol_from_smiles(smiles_storage[mol_index]);
             if (!molecule) continue;
             std::uint32_t const num_atoms = molecule->getNumAtoms();
-            // `set_coords_interleaved` writes into an existing conformer, and a molecule
-            // parsed from SMILES carries none.
+            // `set_coords_interleaved` writes into an existing conformer; SMILES parsing leaves none.
             if (molecule->getNumConformers() == 0) molecule->addConformer(new RDKit::Conformer(num_atoms), true);
 
             std::size_t const base = slot_layout.slot_offset(mol_index, conformer);
@@ -146,8 +142,7 @@ int main() {
                  unperceived);
 
     sf_verify_(checked > 0, "at least one conformer must be generated");
-    // Allow a small share of conformers whose geometry RDKit cannot assign, but every
-    // conformer that does carry perceivable stereo must carry the declared one.
+    // A share may be unassignable, but every conformer with perceivable stereo must carry the declared one.
     std::uint32_t const perceivable = checked - unperceived;
     sf_verify_(perceivable > 0, "at least one conformer must have perceivable double-bond stereo");
     sf_verify_(matched == perceivable, "every perceivable conformer must match its declared E/Z");

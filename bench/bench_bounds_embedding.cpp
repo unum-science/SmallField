@@ -2,22 +2,17 @@
  *  @file bench/bench_bounds_embedding.cpp
  *  @brief Score `build_bounds_matrix` by handing it to RDKit's own embedder and reading what comes back.
  *
- *  Our refusal counter cannot answer this question. `bounds_infeasible_k` is emitted at one site and has
- *  read zero across every corpus measured, so it is a null control: there is no signal in it to move, and
- *  a matrix that admits no good embedding is indistinguishable from one that admits a perfect one. What a
- *  wrong bounds matrix actually produces is a worse geometry inside the population already counted
- *  successful, and the only instrument that sees that is an embedder driven by the matrix under test.
- *
- *  So this drives `RDKit::DGeomHelpers::EmbedMolecule` three times per molecule at one seed, changing
- *  nothing but where the distance bounds came from, and scores each embedding by its MMFF94 single-point
- *  energy. The two control arms are the point of the design rather than decoration: an embedder run with
- *  no custom matrix and an embedder run with RDKit's own `setTopolBounds` matrix pushed back through
- *  `params.boundsMat` are the same measurement taken through two different channels, so any gap between
- *  them is the instrument's own error and bounds how much of the third arm's gap can be believed.
- *
- *  Triangle smoothing is applied here rather than left to the embedder, because its verdict is the one
- *  refusal our own pipeline cannot report: a matrix no coordinates satisfy is caught by the smoother on
- *  the host, and the count of those is printed beside the embedding failures rather than folded into them.
+ *  Our refusal counter cannot answer this: `bounds_infeasible_k` is emitted at one site and has read zero across
+ *  every corpus measured, a null control in which a matrix admitting no good embedding is indistinguishable from one
+ *  admitting a perfect one. A wrong bounds matrix produces a worse geometry inside the population already counted
+ *  successful, which only an embedder driven by the matrix under test can see. So this drives
+ *  `RDKit::DGeomHelpers::EmbedMolecule` three times per molecule at one seed, changing nothing but where the distance
+ *  bounds came from, and scores each embedding by its MMFF94 single-point energy. The two control arms are the design
+ *  rather than decoration: an embedder run with no custom matrix and one run with RDKit's own `setTopolBounds` matrix
+ *  pushed back through `params.boundsMat` are one measurement through two channels, so any gap is the instrument's
+ *  own error and bounds how much of the third arm's gap can be believed. Triangle smoothing is applied here rather
+ *  than left to the embedder because its verdict is the one refusal our own pipeline cannot report: a matrix no
+ *  coordinates satisfy, caught by the smoother on the host and counted beside the embedding failures.
  */
 
 #include <cmath>   // `std::isfinite`, `std::fabs`
@@ -66,13 +61,9 @@ static constexpr std::uint32_t max_seed_k = 2'000'000'000;
 
 #pragma region Arms
 
-/**
- *  @brief Where one arm's distance bounds came from.
- *
- *  The first two are controls and the third is the measurement. They are one enumeration rather than a
- *  flag on a shared routine because the whole comparison is between them, and a run that quietly dropped
- *  one would still print a table.
- */
+/** Where one arm's distance bounds came from: the first two are controls and the third the measurement, one
+ *  enumeration rather than a flag on a shared routine because the whole comparison is between them and a run that
+ *  quietly dropped one would still print a table. */
 enum class bounds_source_t : std::uint8_t {
     /** No custom matrix: the embedder calls `setTopolBounds` itself. The reference every delta is against. */
     embedder_own_k,
@@ -92,21 +83,20 @@ static constexpr char const *bounds_source_name(bounds_source_t source) noexcept
     return "unnamed-source";
 }
 
-/** What one arm did to one molecule. */
+/** What one arm did to one molecule: `scored_k` embedded and MMFF94 scored the raw coordinates,
+ *  `descriptor_refused_k` our builder refused it so the arm has nothing to say, `smoothing_refused_k` triangle
+ *  smoothing found the matrix inconsistent so no embedding was attempted, `embedding_failed_k` `EmbedMolecule`
+ *  returned no conformer, `energy_unavailable_k` the embedding exists but MMFF94 could not type or score it. */
 enum class arm_outcome_t : std::uint8_t {
-    /** Embedded, and MMFF94 scored the raw coordinates. */
     scored_k,
-    /** Our descriptor builder refused the molecule, so the arm has nothing to say about it. */
     descriptor_refused_k,
-    /** Triangle smoothing found the matrix inconsistent, so no embedding was attempted. */
     smoothing_refused_k,
-    /** `EmbedMolecule` returned no conformer. */
     embedding_failed_k,
-    /** The embedding exists but MMFF94 could not type or score it. */
     energy_unavailable_k,
 };
 
-/** Running counts and the paired energies for one arm across the corpus. */
+/** Running counts and the paired energies for one arm across the corpus; `energy_deltas` holds one entry per
+ *  molecule this arm and the reference arm both scored, in kcal/mol. */
 struct arm_tally_t {
     std::size_t attempted = 0;
     std::size_t scored = 0;
@@ -114,7 +104,6 @@ struct arm_tally_t {
     std::size_t smoothing_refused = 0;
     std::size_t embedding_failed = 0;
     std::size_t energy_unavailable = 0;
-    /** One entry per molecule this arm and the reference arm both scored, in kcal/mol. */
     std::vector<double> energy_deltas;
 };
 
@@ -139,13 +128,9 @@ struct sweep_scratch_t {
     sftypes::molecule_descriptor_t descriptor;
 };
 
-/**
- *  @brief Copy our packed bounds into a fresh `DistGeom::BoundsMatrix`.
- *
- *  Our layout keeps the upper bound above the diagonal and the lower below, which is the convention
- *  `types/views.hpp` states and `upper_distance_bound_at` reads; RDKit's matrix is addressed by an
- *  ordered pair instead, so the transcription is where the two conventions meet.
- */
+/** Copy our packed bounds into a fresh `DistGeom::BoundsMatrix`. Our layout keeps the upper bound above the diagonal
+ *  and the lower below, the convention `types/views.hpp` states and `upper_distance_bound_at` reads; RDKit's is
+ *  addressed by an ordered pair, so this is where the two meet. */
 static void fill_rdkit_matrix_from_ours_(sftypes::packed_matrix<float> ours, std::uint32_t num_atoms,
                                          DistGeom::BoundsMatrix &destination) {
     for (std::uint32_t row = 0; row < num_atoms; ++row) {
@@ -187,11 +172,8 @@ static DistGeom::BoundsMatPtr our_bounds_for_(RDKit::ROMol const &molecule, swee
  *  @brief Embed @p molecule once under @p source and score the raw coordinates with MMFF94.
  *
  *  @param[in] molecule Molecule with explicit hydrogens; copied, so the caller's copy keeps no conformer.
- *  @param[in] source Which bounds the embedder is driven with.
  *  @param[in] seed Embedding seed, identical across arms so only the bounds differ.
- *  @param[inout] scratch Buffers reused across molecules.
  *  @param[out] energy MMFF94 single-point energy in kcal/mol, written only on `scored_k`.
- *  @return What the arm did.
  */
 static arm_outcome_t embed_and_score_(RDKit::ROMol const &molecule, bounds_source_t source, std::uint32_t seed,
                                       sweep_scratch_t &scratch, double &energy) {
@@ -299,8 +281,7 @@ int main(int argc, char **argv) {
             record_outcome(tallies[arm_index], outcomes[arm_index]);
         }
 
-        // The delta is paired per molecule against the reference arm, so a molecule the reference itself
-        // could not score contributes to no arm's delta and to every arm's failure count.
+        // Paired per molecule against the reference arm: one the reference could not score contributes to no delta.
         if (outcomes[0] != arm_outcome_t::scored_k) continue;
         for (std::size_t arm_index = 1; arm_index < num_arms_k; ++arm_index)
             if (outcomes[arm_index] == arm_outcome_t::scored_k)
@@ -323,12 +304,10 @@ int main(int argc, char **argv) {
                      arm_index == 0 ? std::string {"—"} : fmt::format("{}/{}", worse, paired));
     }
 
-    // Both controls drive one embedder over one topology at one seed, so a gap between them is the
-    // channel's own error rather than anything about a bounds matrix, and it bounds how much of the
-    // third arm's gap can be believed. The energy half of that gap is the half worth gating on: a
-    // molecule the two controls happen to disagree about embedding is one sample, while a non-zero
-    // median across the paired set means `params.boundsMat` is not a transparent channel, and every
-    // number above it is measuring the instrument instead of the builder.
+    // Both controls drive one embedder over one topology at one seed, so a gap between them is the channel's own
+    // error and bounds how much of the third arm's gap can be believed. The energy half is what is worth gating on:
+    // one disagreement about embedding is one sample, but a non-zero median across the paired set means
+    // `params.boundsMat` is not a transparent channel and every number above it measures the instrument.
     std::size_t const control_gap = tallies[0].scored > tallies[1].scored ? tallies[0].scored - tallies[1].scored
                                                                           : tallies[1].scored - tallies[0].scored;
     double const control_median = median_of(tallies[1].energy_deltas);

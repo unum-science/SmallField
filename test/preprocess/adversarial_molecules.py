@@ -1,38 +1,34 @@
 """
-adversarial_molecules.py — generate a small dataset that exercises every
-boundary condition in SmallField's preprocess + GPU pipeline, for use as a
-fast regression signal (~2 min on 1 GPU, ~30 s on 8 GPUs).
+adversarial_molecules.py — generate a small dataset exercising every boundary condition in SmallField's
+preprocess + GPU pipeline, as a fast regression signal: ~2 min on 1 GPU, ~30 s on 8 GPUs.
 
-The set is grouped by axis; each axis targets a specific code path that has
-historically been the source of crashes or correctness bugs:
+Grouped by axis, each targeting a code path where crashes and correctness bugs concentrate:
 
-  1. atom-count bin edges  — the 8 atom-limited-bin caps {16,32,48,64,80,96,112,128}
-     plus their immediate neighbors. Exercises kernel grid sizing and per-bin
-     shared-memory paths.
-  2. per-atom interaction density — cage and fused-ring templates pushing any
-     single atom into a large number of bonds/angles/torsions/oops/stretchbends,
-     the class of molecule that overflowed our original uint8 per-atom counters.
-  3. MMFF typing corners — hypervalent, organocharged, and boron/phosphorus
-     species that exercise the MMFF94 fallback-type paths.
+  1. atom-count bin edges — the atom-limited-bin caps through 128 plus their immediate neighbors,
+     exercising kernel grid sizing and per-bin shared-memory paths. The 192 cap the ladder ends on is
+     not covered here.
+  2. per-atom interaction density — cage and fused-ring templates pushing one atom into a large number of
+     bonds/angles/torsions/oops/stretchbends, the class a `uint8` per-atom counter overflows.
+  3. MMFF typing corners — hypervalent, organocharged and boron/phosphorus species reaching the MMFF94
+     fallback-type paths.
   4. stereochemistry boundaries — 0/1/2/many chiral centers, E/Z, atropisomers.
-  5. degenerate graphs — long chains and highly-branched structures that
-     stress OpenMP load balance and atom-count distribution.
-  6. RDKit parse corners — explicit H, long SMILES, nested ring closures,
-     kekulized vs aromatic notation.
-  7. DG convergence corners — molecules whose FIRE minimization reaches max
-     iterations without convergence.
-  8. scaffold-cache stress — many decorations of one Bemis-Murcko scaffold
-     exercising the cache hit path + the insert-if-missing contention window.
+  5. degenerate graphs — long chains and highly-branched structures stressing OpenMP load balance and
+     atom-count distribution.
+  6. RDKit parse corners — explicit H, long SMILES, nested ring closures, kekulized vs aromatic notation.
+  7. DG convergence corners — molecules whose FIRE minimization reaches max iterations without converging.
+  8. scaffold-cache stress — many decorations of one Bemis-Murcko scaffold, exercising the cache hit path
+     and the insert-if-missing contention window.
+  9. VF2 hang candidates — highly-substituted polycyclic aromatics and heavily fused cages whose symmetry
+     blows up `RDKit::SubstructMatch` recursion depth.
 
 Usage:
     python adversarial_molecules.py \\
         --output test/preprocess/adversarial.smi \\
         --meta   test/preprocess/adversarial.meta.json
 
-Output format: `adversarial.smi` is one SMILES per line, no IDs — fed into
-smi_to_parquet.py for consumption by smallfield_batch. The meta JSON
-records which template each row came from, so diagnostic messages can point
-at the boundary a failing molecule exercises.
+Output: `adversarial.smi` is one SMILES per line, no IDs, fed into smi_to_parquet.py for smallfield_batch.
+The meta JSON records which template each row came from, so a diagnostic can point at the boundary a
+failing molecule exercises.
 """
 
 from __future__ import annotations
@@ -53,8 +49,7 @@ class template_t:
     name: str
     smiles_generator: Callable[[], Iterable[str]]
     target_code_path: str
-    # Expansion multiplier. Used by the scaffold-cache-stress axis to emit
-    # many similar decorations of a single scaffold.
+    # Expansion multiplier, used by the scaffold-cache-stress axis for many decorations of one scaffold.
     multiplicity: int = 1
 
 
@@ -65,9 +60,8 @@ def _repeat_c(carbon_count: int) -> str:
 
 
 def _star_alkane(branch_count: int, branch_length: int) -> str:
-    """Star alkane: central carbon with `branch_count` branches, each
-    `branch_length` carbons long. Valid only for branch_count ≤ 4 (carbon
-    valence); for larger branch counts we build a dendrimer-style tree."""
+    """Star alkane: central carbon with `branch_count` branches of `branch_length` carbons. Carbon valence
+    allows this only up to branch_count 4; beyond that it builds a dendrimer-style tree."""
 
     if branch_count <= 4:
         branches = [_repeat_c(branch_length) for _ in range(branch_count)]
@@ -83,18 +77,16 @@ def _star_alkane(branch_count: int, branch_length: int) -> str:
 
 
 def _substituted_aniline(sample_count: int) -> Iterable[str]:
-    """Yield `sample_count` distinct simple decorations of aniline's scaffold (c1ccc(cc1)N).
-    Shares one Bemis-Murcko scaffold, so the scaffold cache sees repeated
-    hash hits on the first call and steady state hits on the rest."""
+    """Yield `sample_count` distinct simple decorations of aniline's scaffold (c1ccc(cc1)N). One shared
+    Bemis-Murcko scaffold, so the cache sees repeated hash hits on the first call, steady state on the rest."""
 
     decorations = [
         "C", "CC", "CCC", "O", "OC", "OCC", "N(C)C", "F", "Cl", "Br",
         "C#N", "C(=O)C", "C(=O)O", "S", "SC", "C(F)(F)F", "C(C)(C)C",
         "OC(C)=O", "N", "NC(=O)C",
     ]
-    # Generate `sample_count` distinct combinations of decorations at the 2, 3, 4
-    # positions of the aniline ring. Use integer encoding so results are
-    # deterministic and reproducible across platforms.
+    # `sample_count` distinct decoration combinations at the aniline ring's 2, 3, 4 positions, integer-encoded
+    # so results are deterministic and reproducible across platforms.
     count = 0
     for first_index in range(len(decorations)):
         for second_index in range(len(decorations)):
@@ -240,14 +232,12 @@ def build_templates() -> list[template_t]:
         multiplicity=1,  # generator yields all rows directly
     ))
 
-    # Axis 9: VF2 hang candidates — highly-substituted polycyclic aromatics and
-    # heavily fused cages whose symmetry blows up VF2's recursion depth in
-    # `RDKit::SubstructMatch`. Without the `preprocess_deadline` +
-    # `extraAtomCheck` hook (RDKit 2025.09.6 feature), one of these can stall
-    # the OMP-for preprocess-step indefinitely and freeze the 4-role pipeline.
-    # The new per-molecule deadline caps each at ~2 s and stamps
-    # `conformer_status_t::preprocess_timeout`; the fallback-role then retries
-    # via ETKDGv3 (no SubstructMatch path).
+    # Axis 9: VF2 hang candidates — highly-substituted polycyclic aromatics and heavily fused cages whose
+    # symmetry blows up VF2's recursion depth in `RDKit::SubstructMatch`. Without the `preprocess_deadline`
+    # + `extraAtomCheck` hook, an RDKit 2025.09.6 feature, one of these stalls the OMP-for preprocess-step
+    # indefinitely and freezes the 4-role pipeline; the per-molecule deadline caps each at ~2 s and stamps
+    # `conformer_status_t::preprocess_timeout`, and the fallback-role retries via ETKDGv3, which takes no
+    # SubstructMatch path.
     vf2_hangers = [
         ("tetracene",                       "c1ccc2cc3cc4ccccc4cc3cc2c1"),
         ("pentacene",                       "c1ccc2cc3cc4cc5ccccc5cc4cc3cc2c1"),

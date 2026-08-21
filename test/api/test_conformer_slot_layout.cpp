@@ -2,10 +2,9 @@
  *  @file test/api/test_conformer_slot_layout.cpp
  *  @brief Guard the structure-of-arrays conformer slot contract.
  *
- *  A shipped writer once copied `3 * num_atoms` contiguous halves from a slot base, which reads x for the real
- *  atoms and then inter-component padding -- so y and z were dropped for every molecule with
- *  `3 * num_atoms <= max_atoms`, and the stored geometry collapsed onto the x axis. Bond lengths and energies both
- *  still looked plausible; only a degeneracy check exposes it, so that is what this test asserts.
+ *  Reading a slot as `3 * num_atoms` contiguous halves from its base gets x and then inter-component
+ *  padding, dropping y and z wherever `3 * num_atoms <= max_atoms` and collapsing the geometry onto the x
+ *  axis; bond lengths and energies stay plausible under that, so only the degeneracy check exposes it.
  */
 
 #include <cmath>   // `std::abs`
@@ -32,9 +31,8 @@ namespace smallfield::tests {
 
 /**
  *  @brief Whether `slot_view` addresses every component of a full slot where the contract says it does.
- *
- *  The tetrahedron below exercises four atoms; this walks all `3 * max_atoms` of them, and it is the only
- *  thing pinning the view's strides to `axis * max_atoms + atom` now that no call site spells that twice.
+ *  The tetrahedron below covers four atoms; this walks all `3 * max_atoms` and alone pins the strides to
+ *  `axis * max_atoms + atom`, which no call site spells out.
  */
 static constexpr bool slot_view_matches_contract_() {
     conformer_slot_layout_t const layout {128u, 3u};
@@ -90,14 +88,12 @@ int main() {
                                             {0.760f, 1.316f, 0.000f},
                                             {0.760f, 0.438f, 1.240f}};
 
-    // `max_atoms` far exceeds `atom_count`, which is exactly the regime the bug hit:
-    // 3 * 4 = 12 halves never reach the y component at offset 128.
+    // `max_atoms` far exceeds `atom_count`: 3 * 4 = 12 halves never reach the y component at offset 128.
     conformer_slot_layout_t const layout {128u, 3u};
 
-    // The slot is filled through the contract spelled out rather than through the type that implements it:
-    // three planes of `max_atoms`, so component `axis` of `atom` sits at `axis * max_atoms + atom`. That is
-    // what a shipped shard's `conformer_coords` column is packed against, and asking the layout where to
-    // write would make the round trip below agree with itself whatever the layout said.
+    // Filled through the contract spelled out rather than the type implementing it: three planes of
+    // `max_atoms`, component `axis` of `atom` at `axis * max_atoms + atom`, which is how a shipped shard's
+    // `conformer_coords` is packed. Asking the layout would make the round trip agree with itself regardless.
     std::vector<float> buffer(layout.slot_offset(1u, 0u), 0.0f);
     for (std::uint32_t atom = 0; atom < atom_count; ++atom)
         for (std::uint32_t axis = 0; axis < 3u; ++axis)
@@ -112,8 +108,7 @@ int main() {
         for (std::uint32_t axis = 0; axis < 3u; ++axis)
             sf_verify_(row[atom * 3u + axis] == reference[atom][axis], "the slot transpose lost a component");
 
-    // A contiguous read collapses every point onto the x axis and so yields rank 1, while a correct
-    // transpose yields rank 3. This is the assertion that separates the two.
+    // A contiguous read collapses every point onto x for rank 1; a correct transpose gives rank 3.
     std::uint32_t const rank = coordinate_rank_(row, atom_count);
     if (rank != 3u)
         return sftest::report_fail(test_name_k, "coordinate rank {}, expected 3 -- the geometry is degenerate", rank);

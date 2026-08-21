@@ -2,26 +2,23 @@
  *  @file   test/preprocess/rdkit_divergence_table.cpp
  *  @brief  Every recorded place where SmallField and RDKit disagree and SmallField is right.
  *
- *  Rows are grouped by the chemistry that reaches the defect rather than by the upstream file, because
- *  the chemistry is what a reader has in hand when a parity comparison surprises them. Each family is
- *  introduced by a block comment rather than by a `#pragma region`, which is the one place in this tree
- *  the marker cannot go: a pragma inside a braced initializer is ill-formed, and splitting the array
- *  per family so the markers fit would replace one span with a hand-maintained concatenation.
+ *  Rows are grouped by the chemistry that reaches the defect rather than by the upstream file, because the
+ *  chemistry is what a reader has in hand when a parity comparison surprises them. Each family is introduced
+ *  by a comment rather than a `#pragma region`, the one marker this tree cannot use here: a pragma inside a
+ *  braced initializer is ill-formed, and splitting the array per family would replace one span with a
+ *  hand-maintained concatenation. Two candidates were measured and deliberately @b not recorded, listed here
+ *  so nobody spends the afternoon rediscovering them:
  *
- *  Two candidates were measured and deliberately @b not recorded, and they are listed here so nobody
- *  spends the afternoon rediscovering them:
- *
- *  - `DistGeom/TriangleSmooth.cpp`, in the lower-bound update, chains two candidates with `else if` and
- *    so appears to discard the larger of them where a maximum belongs. It cannot: the two candidates
- *    are `L_ik - U_jk` and `L_jk - U_ik`, whose sum is `(L_ik - U_ik) + (L_jk - U_jk)`, and every term
- *    of that is non-positive on any matrix with `L <= U`. At most one candidate can exceed a
- *    non-negative `L_ij`, so the branch and a maximum agree on every consistent input. A sweep over
- *    400 corpus molecules, and an exhaustive search over every single-pair tightening of three small
- *    molecules, found zero inputs where they differ. Ours takes the maximum because that is what the
- *    inequality says; it is not a divergence.
- *  - The 1-3 bound around a three-membered ring, where a law-of-cosines write can overwrite an exact
- *    bond length. Upstream corrected it in `c5de9f884357` and `bb18fd56f294`, and our builder carries
- *    the same visited-bound discipline, so there is nothing left to record.
+ *  - `DistGeom/TriangleSmooth.cpp`, in the lower-bound update, chains two candidates with `else if` and so
+ *    appears to discard the larger where a maximum belongs. It cannot: they are `L_ik - U_jk` and
+ *    `L_jk - U_ik`, whose sum `(L_ik - U_ik) + (L_jk - U_jk)` is non-positive term by term wherever
+ *    `L <= U`, so at most one exceeds a non-negative `L_ij` and the branch and a maximum agree on every
+ *    consistent input. A sweep over 400 corpus molecules, plus an exhaustive search over every single-pair
+ *    tightening of three small molecules, found zero inputs where they differ. Ours takes the maximum
+ *    because that is what the inequality says; it is not a divergence.
+ *  - The 1-3 bound around a three-membered ring, where a law-of-cosines write can overwrite an exact bond
+ *    length. Upstream corrected it in `c5de9f884357` and `bb18fd56f294`, and our builder carries the same
+ *    visited-bound discipline, so there is nothing left to record.
  */
 
 #include <cstddef> // `std::size_t`
@@ -34,16 +31,14 @@ namespace smallfield::tests {
 
 static constexpr rdkit_divergence_row_t divergence_rows_k[] = {
 
-    /*  Ring double bonds.
-     *
-     *  A double bond inside a ring gets its 1-4 bounds from `_getInRing14Type`, which asks
-     *  `_getAtomStereo` whether the pair under test sits cis or trans. That helper exclusive-ors two
-     *  comparisons against the bond's recorded stereo atoms, which are pinned to the bond's begin and
-     *  end atoms, while the pair reaching it comes from a ring walk whose direction `RingInfo` fixes
-     *  arbitrarily. Walk the ring the other way and the exclusive-or flips, so a pair that is trans is
-     *  handed the cis distance. Both isomers of this cyclo-undecene invert: the Z form, whose stereo
-     *  atoms are 3 and 6, puts atom 3 cis to the chlorine and therefore trans to atom 7, yet receives
-     *  the short cis bound; the E form receives the long trans bound for a pair that is cis. */
+    // Ring double bonds.
+    // A double bond inside a ring gets its 1-4 bounds from `_getInRing14Type`, which asks `_getAtomStereo`
+    // whether the pair sits cis or trans. That helper exclusive-ors two comparisons against the bond's stereo
+    // atoms, pinned to its begin and end atoms, while the pair reaching it comes from a ring walk whose
+    // direction `RingInfo` fixes arbitrarily -- walk the other way and the flip hands a trans pair the cis
+    // distance. Both isomers of this cyclo-undecene invert: the Z form, stereo atoms 3 and 6, puts atom 3 cis
+    // to the chlorine and so trans to atom 7 yet receives the short cis bound; the E form receives the long
+    // trans bound for a pair that is cis.
     {.smiles = "C1CCC/C=C(Cl)/CCCC1",
      .kind = divergence_kind_t::bounds_1_4_k,
      .atoms = {3, 7, 0, 0},
@@ -60,16 +55,14 @@ static constexpr rdkit_divergence_row_t divergence_rows_k[] = {
      .since = rdkit_release_t::release_2025_09_k,
      .fixed_in = rdkit_release_t::not_yet_fixed_k},
 
-    /*  Saturated small rings.
-     *
-     *  The CSD torsion energy is a six-term cosine series and its analytic gradient expands each term
-     *  by hand. The sixth expansion reads `forceConstants[4]` and `signs[4]` -- the fifth term's
-     *  coefficients -- and its `sin(6 phi)` identity ends in `6 sin(phi)` where `6 sin(phi) cos(phi)`
-     *  belongs. Of the 105 small-ring patterns, 37 carry a non-zero sixth coefficient and all 37 of
-     *  those carry a zero fifth one, so the entire six-fold force silently vanishes. Cyclopentane is
-     *  the smallest molecule that reaches it: one pattern, one coefficient, `V6 = 10` kcal/mol. Our
-     *  kernel cannot express either mistake, because one indexed coefficient drives both the energy and
-     *  the derivative and a Chebyshev recurrence supplies `sin(n phi)`. */
+    // Saturated small rings.
+    // The CSD torsion energy is a six-term cosine series whose analytic gradient expands each term by hand.
+    // The sixth expansion reads `forceConstants[4]` and `signs[4]` -- the fifth term's coefficients -- and its
+    // `sin(6 phi)` identity ends in `6 sin(phi)` where `6 sin(phi) cos(phi)` belongs. Of the 105 small-ring
+    // patterns, 37 carry a non-zero sixth coefficient and all 37 carry a zero fifth one, so the entire
+    // six-fold force silently vanishes. Cyclopentane is the smallest molecule reaching it: one pattern, one
+    // coefficient, `V6 = 10` kcal/mol. Our kernel can express neither mistake, since one indexed coefficient
+    // drives both energy and derivative and a Chebyshev recurrence supplies `sin(n phi)`.
     {.smiles = "C1CCCC1",
      .kind = divergence_kind_t::torsion_preference_k,
      .atoms = {0, 1, 2, 3},

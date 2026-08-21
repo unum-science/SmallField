@@ -2,9 +2,8 @@
  *  @file src/smallfield/types/conformer_status.hpp
  *  @brief Per-conformer status enum, and the vocabulary every rejection in the pipeline speaks.
  *
- *  A leaf header with no project dependency, because the refusals start at the leaves: `build_descriptor`
- *  answers with one before a molecule is anything more than a flat descriptor, and the warp kernels write
- *  one per slot. `api/smallfield.hpp` re-exports it as the spelling a caller of `generate_conformers` reads.
+ *  A leaf header with no project dependency: `build_descriptor` answers with one from a bare flat
+ *  descriptor, the warp kernels write one per slot, `api/smallfield.hpp` re-exports it to callers.
  */
 
 #pragma once
@@ -18,75 +17,60 @@
 namespace smallfield::types {
 
 /**
- *  @brief Per-conformer status code, and the vocabulary every rejection in the pipeline speaks.
+ *  @brief Per-conformer status code. `success_k` is the only value a conformer survives.
  *
- *  @b Append only. Every value is written as an integer into every shipped `*.3D.parquet`, so
- *  renumbering or removing one silently changes what already-written shards mean. A value that
- *  stops being produced keeps its slot and says so; a new refusal takes the next free number.
- *
- *  `success_k` is the only value a conformer survives; everything else names why it did not.
+ *  @b Append only. Every value is written as an integer into every shipped `*.3D.parquet`, so renumbering
+ *  or removing one silently changes what already-written shards mean; a value that stops being produced
+ *  keeps its slot and says so, and a new refusal takes the next free number.
  */
 enum class conformer_status_t : std::uint8_t {
+    /** Embedded, polished, and carrying an energy `energy_is_physical` accepts. */
     success_k = 0,
+    /** The embedding could not satisfy a declared chiral center or E/Z bond within the attempt budget. */
     stereo_failure_k = 1,
+    /** The MMFF94 minimiser ran and did not reach a stationary point. Also the batch-level verdict
+     *  `generate_conformers` returns when no conformer in the call succeeded. */
     mmff_unconverged_k = 2,
+    /** RDKit refused the SMILES. Also the pre-fill every output slot carries, so a molecule no wave
+     *  reached reads as unparsed rather than as whatever the caller's buffer held. */
     invalid_smiles_k = 3,
     /** More atoms than the single-warp pipeline's `max_atoms_per_molecule_k`. */
     too_many_atoms_k = 4,
-    /** Reserved. Nothing produces this: it marked a `preprocess-step` that exceeded its
-     *  per-`molecule` deadline, and the deadline guarded RDKit VF2's pathological worst case. The
-     *  native matcher covers the whole pattern corpus, so no substructure search runs. */
+    /** Reserved, produced by nothing: it marked a `preprocess-step` past its per-molecule deadline, and
+     *  that deadline guarded RDKit VF2's pathological worst case, which the native matcher removed by
+     *  covering the whole pattern corpus with no substructure search. Keeps its slot under the append-only
+     *  rule above, because the values after it are already written into shipped shards. */
     preprocess_timeout_k = 5,
-    /** Molecule contains an atom whose `MMFF94` atom type cannot be assigned
-     *  by `RDKit::MMFF::MMFFMolProperties::getMMFFAtomType` (returns 0). Covers
-     *  transition metals, lanthanides, boron, and other elements outside the MMFF94
-     *  parameter set. The `fallback-role` sees these too, and rejects them on the same typing
-     *  check before spending an embedding on a molecule it could never minimise. */
+    /** An atom `RDKit::MMFF::MMFFMolProperties::getMMFFAtomType` cannot assign — a transition metal,
+     *  lanthanide, boron, anything outside MMFF94. `fallback-role` refuses it there, before embedding. */
     unsupported_element_k = 6,
-    /** More bonds than `max_bonds_k`, which only a molecule under the atom cap carrying an
-     *  unusual number of ring closures reaches. Distinct from `invalid_smiles_k`: the SMILES
-     *  parsed, and the molecule is simply wider than the flat descriptor's bond arrays. */
+    /** More bonds than `max_bonds_k`. Distinct from `invalid_smiles_k`: the SMILES parsed, and the
+     *  molecule is simply wider than the flat descriptor's bond arrays. */
     too_many_bonds_k = 7,
-    /** More SSSR rings than `atom_ring_bitmap` has bits, or more ring-membership entries than
-     *  `ring_atoms` holds. Either one leaves a genuinely in-ring atom carrying no ring label, and
-     *  MMFF typing and the CSD torsion match then read the molecule as acyclic where it is not,
-     *  so the molecule is refused rather than parametrised from partial ring perception. */
+    /** More SSSR rings than `atom_ring_bitmap` has bits, or more membership entries than `ring_atoms`
+     *  holds. Either leaves an in-ring atom unlabelled, so the molecule is refused, not half-perceived. */
     too_many_rings_k = 8,
-    /** Triangle smoothing drove some atom pair's lower bound above its upper, so no set of
-     *  coordinates satisfies the molecule's bounds matrix. `smoothing_t::infeasible_k` is the
-     *  device-side verdict that names it, and the smoothed matrix the prepass persists carries the
-     *  crossed pair. Distinct from `stereo_failure_k`: an impossible matrix embedded anyway fails
-     *  downstream under a name that describes the symptom rather than the cause. */
+    /** Triangle smoothing drove some atom pair's lower bound above its upper, so no coordinates satisfy
+     *  the matrix. Named apart from `stereo_failure_k`, the symptom such a matrix shows downstream. */
     bounds_infeasible_k = 9,
-    /** The slot's MMFF94 energy is not a finite number, so the geometry behind it is not one either.
-     *  Energies order the conformers of a molecule, and a `NaN` compares false against everything —
-     *  which breaks the strict-weak ordering `std::stable_sort` requires — while an infinity sorts
-     *  first and would be published as the molecule's best conformer. The demoted slot keeps the
-     *  value it was refused for: consumers gate on the status, and the number is the only evidence
-     *  of what diverged. */
+    /** The slot's MMFF94 energy is not finite, so neither is the geometry behind it: a `NaN` breaks the
+     *  strict-weak ordering `std::stable_sort` requires and an infinity would be published as the
+     *  molecule's best conformer. The slot keeps the value it was refused for, the only evidence left. */
     nonphysical_energy_k = 10,
-    /** The molecule fits every extent it was measured against; the batch it was placed in did not fit
-     *  its producer. Three sites reach it: a slice whose molecule count outgrows what a 32-bit
-     *  per-molecule region offset addresses refuses the tail past that bound, a device whose wave pool
-     *  or pinned staging could not be reserved refuses its whole batch, and the metric prepass refuses
-     *  a bin its scratch cannot hold. Deliberately not `too_many_atoms_k`: nothing about the molecule is
-     *  oversized, so the same input at a smaller wave succeeds, and a histogram that spelled it as an
-     *  atom-count refusal would report a sizing bug as a property of the corpus. */
+    /** The molecule fits every extent it was measured against; the batch it landed in did not fit its
+     *  producer. Three sites reach it: a slice outgrowing what a 32-bit per-molecule region offset
+     *  addresses, a device whose wave pool or pinned staging could not be reserved, and a metric prepass
+     *  bin its scratch cannot hold. Not `too_many_atoms_k`: the same input at a smaller wave succeeds,
+     *  so an atom-count name would report a sizing bug as a property of the corpus. */
     batch_overflow_k = 11,
     /** No kernel wrote this slot: it carries what the wave's priming walk left there. Distinct from
-     *  `mmff_unconverged_k`, which is a minimiser that ran and did not converge — a geometry exists and
-     *  is simply not at a stationary point, where here there is no geometry at all. The two call for
-     *  opposite responses, so they cannot share a name. */
+     *  `mmff_unconverged_k`, where a geometry exists and is simply not at a stationary point. */
     slot_unwritten_k = 12,
     /** The MMFF polish moved a declared tetrahedral center onto the wrong handedness, caught by the
-     *  post-polish validation. Distinct from `stereo_failure_k`, which the pipeline kernel writes when
-     *  the embedding could not satisfy the chiral constraint in the first place: that one is a molecule
-     *  the distance geometry found hard, this one is a geometry the force field walked out of a basin
-     *  it was already in. Splitting them is what tells a corpus-scale run which stage is inverting. */
+     *  post-polish validation. Split from `stereo_failure_k` so a corpus run sees which stage inverts. */
     polish_inverted_center_k = 13,
-    /** The same, for a declared E/Z double bond. Separate from the center above because the two have
-     *  different causes and different fixes, and the shipped corpus was wrong in both at once at rates
-     *  nobody could tell apart. */
+    /** The same, for a declared E/Z double bond. Separate from the center above because a corpus can be
+     *  wrong in both at once at rates a single count cannot tell apart. */
     polish_inverted_bond_k = 14,
 };
 
@@ -98,12 +82,8 @@ inline constexpr std::size_t conformer_status_count_k =
 /** What a status byte no enumerator claims prints as, which a shard from a newer producer can carry. */
 inline constexpr std::string_view unnamed_status_k = "unnamed_status";
 
-/**
- *  @brief The name a per-status report prints, which is the enumerator without its suffix.
- *
- *  Exhaustive and carrying no `default:`, so appending to the enum is a `-Wswitch` warning here rather
- *  than a row printed under a neighbour's name.
- */
+/** The name a per-status report prints, the enumerator without its suffix. Exhaustive and carrying no
+ *  `default:`, so appending to the enum is a `-Wswitch` warning rather than a row under a wrong name. */
 inline constexpr std::string_view conformer_status_name(conformer_status_t status) noexcept {
     switch (status) {
     case conformer_status_t::success_k: return "success";
@@ -130,15 +110,10 @@ static_assert(conformer_status_name(static_cast<conformer_status_t>(conformer_st
                   conformer_status_name(static_cast<conformer_status_t>(conformer_status_count_k)) == unnamed_status_k,
               "every enumerator carries a name, and nothing past the last one does");
 
-/**
- *  @brief Whether an MMFF94 energy is one a conformer can be ranked and published by.
- *
- *  The predicate both producers of a `success_k` slot share, so the GPU pipeline and the
- *  `fallback-role` cannot disagree about what a publishable energy is. Finiteness only, and
- *  deliberately no magnitude bound: at this pipeline's dispatch geometry a bound is a throughput
- *  decision rather than a policy detail, and the signal separating a diverged minimization from a
- *  genuinely low energy is a paired delta against RDKit that production does not have.
- */
+/** Whether an MMFF94 energy is one a conformer can be ranked and published by. Shared by both producers
+ *  of a `success_k` slot, so the GPU pipeline and the `fallback-role` cannot disagree. Finiteness only:
+ *  telling a diverged minimization from a genuinely low energy needs a paired delta against RDKit that
+ *  production does not have, so a magnitude bound would refuse on a number nothing here can judge. */
 inline constexpr auto energy_is_physical = [](float energy) noexcept { return std::isfinite(energy); };
 
 } // namespace smallfield::types

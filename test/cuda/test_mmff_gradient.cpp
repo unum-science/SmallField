@@ -2,22 +2,16 @@
  *  @file test/cuda/test_mmff_gradient.cpp
  *  @brief Gate the device MMFF94 energy and its analytical gradient against host references.
  *
- *  Two references, because neither alone is enough. RDKit's `calcEnergy` gates the total the kernel
- *  accumulates at identical coordinates, and a central difference of that same total gates the gradient
- *  the kernel writes beside it: an energy that matches RDKit under a gradient that does not
- *  differentiate it is exactly what a minimizer turns into a wrong conformer, and no total-energy
- *  comparison sees it.
+ *  Neither reference alone is enough: RDKit's `calcEnergy` gates the total at identical coordinates, a
+ *  central difference of that total gates the gradient beside it. An energy matching RDKit under a
+ *  gradient that does not differentiate it is what a minimizer turns into a wrong conformer, and no
+ *  total-energy comparison sees it. The out-of-plane bend is probed alone first, being the one MMFF94
+ *  form whose derivative shares no algebra with the stage, so a sign error in it hides inside a total.
  *
- *  The out-of-plane bend is probed on its own first. It is the one MMFF94 form whose derivative shares
- *  no algebra with the rest of the stage, so a sign error in it hides inside a full-stage total but
- *  cannot hide once every other term's force constant is gone.
- *
- *  The built-in molecules are what `ctest` gates on, and every one of them reproduces RDKit's total
- *  inside `energies_agree_`'s band, so the sweep exempts none of them. A corpus named on
- *  the command line turns the same sweep into a survey: over a 40-molecule PubChem sample the gradient
- *  sections stay clean and the energy section reports real divergences, 18 molecules beyond its band and
- *  four of them past 20 kcal per mol, which is the state of the two implementations rather than a
- *  property of this harness.
+ *  `ctest` gates on the built-ins, every one inside `energies_agree_`'s band, so the sweep exempts none.
+ *  A named corpus turns it into a survey: over a 40-molecule PubChem sample the gradient sections stay
+ *  clean while the energy section reports 18 molecules beyond its band, four past 20 kcal per mol --
+ *  the state of the two implementations rather than a property of this harness.
  */
 
 #include <cmath>   // `std::fabs`, `std::isfinite`
@@ -71,12 +65,10 @@ static constexpr std::string_view gradient_field_name_(std::uint32_t axis) noexc
 /**
  *  @brief How far one coordinate moves either way for a central difference, in angstroms.
  *
- *  The step is bounded from below by cancellation, not by truncation. The kernel answers in `float`, so
- *  two energies of magnitude E are each rounded to about `E * 2^-23` before they are subtracted and the
- *  difference divided by `2 * step`; at glucose's 138 kcal per mol a 1e-4 step left the quotient with a
- *  0.17 resolution against analytical components of 1.3, and this test read that as a mismatch. Ten
- *  times the step divides that by ten, while the truncation a central difference pays grows as the
- *  square of it and stays four orders below the band either way.
+ *  Cancellation bounds the step from below, not truncation: `float` rounds two energies of magnitude E to
+ *  `E * 2^-23` before subtracting and dividing by `2 * step`, so at glucose's 138 kcal per mol a 1e-4 step
+ *  left the quotient a 0.17 resolution against analytical components of 1.3 and read as a mismatch. Ten
+ *  times the step divides that by ten; truncation grows as the square of it, four orders below the band.
  */
 static constexpr float finite_difference_step_k = 1.0e-3f;
 
@@ -87,37 +79,29 @@ static constexpr std::size_t sampled_components_per_molecule_k = 12;
 static constexpr std::size_t max_printed_lines_k = 32;
 
 /**
- *  @brief Buffers every molecule and every probe reuses, so the sweep allocates once rather than per call.
+ *  @brief Buffers every molecule and probe reuses, so the sweep allocates once rather than per call.
  *
- *  Each finite-difference component costs two device energy evaluations, so a molecule of sixty atoms
- *  runs the evaluator about fifty times; anything sized per call would be an allocation per probe.
+ *  Each component costs two device evaluations, some fifty per sixty-atom molecule, so anything sized per
+ *  call would be an allocation per probe. `prepared` is refilled per SMILES, `single_oop` is the same
+ *  molecule stripped to its first out-of-plane bend, `atom_major` holds RDKit's conformer and `axis_major`
+ *  the transposed copy a probe perturbs and restores; `probe_gradient` is written and never read, and
+ *  `bond_hops` backs the hop matrix every energy call rebuilds.
  */
 struct gradient_scratch_t {
-    /** Preprocessed molecule, refilled per SMILES by `prepare_molecule_into`. */
     sfp::etkdg_prepared_molecule_t prepared {};
-    /** The same molecule stripped down to its first out-of-plane bend. */
     sfp::etkdg_prepared_molecule_t single_oop {};
-    /** RDKit's conformer, atom-major. */
     std::vector<float> atom_major;
-    /** The same coordinates axis-major; a probe perturbs one component and restores it. */
     std::vector<float> axis_major;
-    /** Analytical gradient of the full stage at the unperturbed coordinates. */
     std::vector<float> stage_gradient;
-    /** Analytical gradient of the isolated out-of-plane term at the same coordinates. */
     std::vector<float> term_gradient;
-    /** The gradient a probe's energy call writes and nobody reads. */
     std::vector<float> probe_gradient;
-    /** Storage behind the hop matrix every energy call rebuilds. */
     std::vector<std::uint8_t> bond_hops;
 };
 
 /**
- *  @brief Evaluate one molecule's MMFF94 energy and gradient on the device.
- *
- *  The pool ships no hop matrix: the device rebuilds it per wave from the bond list, and this
- *  single-molecule harness does the same so the nonbonded sweep sees production's exclusions.
- *
- *  @param[in] prepared Molecule whose terms are evaluated.
+ *  @brief Evaluate one molecule's MMFF94 energy and gradient on the device. The pool ships no hop matrix,
+ *  so this harness rebuilds it from the bond list as the device does per wave, leaving the nonbonded
+ *  sweep production's exclusions.
  *  @param[in] positions Axis-major coordinates, `3 * prepared.num_atoms` components.
  *  @param[inout] scratch Supplies the hop-matrix storage this call refills.
  *  @param[out] gradient Grown to match @p positions, then filled axis-major.
@@ -149,13 +133,8 @@ struct gradient_scratch_t {
 
 /**
  *  @brief Central difference of the device energy with respect to one coordinate of `scratch.axis_major`.
- *
- *  The perturbed component is restored to the exact value it held, so a caller may walk every component
- *  of one molecule through the same buffer.
- *
- *  @param[in] prepared Molecule whose energy is differentiated.
+ *  The perturbed component is restored exactly, so a caller may walk a whole molecule through one buffer.
  *  @param[in] axis Spatial dimension of the perturbed component, `0` for x through `2` for z.
- *  @param[in] atom Atom whose coordinate is perturbed.
  *  @param[inout] scratch Holds the coordinates, and the buffers the two energy calls fill.
  *  @param[out] derivative Receives the derivative in kcal per mol per angstrom; untouched on a refusal.
  *  @return Whether both device round trips completed, and which step refused one.
@@ -174,8 +153,7 @@ struct gradient_scratch_t {
     if (probe == mmff_energy_probe_t::completed_k)
         probe = mmff_energy_and_gradient_(prepared, scratch.axis_major, scratch, scratch.probe_gradient, energy_minus);
 
-    // Restored before the refusal is answered, so a probe leaves the coordinates it borrowed as it found
-    // them whatever the device said.
+    // Restored before the refusal is answered, so a probe leaves borrowed coordinates as it found them.
     coordinates(atom, axis) = original;
     if (probe != mmff_energy_probe_t::completed_k) return probe;
     derivative = (energy_plus - energy_minus) / (2.0f * finite_difference_step_k);
@@ -186,11 +164,13 @@ struct gradient_scratch_t {
 
 #pragma region Tolerances
 
-/** The band an analytical derivative is trusted to against a central difference of a `float` energy. */
+/**
+ *  @brief The band an analytical derivative is trusted to against a central difference of a `float` energy.
+ *  `absolute` is accepted outright and decides a component whose derivative is near zero; `relative` is
+ *  against the difference itself and takes over above unit magnitude.
+ */
 struct gradient_tolerance_t {
-    /** Absolute error accepted outright, which is what decides a component whose derivative is near zero. */
     float absolute = 0.0f;
-    /** Error relative to the difference itself, which takes over above unit magnitude. */
     float relative = 0.0f;
 
     bool agree(float finite_difference, float analytical) const noexcept {
@@ -200,28 +180,24 @@ struct gradient_tolerance_t {
 };
 
 /**
- *  @brief The band one isolated out-of-plane term is held to.
- *
- *  Its energy is a few kcal per mol whatever the molecule around it, so the cancellation the difference
- *  pays does not grow with atom count either: over the built-ins the worst error is 3e-5, which the run
- *  prints beside this band.
+ *  @brief The band one isolated out-of-plane term is held to. Its energy is a few kcal per mol whatever
+ *  surrounds it, so cancellation does not grow with atom count: the worst error over the built-ins is
+ *  3e-5, which the run prints beside this band.
  */
 static constexpr gradient_tolerance_t single_term_tolerance_k {.absolute = 2.0e-3f, .relative = 1.0e-2f};
 
 /**
- *  @brief The band the full stage is held to, which the size of the total it differentiates decides.
- *
- *  A hundred-atom molecule carries a few hundred kcal per mol through the same `float` subtraction, so
- *  this band is set by the largest built-in rather than the smallest: the worst error over them is 0.016.
+ *  @brief The band the full stage is held to, decided by the size of the total it differentiates: a
+ *  hundred-atom molecule pushes a few hundred kcal per mol through the same `float` subtraction, so the
+ *  largest built-in sets it rather than the smallest. Worst error over them is 0.016.
  */
 static constexpr gradient_tolerance_t full_stage_tolerance_k {.absolute = 2.5e-2f, .relative = 7.5e-2f};
 
 /**
  *  @brief Whether the device total and RDKit's are the same number, at the resolution `float` allows.
  *
- *  The band is what the two implementations measurably achieve rather than what they can be made to
- *  pass at: every one of the ten built-in molecules agrees to 3e-4 kcal per mol or better, so a band of
- *  a whole kcal would leave three orders of magnitude of regression unreported.
+ *  The band is what the two implementations measurably achieve, not what they can be made to pass at: all
+ *  ten built-ins agree to 3e-4 kcal per mol or better, so a whole kcal would hide three orders of regression.
  */
 static bool energies_agree_(double rdkit_energy, double device_energy) noexcept {
     double const band = std::max(1.0e-2, 1.0e-4 * std::fabs(rdkit_energy));
@@ -230,9 +206,8 @@ static bool energies_agree_(double rdkit_energy, double device_energy) noexcept 
 
 /**
  *  @brief Whether one axis sum of a gradient cancelled to zero, at the resolution its magnitudes allow.
- *
  *  A translation-invariant field sums to zero exactly in real arithmetic; in `float` it sums to the
- *  rounding of the magnitudes that cancelled, so the band scales with them and floors at 1e-2.
+ *  rounding of what cancelled, so the band scales with those magnitudes and floors at 1e-2.
  */
 static bool axis_sum_vanishes_(float magnitude_sum, float axis_sum) noexcept {
     return std::fabs(axis_sum) < std::max(1.0e-2f, 1.0e-5f * magnitude_sum);
@@ -245,22 +220,20 @@ static bool axis_sum_vanishes_(float magnitude_sum, float axis_sum) noexcept {
 /**
  *  @brief How far one coordinate moves either way for the restraint's own central difference.
  *
- *  Five times the stage's step, because the restraint is the one term whose energy is not a chemical
- *  quantity: at a weight of 100 an inverted center carries some 2e4 kcal per mol, which a `float`
- *  resolves to about 2e-3, and the stage's 1e-3 step would divide that by 2e-3 and leave the quotient a
- *  resolution of one. The truncation a central difference pays grows as the square of the step and stays
- *  well under the band either way.
+ *  Five times the stage's step: the restraint's energy is not a chemical quantity, and at a weight of 100
+ *  an inverted center carries some 2e4 kcal per mol, which `float` resolves to 2e-3 -- the stage's 1e-3
+ *  step would leave the quotient a resolution of one. Truncation grows as the square of the step and
+ *  stays well under the band either way.
  */
 static constexpr float chiral_difference_step_k = 5.0e-3f;
 
 /**
  *  @brief The band the restraint's derivative is trusted to against a central difference of its energy.
  *
- *  The absolute floor is set from the energy scale rather than from the derivative's, for the reason
- *  above: a component whose true derivative is zero still reads back as the cancellation noise of two
- *  2e4 totals, which no floor below that noise can accept. The relative band is ten times tighter than
- *  the stage's, because a restraint gradient that is wrong is wrong by a whole term rather than by
- *  rounding — a missing force on the center atom is a hundred percent error, not a percent.
+ *  The absolute floor comes from the energy scale, not the derivative's: a true derivative of zero still
+ *  reads back as the cancellation noise of two 2e4 totals, which no lower floor can accept. The relative
+ *  band is ten times tighter than the stage's, because a wrong restraint gradient is wrong by a whole
+ *  term -- a missing force on the center atom is a hundred percent error, not a percent.
  */
 static constexpr gradient_tolerance_t chiral_restraint_tolerance_k {.absolute = 2.0f, .relative = 1.0e-3f};
 
@@ -277,10 +250,12 @@ enum class restraint_expectation_t : std::uint8_t {
     center_term_only_k,
 };
 
-/** One geometry the restraint is scored on, with the descriptor the polish kernel would be handed. */
+/**
+ *  @brief One geometry the restraint is scored on, with the descriptor the polish kernel would be handed.
+ *  Positions are axis-major, `3 * num_atoms` components, and atom zero is the center.
+ */
 struct chiral_fixture_t {
     std::string_view name;
-    /** Axis-major coordinates, `3 * num_atoms` components; atom zero is the center. */
     std::vector<float> positions;
     std::uint32_t num_atoms = 0;
     sft::chiral_center_descriptor_t center {};
@@ -290,14 +265,12 @@ struct chiral_fixture_t {
 /**
  *  @brief The four fixtures, built around one ideal tetrahedron.
  *
- *  At a 1.5 angstrom bond the pivot-based volume is 10.4 cubic angstrom against its floor of 5, and the
- *  center-based one is 2.60 against its floor of 1.5 — which is the whole reason the second floor is not
- *  the first: the same geometry that clears one by a factor of two clears the other by less.
- *
- *  `center_through_plane` is the geometry this restraint exists for. Its four neighbors are untouched, so
- *  the pivot-based volume is still 10.4 and its term is flat; the center alone has crossed its neighbors'
- *  plane, which is exactly what a restraint applying no force to the center atom cannot see and what
- *  `assignChiralTypesFrom3D` reads as the opposite handedness.
+ *  At a 1.5 angstrom bond the pivot-based volume is 10.4 cubic angstrom against its floor of 5 and the
+ *  center-based one 2.60 against its floor of 1.5, which is why the second floor is not the first.
+ *  `center_through_plane` is the geometry this restraint exists for: neighbors untouched, so the
+ *  pivot-based volume is still 10.4 and its term flat, while the center alone has crossed their plane --
+ *  what a restraint applying no force to the center cannot see, and what `assignChiralTypesFrom3D` reads
+ *  as the opposite handedness.
  */
 static std::vector<chiral_fixture_t> chiral_fixtures_() {
     float const offset = fixture_bond_length_k / 1.7320508f;
@@ -379,10 +352,8 @@ static float gradient_magnitude_(gradient_soa_t gradient, std::uint32_t atom) no
 /**
  *  @brief Gate the chiral restraint's own energy and derivative, which no MMFF94 reference can see.
  *
- *  Published MMFF94 carries no chiral term, so the corpus sweep below runs with the restraint switched
- *  off and nothing there touches it. Its only reference is a central difference of its own energy, and
- *  its only structural claim is which atoms each of its two terms pushes.
- *
+ *  Published MMFF94 carries no chiral term, so the sweep below runs with the restraint off: its only
+ *  reference is a central difference of its own energy, its only claim which atoms its two terms push.
  *  @param[inout] terms Receives one comparison per structural claim of every fixture.
  *  @param[inout] derivatives Receives one comparison per gradient component of every fixture.
  *  @param[out] worst_error Receives the largest error any component showed, so the band stays auditable.
@@ -468,9 +439,10 @@ enum class molecule_outcome_t : std::uint8_t {
 /**
  *  @brief What the sweep counted, threaded by reference so the sweep owns no module state.
  *
- *  The two worst errors are the margin the gradient bands were chosen against, printed every run so the
- *  bands stay auditable rather than inherited: a band ten times the worst error is slack, and a band
- *  just above it is a test that fails on the next molecule.
+ *  One counter per `molecule_outcome_t`, plus the molecules with no out-of-plane term for that section to
+ *  probe. A refusal is a failure of the run rather than of a molecule, so `first_refusal` keeps the step
+ *  the count cannot carry. The two worst errors are the margin the gradient bands were chosen against,
+ *  printed every run: ten times the worst error is slack, just above it fails on the next molecule.
  */
 struct gradient_tally_t {
     std::uint32_t compared = 0;
@@ -478,22 +450,17 @@ struct gradient_tally_t {
     std::uint32_t unembedded = 0;
     std::uint32_t unaligned = 0;
     std::uint32_t unreferenced = 0;
-    /** Molecules the device refused a launch for, which is a failure of the run rather than of a molecule. */
     std::uint32_t refused = 0;
-    /** Which step the first refusal came from, which is the one thing the count cannot carry. */
     mmff_energy_probe_t first_refusal = mmff_energy_probe_t::completed_k;
-    /** Compared molecules carrying no out-of-plane term, which that section has nothing to probe on. */
     std::uint32_t without_oop = 0;
     float worst_oop_error = 0.0f;
     float worst_stage_error = 0.0f;
 };
 
 /**
- *  @brief One reporter per compared section, so each closes with its own `compared=` count.
- *
- *  The four are separate reporters rather than four `summarize` calls on one, because a molecule
- *  contributes to all four before the next molecule starts and a shared reporter would attribute every
- *  count to whichever section summarized first.
+ *  @brief One reporter per compared section, so each closes with its own `compared=` count. Separate
+ *  reporters rather than several `summarize` calls on one: a molecule contributes to all of them before
+ *  the next starts, and a shared reporter would credit every count to whichever summarized first.
  */
 struct gradient_reporters_t {
     /** Analytical gradient of one isolated out-of-plane bend against a central difference of its energy. */
@@ -546,12 +513,8 @@ struct gradient_reporters_t {
 /**
  *  @brief Fill @p single with @p prepared's first out-of-plane bend and nothing else.
  *
- *  Every other category is emptied rather than zeroed, and the four positions of that one term become
- *  the whole interaction list, so each of i, j, k and l receives a gradient from the out-of-plane form
- *  alone. With no van der Waals parameters and no charges the nonbonded sweep contributes nothing
- *  either, which is what leaves the difference attributable to a single term.
- *
- *  @param[in] prepared Molecule carrying at least one out-of-plane term.
+ *  Every other category is emptied and the term's four positions become the whole interaction list; with
+ *  no van der Waals parameters or charges the nonbonded sweep adds nothing, so i, j, k and l see only it.
  *  @param[out] single Reused across molecules, so every category it owns is refilled or cleared here.
  */
 static void fill_single_oop_term_into_(sfp::etkdg_prepared_molecule_t const &prepared,
@@ -579,10 +542,8 @@ static void fill_single_oop_term_into_(sfp::etkdg_prepared_molecule_t const &pre
 
 /**
  *  @brief Compare the isolated out-of-plane gradient against a central difference of its own energy.
- *
  *  @param[in] smiles Molecule under test, carried into the diagnostic keys.
  *  @param[inout] scratch Holds the coordinates the probes perturb and the buffers they fill.
- *  @param[inout] reporter Section that receives one comparison per position and axis.
  *  @param[inout] tally Keeps the worst error this section saw.
  *  @return Whether every device round trip completed, and which step refused one.
  */
@@ -621,12 +582,9 @@ static void fill_single_oop_term_into_(sfp::etkdg_prepared_molecule_t const &pre
 }
 
 /**
- *  @brief Compare the three axis sums of the full gradient against the zero invariance under translation
- *  requires of them.
- *
+ *  @brief Compare the three axis sums of the full gradient against the zero translation invariance requires.
  *  @param[in] smiles Molecule under test, carried into the diagnostic keys.
  *  @param[in] gradient Full-stage analytical gradient, axis-major.
- *  @param[inout] reporter Section that receives one comparison per axis.
  */
 static void compare_translation_invariance_(std::string const &smiles, gradient_soa_t gradient,
                                             diagnostic_reporter_t &reporter) {
@@ -652,13 +610,10 @@ static void compare_translation_invariance_(std::string const &smiles, gradient_
 /**
  *  @brief Compare sampled components of the full-stage gradient against central differences.
  *
- *  The stride is derived from the molecule's own component count rather than fixed, so the samples span
- *  all three axis blocks whatever the atom count; a fixed stride lands entirely inside x once a molecule
- *  passes a few dozen atoms.
- *
+ *  The stride follows the molecule's own component count, so samples span all three axis blocks whatever
+ *  the atom count; a fixed stride lands entirely inside x past a few dozen atoms.
  *  @param[in] smiles Molecule under test, carried into the diagnostic keys.
  *  @param[inout] scratch Holds the coordinates the probes perturb and the gradient they are compared to.
- *  @param[inout] reporter Section that receives one comparison per sampled component.
  *  @param[inout] tally Keeps the worst error this section saw.
  *  @return Whether every device round trip completed, and which step refused one.
  */
@@ -673,8 +628,7 @@ static void compare_translation_invariance_(std::string const &smiles, gradient_
         return full_stage_tolerance_k.agree(finite_difference, analytical);
     };
 
-    // The counter walks storage, which an axis-major view packs one whole axis at a time, so the axis is the
-    // quotient and the atom the remainder however the view is subscripted.
+    // An axis-major view packs one whole axis at a time, so the axis is the quotient and the atom the remainder.
     for (std::size_t component = 0; component < total_components; component += stride) {
         std::uint32_t const axis = static_cast<std::uint32_t>(component / num_atoms);
         std::uint32_t const atom = static_cast<std::uint32_t>(component % num_atoms);
@@ -697,9 +651,6 @@ static void compare_translation_invariance_(std::string const &smiles, gradient_
 
 /**
  *  @brief Run one molecule through every section.
- *
- *  @param[in] smiles Molecule to prepare, embed and compare.
- *  @param[inout] reporters The four sections, each receiving this molecule's comparisons.
  *  @param[inout] scratch Every buffer the molecule needs, carried in from above the loop.
  *  @param[inout] tally Receives what the sections cannot: the skips, the roster hits and the worst errors.
  *  @return Whether the molecule was comparable, and why not when it was not.
@@ -713,8 +664,7 @@ static molecule_outcome_t compare_molecule_(std::string const &smiles, gradient_
     if (!molecule) return molecule_outcome_t::unprepared_k;
     if (!embed_molecule(*molecule)) return molecule_outcome_t::unembedded_k;
 
-    // A salt is the case that reaches here: preprocessing keeps a different atom set than `addHs` does,
-    // and two atom counts that disagree are two atom orders no comparison can align.
+    // A salt reaches here: preprocessing keeps a different atom set than `addHs`, so no order aligns.
     std::uint32_t const rdkit_atoms = molecule->getNumAtoms();
     if (rdkit_atoms != scratch.prepared.num_atoms) {
         reporters.stage_energy.note("atom_count", "smiles={}", smiles)
@@ -733,7 +683,7 @@ static molecule_outcome_t compare_molecule_(std::string const &smiles, gradient_
     double const rdkit_energy = rdkit_mmff94_energy(*molecule);
     if (!std::isfinite(rdkit_energy)) return molecule_outcome_t::unreferenced_k;
 
-    /** Keep the first refusal the molecule met, so the run's failure can name the step that refused. */
+    // Keep the first refusal the molecule met, so the run's failure can name the step that refused.
     auto const refuse_ = [&tally](mmff_energy_probe_t probe) {
         if (tally.first_refusal == mmff_energy_probe_t::completed_k) tally.first_refusal = probe;
         return molecule_outcome_t::refused_k;
@@ -761,13 +711,10 @@ static molecule_outcome_t compare_molecule_(std::string const &smiles, gradient_
 }
 
 /**
- *  @brief Walk the corpus, comparing every molecule the two references both cover.
- *
- *  The scratch is declared once above the loop, so the buffers grow to the largest molecule and never
- *  again; the sweep runs to completion whatever it finds, because the counts are the output.
- *
+ *  @brief Walk the corpus, comparing every molecule the two references both cover. Scratch declared once
+ *  above the loop grows to the largest molecule and no further, and the sweep runs to completion whatever
+ *  it finds, because the counts are the output.
  *  @param[in] corpus SMILES to compare, built-ins first.
- *  @param[inout] reporters The four sections.
  *  @param[inout] tally Filled with the per-molecule outcomes.
  */
 static void sweep_corpus_(std::vector<std::string> const &corpus, gradient_reporters_t &reporters,
@@ -815,8 +762,7 @@ int main(int argc, char **argv) {
     sftest::gradient_reporters_t reporters;
     reporters.limit_printed_lines(sftest::max_printed_lines_k);
 
-    // The restraint is scored on its own fixtures before the corpus, because the sweep below switches it
-    // off: RDKit's MMFF94 carries no chiral term, so no molecule there can say anything about it.
+    // Scored before the corpus: RDKit's MMFF94 has no chiral term, so the sweep runs with it off.
     float worst_restraint_error = 0.0f;
     sftest::mmff_energy_probe_t const restraint_probe = sftest::check_chiral_restraint_(
         reporters.chiral_terms, reporters.chiral_restraint, worst_restraint_error);

@@ -2,13 +2,13 @@
  *  @file test/cuda/test_bond_distance.cpp
  *  @brief Gate byte-for-byte parity between the device hop-count BFS and the host all-pairs BFS.
  *
- *  A warp BFS rebuilds the N × N hop matrix the MMFF nonbonded sweep reads, on the device, from the batch's bond
- *  list; the host builds the same matrix from the descriptor's CSR adjacency. Two different traversals over two
- *  different encodings of the same graph, so the check is exact equality over every byte of every molecule — a
- *  single differing entry silently changes which pairs the sweep treats as 1-4 or as excluded.
+ *  A warp BFS rebuilds the N × N hop matrix the MMFF nonbonded sweep reads from the batch's bond list; the
+ *  host builds the same matrix from the descriptor's CSR adjacency. Two traversals over two encodings of one
+ *  graph, so the check is exact equality over every byte -- a single differing entry silently changes which
+ *  pairs the sweep treats as 1-4 or as excluded.
  *
- *  Corpus: a `.smi` path in `argv[1]` or in `SMALLFIELD_TEST_CORPUS` streams real molecules, capped by `argv[2]`
- *  or `SMALLFIELD_TEST_MAX_MOLS` (default 300). Absent both the built-in list runs, which carries its own
+ *  Corpus: a `.smi` path in `argv[1]` or `SMALLFIELD_TEST_CORPUS`, capped by `argv[2]` or
+ *  `SMALLFIELD_TEST_MAX_MOLS` (default 300); absent both the built-in list runs, which carries its own
  *  multi-fragment salts so the 255 unreachable sentinel is covered either way.
  */
 
@@ -38,10 +38,9 @@ static constexpr std::string_view test_name_k = "test_bond_distance";
 namespace smallfield::tests {
 
 /**
- *  @brief Multi-fragment molecules whose halves have no bonded path between them.
- *
- *  A salt is the only way the 255 sentinel appears, and the sweep's exclusion logic hinges on
- *  it, so the corpus always carries some regardless of what the caller streams in.
+ *  @brief Multi-fragment molecules whose halves have no bonded path between them. A salt is the only way
+ *  the 255 sentinel appears and the sweep's exclusion logic hinges on it, so the corpus always carries
+ *  some regardless of what the caller streams in.
  */
 static std::vector<std::string> builtin_multi_fragment_smiles_() {
     return {
@@ -55,8 +54,6 @@ static std::vector<std::string> builtin_multi_fragment_smiles_() {
 
 /**
  *  @brief Host reference: parse @p smiles the way preprocessing does, then BFS the CSR.
- *
- *  @param[in] smiles Molecule to rebuild, as it entered the batch.
  *  @param[out] reference Resized to N squared and filled with the packed hop matrix.
  *  @return Atom count, or 0 if the molecule could not be rebuilt.
  */

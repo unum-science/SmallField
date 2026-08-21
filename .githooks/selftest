@@ -246,6 +246,27 @@ assert_rejects "asterisk emphasis in Markdown" NOTES.md \
 assert_accepts "a Markdown document naming the banned form" NOTES.md \
     'Bold is `**bold**` in other dialects; here it is __bold__.'
 
+# The backward-reference rule reaches prose, not just C++ comments. Markdown is prose on every line;
+# Python carries it behind `#` and inside docstrings, which is why that arm keeps its literals.
+assert_rejects "backward-looking prose in Markdown" NOTES.md \
+    'The packer no longer reads this field.' "carries backward-looking prose"
+assert_rejects "backward-looking prose in a Python comment" bench/note.py \
+    '# The packer no longer reads this field.' "carries backward-looking prose"
+assert_rejects "backward-looking prose in a Python docstring" bench/note.py \
+    '"""The packer no longer reads this field."""' "carries backward-looking prose"
+assert_accepts "a Markdown document naming the banned words" NOTES.md \
+    'No "previously", "used to", "no longer" in prose.'
+assert_accepts "a changelog, which narrates history by definition" CHANGELOG.md \
+    'The packer no longer reads this field.'
+assert_accepts "a roadmap, which records decisions" ROADMAP.md \
+    'The packer no longer reads this field.'
+
+# One sentence per line, and the bullet whose bold lead-in ends in a period is still one sentence.
+assert_rejects "several sentences on one Markdown line" NOTES.md \
+    'The reader owns the queue. The writer drains it.' "packs several sentences onto one line"
+assert_accepts "a term-then-definition bullet" NOTES.md \
+    '- __Style checks in CI.__ CI is for correctness.'
+
 # A clean tree must commit untouched. Deliberately adversarial: a path that looks like an
 # abbreviation, a SMARTS pattern, an RDKit column name behind the adapter boundary, and a template
 # whose bare name is correct precisely because it is a template.

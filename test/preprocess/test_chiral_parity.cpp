@@ -2,34 +2,24 @@
  *  @file test/preprocess/test_chiral_parity.cpp
  *  @brief Police the tag-and-parity derivation of the chiral volume sign with three exact oracles.
  *
- *  `extract_chiral_centers` derives the target signed-volume sign from the atom's tetrahedral tag and the parity
- *  of the stored neighbor order. Three independent oracles police that derivation, and all three demand exact
- *  agreement:
+ *  `extract_chiral_centers` derives the target signed-volume sign from the atom's tetrahedral tag and the
+ *  parity of the stored neighbor order; three independent oracles demand exact agreement.
  *
- *  The chiral-set oracle rebuilds the answer from the order the bonds appear on the atom, which is the order
- *  RDKit's `Atom::getPerturbationOrder` reads and the order `EmbeddingOps::findChiralSets` hands to
- *  `DistGeom::ChiralSet` - counterclockwise asks for a positive volume, clockwise for a negative one. It is the
- *  only oracle that speaks at every center: the derivation's load-bearing claim is that the CSR adjacency, filled
- *  in bond-index order, reproduces that bond order, and a center with tied CIP ranks or no R/S label at all - a
- *  bicyclo bridgehead, an adamantane cage - is exactly where the two could diverge unobserved. The census counts
- *  the divergences it finds, so the claim in the production docblock is measured rather than asserted.
+ *   - @b Chiral-set: the bond appearance order `Atom::getPerturbationOrder` reads and
+ *     `EmbeddingOps::findChiralSets` hands to `DistGeom::ChiralSet`, counterclockwise asking a positive
+ *     volume. It alone speaks at every center, so it carries the load-bearing claim that the CSR adjacency,
+ *     filled in bond-index order, is that bond order - which only a tied-rank or unlabeled center, a
+ *     bridgehead or an adamantane cage, can falsify unobserved.
+ *   - @b CIP: `assignAtomCIPRanks` and `_CIPCode` transported onto the emitted neighbor order, for
+ *     four-coordinate centers with four distinct ranks only. A tie leaves the sign undetermined, as a
+ *     tropane's C3 does; a three-coordinate center hides its lone pair from the ranking, so its R/S label
+ *     does not compose with a triple product over three neighbors.
+ *   - @b Geometric: an ETKDG embedding, whose volume constraints come from the same tags, compared against
+ *     the target at every center, tie or not.
  *
- *  The CIP oracle rebuilds the answer straight from RDKit - `assignAtomCIPRanks` for the neighbor ordering, the
- *  `_CIPCode` property for the R/S label - and transports that sign onto the neighbor order the production code
- *  emits. It speaks for four-coordinate centers whose neighbors carry four distinct CIP ranks. A tie leaves the
- *  CIP ordering, and therefore the sign it implies, undetermined - the C3 of a tropane is exactly such a
- *  pseudo-asymmetric case. A three-coordinate center hides its lone pair from the ranking entirely, and RDKit's
- *  R/S label there does not compose with a triple product over the three bonded neighbors, as the sulfoxides in
- *  the curated set demonstrate against their own embedded geometry.
- *
- *  The geometric oracle embeds the molecule with ETKDG, which builds its chiral volume constraints from the same
- *  tetrahedral tags, and compares the sign of the realized tetrahedron against the target. It speaks at every
- *  center, tie or not.
- *
- *  Coverage comes from a curated set of stereo-rich molecules, an exhaustive enumeration of tetrahedral tag
- *  assignments over those molecules, and an optional SMILES corpus named by `argv[1]` or by
- *  `SMALLFIELD_TEST_CORPUS`, capped by `argv[2]` or `SMALLFIELD_TEST_MAX_MOLS`. A named corpus that
- *  does not open is a failure, never an empty run.
+ *  Coverage: a curated stereo-rich set with an exhaustive tag-assignment enumeration over it, plus an
+ *  optional corpus from `argv[1]` or `SMALLFIELD_TEST_CORPUS` capped by `argv[2]` or
+ *  `SMALLFIELD_TEST_MAX_MOLS`; a named corpus that does not open is a failure, never an empty run.
  */
 
 #include <cmath>   // `std::fabs`
@@ -66,13 +56,9 @@ static constexpr std::size_t max_printed_lines_k = 10;
 
 namespace smallfield::tests {
 
-/**
- *  @brief Census of the centers each oracle saw and of the ones it had to decline.
- *
- *  Only what the reporters below do not already hold: they own every comparison and every
- *  mismatch, and `summarize` prints those, so counting them a second time here would be two
- *  bookkeeping schemes for one fact.
- */
+/** Census of the centers each oracle saw and of the ones it declined — only what the reporters below do not already
+ *  hold, since they own every comparison and mismatch and `summarize` prints those. `csr_order_divergences` counts
+ *  centers whose CSR neighbor order is not the bond appearance order. */
 struct oracle_tally_t {
     std::uint64_t molecules = 0;
     std::uint64_t centers = 0;
@@ -81,17 +67,12 @@ struct oracle_tally_t {
     std::uint64_t unlabeled = 0;
     std::uint64_t geometry_three_coordinate = 0;
     std::uint64_t embed_failures = 0;
-    /** Centers whose CSR neighbor order is not the order the bonds appear on the atom. */
     std::uint64_t csr_order_divergences = 0;
 };
 
-/**
- *  @brief One diagnostic sink per oracle, so each closes its own `compared=` section.
- *
- *  The two speak for different populations - the CIP oracle declines ties and three-coordinate
- *  centers, the geometric one declines near-planar arrangements - so a single shared count could
- *  never say which oracle a comparison came from.
- */
+/** One diagnostic sink per oracle, so each closes its own `compared=` section. They speak for different populations
+ *  - the CIP oracle declines ties and three-coordinate centers, the geometric one near-planar arrangements - so a
+ *  shared count could not say which oracle spoke. */
 struct oracle_reporters_t {
     diagnostic_reporter_t cip {"cip", "derived"};
     diagnostic_reporter_t geometry {"embedded", "derived"};
@@ -104,17 +85,9 @@ struct oracle_reporters_t {
     }
 };
 
-/**
- *  @brief Parity of the permutation carrying @p from onto @p to.
- *
- *  Both sequences hold the same atom indices in a different order. Counting the
- *  inversions of the position sequence gives the sign a signed volume picks up when
- *  its arguments are reordered.
- *
- *  @param[in] from Source ordering of atom indices.
- *  @param[in] to Target ordering, a permutation of @p from.
- *  @return +1 for an even permutation, -1 for an odd one, 0 when the two disagree.
- */
+/** Parity of the permutation carrying @p from onto @p to, both holding the same atom indices in a different order.
+ *  Inversions of the position sequence give the sign a signed volume picks up when its arguments are reordered.
+ *  @return +1 for an even permutation, -1 for an odd one, 0 when the two disagree. */
 static int permutation_parity_(custd::span<std::uint8_t const> from, custd::span<std::uint8_t const> to) {
     std::uint32_t positions[4] = {0, 0, 0, 0};
     for (std::size_t target = 0; target < to.size(); ++target) {
@@ -129,13 +102,8 @@ static int permutation_parity_(custd::span<std::uint8_t const> from, custd::span
     return (inversions % 2 == 0) ? 1 : -1;
 }
 
-/**
- *  @brief Whether any two entries of @p order share a CIP rank.
- *
- *  @param[in] cip_ranks CIP rank per atom index, as `assignAtomCIPRanks` filled it.
- *  @param[in] order Neighbor atom indices to inspect.
- *  @return True as soon as one repeated rank is found.
- */
+/** True as soon as two entries of @p order share a CIP rank, @p cip_ranks holding one per atom index as
+ *  `assignAtomCIPRanks` filled it. */
 static bool any_rank_tie_(RDKit::UINT_VECT const &cip_ranks, custd::span<std::uint8_t const> order) {
     for (std::size_t left = 0; left < order.size(); ++left)
         for (std::size_t right = left + 1; right < order.size(); ++right)
@@ -146,21 +114,14 @@ static bool any_rank_tie_(RDKit::UINT_VECT const &cip_ranks, custd::span<std::ui
 /**
  *  @brief Compare the extracted signs against the chiral set RDKit's own embedder would build.
  *
- *  RDKit defines the tetrahedral tag against the order the bonds appear on the atom, and
- *  `findChiralSets` hands that order straight to `DistGeom::ChiralSet`: counterclockwise asks for a
- *  positive volume over it, clockwise for a negative one, with the center substituted as the fourth
- *  point when there is no fourth bond. Transporting that sign onto the emitted neighbor order is the
- *  whole derivation, stated in RDKit's vocabulary instead of ours.
+ *  RDKit defines the tetrahedral tag against the bond appearance order and `findChiralSets` hands that order straight
+ *  to `DistGeom::ChiralSet`: counterclockwise asks a positive volume over it, clockwise a negative one, the center
+ *  substituted as the fourth point when there is no fourth bond. Transporting that sign onto the emitted neighbor
+ *  order is the whole derivation, in RDKit's vocabulary. It declines nothing - no rank tie, no missing R/S label, no
+ *  coordination number - which makes it the oracle for a bridgehead or a cage, where the other two are silent.
  *
- *  It declines nothing - no rank tie, no missing R/S label, no coordination number - which is what
- *  makes it the oracle for a bridgehead or a cage, where the other two are silent.
- *
- *  @param[in] molecule Molecule already carrying assigned stereochemistry.
- *  @param[in] descriptor Flat descriptor the centers were extracted from.
- *  @param[in] centers Extracted chiral center descriptors.
- *  @param[in] label Printed alongside any mismatch so the offender is identifiable.
- *  @param[inout] reporters Sink that counts and prints the chiral-set oracle's comparisons.
- *  @param[inout] tally Counters advanced by this molecule.
+ *  @param[in] molecule Carries assigned stereochemistry; @p descriptor and @p centers were extracted from it, and
+ *      @p label prints alongside a mismatch so the offender is identifiable.
  */
 static void check_against_chiral_sets_(RDKit::ROMol const &molecule, sft::molecule_descriptor_t const &descriptor,
                                        std::vector<sft::chiral_center_descriptor_t> const &centers,
@@ -176,17 +137,17 @@ static void check_against_chiral_sets_(RDKit::ROMol const &molecule, sft::molecu
             bond_order[count++] = static_cast<std::uint8_t>(bond->getOtherAtomIdx(atom));
         }
 
-        // The claim the production derivation rests on: the CSR adjacency, filled in bond-index order,
-        // is the bond order the tag is defined against. Counted rather than asserted, so a corpus that
-        // breaks it names how often before the sign comparison below reports what it cost.
+        // The claim production rests on: the CSR adjacency, filled in bond-index order, is the bond order
+        // the tag is defined against. Counted, not asserted, so a corpus that breaks it says how often
+        // before the sign comparison below says what it cost.
         std::uint32_t csr_count = 0;
         std::uint16_t const neighbor_first = descriptor.neighbor_offset[atom];
         std::uint16_t const neighbor_last = descriptor.neighbor_offset[atom + 1];
         for (std::uint16_t entry = neighbor_first; entry < neighbor_last && csr_count < count; ++entry, ++csr_count)
             if (descriptor.neighbor_atom[entry] != bond_order[csr_count]) ++tally.csr_order_divergences;
 
-        // RDKit substitutes the center itself as the fourth point when there is no fourth bond, which is
-        // what `extract_chiral_centers` stores in the same slot.
+        // RDKit substitutes the center as the fourth point when there is no fourth bond, which is what
+        // `extract_chiral_centers` stores in the same slot.
         if (count < 4) bond_order[3] = static_cast<std::uint8_t>(atom);
 
         auto const tag = rdkit_atom->getChiralTag();
@@ -205,12 +166,8 @@ static void check_against_chiral_sets_(RDKit::ROMol const &molecule, sft::molecu
 /**
  *  @brief Compare the extracted signs against RDKit's CIP labels.
  *
- *  @param[in] molecule Molecule already carrying assigned stereochemistry.
- *  @param[in] descriptor Flat descriptor the centers were extracted from.
- *  @param[in] centers Extracted chiral center descriptors.
- *  @param[in] label Printed alongside any mismatch so the offender is identifiable.
- *  @param[inout] reporters Sink that counts and prints the CIP oracle's comparisons.
- *  @param[inout] tally Counters advanced by this molecule.
+ *  @param[in] molecule Carries assigned stereochemistry; @p descriptor and @p centers were extracted from it, and
+ *      @p label prints alongside a mismatch so the offender is identifiable.
  */
 static void check_against_cip_(RDKit::ROMol const &molecule, sft::molecule_descriptor_t const &descriptor,
                                std::vector<sft::chiral_center_descriptor_t> const &centers, std::string const &label,
@@ -228,24 +185,22 @@ static void check_against_cip_(RDKit::ROMol const &molecule, sft::molecule_descr
             continue;
         }
 
-        // Rebuild the neighbor order the CIP path produced: highest priority first,
-        // ties broken by ascending atom index.
+        // Rebuild the CIP neighbor order: highest priority first, ties by ascending atom index.
         std::uint8_t reference_order[4] = {0, 0, 0, 0};
         std::uint32_t count = 0;
         std::uint16_t const neighbor_first = descriptor.neighbor_offset[atom];
         std::uint16_t const neighbor_last = descriptor.neighbor_offset[atom + 1];
         for (std::uint16_t entry = neighbor_first; entry < neighbor_last && count < 4; ++entry)
             reference_order[count++] = descriptor.neighbor_atom[entry];
-        // A lone pair never enters the CIP ranking, so a three-coordinate center has no
-        // CIP ordering that the triple product can be transported onto. The geometric
-        // oracle covers these centers instead.
+        // A lone pair never enters the CIP ranking, so a three-coordinate center has no CIP ordering to
+        // transport the triple product onto; the geometric oracle covers these instead.
         if (count < 4) {
             ++tally.three_coordinate;
             continue;
         }
 
-        // A repeated rank leaves the CIP ordering, and with it the sign that ordering
-        // implies, undetermined. The geometric oracle covers these centers instead.
+        // A repeated rank leaves the CIP ordering, and the sign it implies, undetermined; the geometric
+        // oracle covers these instead.
         custd::span<std::uint8_t> const cip_ordered {reference_order, count};
         if (any_rank_tie_(cip_ranks, cip_ordered)) {
             ++tally.rank_ties;
@@ -273,12 +228,8 @@ static void check_against_cip_(RDKit::ROMol const &molecule, sft::molecule_descr
 /**
  *  @brief Compare the extracted signs against an ETKDG embedding of the same molecule.
  *
- *  @param[in] molecule Molecule with explicit hydrogens; a copy of it is embedded.
- *  @param[in] descriptor Flat descriptor the centers were extracted from.
- *  @param[in] centers Extracted chiral center descriptors.
- *  @param[in] label Printed alongside any mismatch so the offender is identifiable.
- *  @param[inout] reporters Sink that counts and prints the geometric oracle's comparisons.
- *  @param[inout] tally Counters advanced by this molecule.
+ *  @param[in] molecule Explicit hydrogens, a copy embedded; @p descriptor and @p centers came from it, and @p label
+ *      prints alongside a mismatch so the offender is identifiable.
  */
 static void check_against_geometry_(RDKit::ROMol const &molecule, sft::molecule_descriptor_t const &descriptor,
                                     std::vector<sft::chiral_center_descriptor_t> const &centers,
@@ -291,8 +242,8 @@ static void check_against_geometry_(RDKit::ROMol const &molecule, sft::molecule_
     auto const &conformer = embedded.getConformer();
 
     for (auto const &center : centers) {
-        // The pivot is `neighbor_atoms[3]`, matching `count_invalid_chiral_centers_`; for a
-        // three-coordinate center it is the center itself.
+        // The pivot is `neighbor_atoms[3]`, as in `count_invalid_chiral_centers_`; for a three-coordinate
+        // center that is the center itself.
         auto const &origin = conformer.getAtomPos(center.neighbor_atoms[3]);
         double edges[3][3] = {};
         for (std::uint32_t slot = 0; slot < 3; ++slot) {
@@ -306,8 +257,8 @@ static void check_against_geometry_(RDKit::ROMol const &molecule, sft::molecule_
                                  edges[1][0] * edges[2][1] - edges[1][1] * edges[2][0]};
         double const volume = edges[0][0] * cross[0] + edges[0][1] * cross[1] + edges[0][2] * cross[2];
 
-        // A near-planar arrangement carries no handedness to compare against. The center's own floor
-        // is the threshold, because below it the pipeline itself declines to read a handedness.
+        // A near-planar arrangement carries no handedness. The center's own floor is the threshold,
+        // because below it the pipeline itself declines to read one.
         if (std::fabs(volume) < static_cast<double>(center.minimum_volume)) continue;
 
         if (descriptor.degree[center.center_atom] < 4) ++tally.geometry_three_coordinate;
@@ -319,23 +270,16 @@ static void check_against_geometry_(RDKit::ROMol const &molecule, sft::molecule_
     }
 }
 
-/** Which oracles a molecule's extracted centers are put to. */
+/** Which oracles a molecule's centers are put to: the graph pair alone for a corpus too large to embed,
+ *  all three for the curated set, which is small enough to afford it. */
 enum class chiral_oracles_t {
-    /** The two graph oracles alone, for a corpus too large to embed. */
     graph_only_k,
-    /** All three, which is what the curated set is small enough to afford. */
     graph_and_geometry_k,
 };
 
-/**
- *  @brief Extract one molecule's stereocenters and hand them to the requested oracles.
- *
- *  @param[inout] molecule Molecule with explicit hydrogens; stereochemistry is assigned in place.
- *  @param[in] label Printed alongside any mismatch.
- *  @param[in] oracles Which oracles to run; embedding is what makes the geometric one expensive.
- *  @param[inout] reporters Sinks the requested oracles report through.
- *  @param[inout] tally Counters advanced by this molecule.
- */
+/** Extract one molecule's stereocenters and hand them to the requested oracles. @p molecule needs explicit hydrogens
+ *  and has its stereochemistry assigned in place, @p label prints with a mismatch, and embedding is what makes the
+ *  geometric oracle the expensive one to ask for. */
 static void check_molecule_(RDKit::RWMol &molecule, std::string const &label, chiral_oracles_t oracles,
                             oracle_reporters_t &reporters, oracle_tally_t &tally) {
     if (molecule.getNumAtoms() > sft::max_atoms_per_molecule_k || molecule.getNumBonds() > sft::max_bonds_k) return;
@@ -348,21 +292,16 @@ static void check_molecule_(RDKit::RWMol &molecule, std::string const &label, ch
     ++tally.molecules;
     if (centers.empty()) return;
 
-    // The extraction has already run `assignStereochemistry`, so the CIP labels and ranks
-    // below describe exactly the molecule the descriptors were derived from.
+    // The extraction already ran `assignStereochemistry`, so the CIP labels and ranks below describe
+    // exactly the molecule the descriptors came from.
     check_against_chiral_sets_(molecule, descriptor, centers, label, reporters, tally);
     check_against_cip_(molecule, descriptor, centers, label, reporters, tally);
     if (oracles == chiral_oracles_t::graph_and_geometry_k)
         check_against_geometry_(molecule, descriptor, centers, label, reporters, tally);
 }
 
-/**
- *  @brief Stereo-rich molecules whose centers must agree with both oracles.
- *
- *  @return SMILES strings spanning single centers, sugars, steroids, alkaloids and
- *          drugs, plus the three-coordinate sulfoxide and phosphine cases where a
- *          lone pair takes the fourth substituent slot.
- */
+/** Stereo-rich molecules whose centers must agree with both oracles: single centers, sugars, steroids, alkaloids and
+ *  drugs, plus the three-coordinate sulfoxide and phosphine cases where a lone pair takes the fourth slot. */
 static std::vector<std::string> stereo_test_smiles_() {
     return {
         "C[C@@H](N)C(=O)O",                                                               // L-alanine
@@ -388,9 +327,9 @@ static std::vector<std::string> stereo_test_smiles_() {
         "C[P@](CC)c1ccccc1",                                                   // three-coordinate phosphine
         "COc1ccc2[nH]c([S@](=O)Cc3ncc(C)c(OC)c3C)nc2c1",                       // esomeprazole
         "C[S@](=O)[C@@H]1CC[C@H](C)CC1",                                       // sulfoxide beside a tied ring pair
-        // Bridged and caged skeletons, where the ring-closure bonds land furthest from anything an
-        // index-sorted order would produce, and where the CIP oracle mostly falls silent: a bicyclo
-        // bridgehead carries no R/S label and a symmetric bridge ties its neighbors' ranks.
+        // Bridged and caged skeletons: ring-closure bonds land furthest from any index-sorted order, and
+        // the CIP oracle mostly falls silent - a bicyclo bridgehead carries no R/S label, a symmetric
+        // bridge ties its neighbors' ranks.
         "C1[C@@H]2CC[C@H](C1)C2",                  // norbornane, unlabeled bridgeheads
         "O[C@H]1C[C@@H]2CC[C@H]1C2",               // norbornanol
         "O[C@@H]1C[C@H]2CC[C@@H]1CC2",             // bicyclo[2.2.2]octanol
@@ -402,17 +341,9 @@ static std::vector<std::string> stereo_test_smiles_() {
     };
 }
 
-/**
- *  @brief Walk one molecule and every reachable assignment of its tetrahedral tags.
- *
- *  Flipping the tags multiplies the coverage of a single skeleton by two per center
- *  without changing the topology, and RDKit relabels the CIP codes for each variant,
- *  so the oracle stays honest across the whole stereoisomer family.
- *
- *  @param[in] smiles Molecule to expand.
- *  @param[inout] reporters Sinks both oracles report through.
- *  @param[inout] tally Counters advanced by every variant.
- */
+/** Walk one molecule and every reachable assignment of its tetrahedral tags. Flipping tags doubles a skeleton's
+ *  coverage per center without touching the topology, and RDKit relabels the CIP codes for each variant, so the
+ *  oracle stays honest across the stereoisomer family. */
 static void check_stereoisomers_(std::string const &smiles, oracle_reporters_t &reporters, oracle_tally_t &tally) {
     auto base = sftest::mol_from_smiles(smiles);
     sf_verify_(base != nullptr, "curated SMILES must parse");
@@ -439,12 +370,7 @@ static void check_stereoisomers_(std::string const &smiles, oracle_reporters_t &
     }
 }
 
-/**
- *  @brief Print one census block; the comparison counts belong to the reporters' own sections.
- *
- *  @param[in] heading Line printed above the counters.
- *  @param[in] tally Counters to report.
- */
+/** Print one census block under @p heading; comparison counts belong to the reporters' own sections. */
 static void report_(std::string_view heading, oracle_tally_t const &tally) {
     fmt::println("  {}", heading);
     fmt::println("    molecules {}, centers {} ({} three-coordinate)", fmt::group_digits(tally.molecules),
@@ -473,8 +399,8 @@ int main(int argc, char **argv) {
     sf_verify_(reporters.cip.comparison_count() >= 400, "curated set must reach several hundred CIP comparisons");
     sf_verify_(curated.three_coordinate > 0, "curated set must exercise three-coordinate centers");
     sf_verify_(curated.rank_ties > 0, "curated set must exercise a pseudo-asymmetric center");
-    // The chiral-set oracle exists for the centers the CIP one declines, so a curated set that
-    // declines none would leave it policing only ground the other already covers.
+    // The chiral-set oracle exists for the centers the CIP one declines; a curated set that declines
+    // none would leave it policing ground the other already covers.
     sf_verify_(curated.unlabeled > 0, "curated set must exercise centers carrying no R/S label");
     sf_verify_(reporters.chiral_sets.comparison_count() > reporters.cip.comparison_count(),
                "the chiral-set oracle must speak at centers the CIP oracle declines");
@@ -490,10 +416,9 @@ int main(int argc, char **argv) {
         return 2;
     }
     if (selection.knob == sftest::corpus_knob_t::named_k) {
-        // Naming a corpus is a request to validate against it, so an empty result is a failure and not an
-        // empty corpus: it would otherwise run zero comparisons and satisfy `cip_mismatches == 0`
-        // vacuously, reporting a pass for work that never happened. The outcome distinguishes the two
-        // ways to get there without a second open.
+        // Naming a corpus is a request to validate against it, so an empty result is a failure: zero
+        // comparisons satisfy `cip_mismatches == 0` vacuously, passing for work that never happened. The
+        // outcome tells the two ways of getting there apart without a second open.
         std::vector<std::string> corpus;
         auto const outcome = sftest::load_smiles_into(selection.path, selection.max_molecules, corpus);
         if (outcome != sftest::smiles_load_t::loaded_k)
@@ -502,8 +427,8 @@ int main(int argc, char **argv) {
 
         sftest::oracle_tally_t corpus_tally;
         for (auto const &smiles : corpus) {
-            // `SmilesToMol` throws on some malformed input rather than returning null, so it belongs
-            // inside the guard alongside `addHs`.
+            // `SmilesToMol` throws on some malformed input instead of returning null, so it belongs
+            // inside the guard beside `addHs`.
             try {
                 std::unique_ptr<RDKit::RWMol> molecule(RDKit::SmilesToMol(smiles));
                 if (!molecule) continue;
@@ -516,8 +441,8 @@ int main(int argc, char **argv) {
             }
         }
         sftest::report_("corpus", corpus_tally);
-        // The same reasoning one level down: every molecule may have been skipped, and a section of zero
-        // comparisons is indistinguishable from a section of zero mismatches.
+        // The same reasoning one level down: every molecule may have been skipped, and zero comparisons
+        // is indistinguishable from zero mismatches.
         if (reporters.chiral_sets.summarize("corpus_chiral_sets").compared == 0)
             return sftest::report_fail(test_name_k, "corpus {} produced no chiral-set comparisons over {} SMILES",
                                        selection.path, corpus.size());

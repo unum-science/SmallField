@@ -2,29 +2,21 @@
  *  @file test/cuda/test_dg_energy.cpp
  *  @brief Gate the device distance-geometry energy, its gradient, its chirality window, and FIRE minimization.
  *
- *  Distance geometry embeds in @b four dimensions, not three. The fourth axis of every coordinate buffer here
- *  is a real coordinate — the one the crush penalty drives toward zero before the structure is read back as
- *  3D — so a view that fixes the axis count at three cannot describe these buffers at all. The axis count
- *  therefore lives in the view's type, `sft::embedding_soa_t`, and only the transposition to and from
- *  RDKit's interleaved `(atom, 3)` layout is three-dimensional.
+ *  Distance geometry embeds in @b four dimensions. The fourth axis is a real coordinate, the one the crush
+ *  penalty drives toward zero before the structure is read back as 3D, so the axis count lives in the
+ *  view's type `sft::embedding_soa_t`; only the transposition to RDKit's interleaved `(atom, 3)` layout is
+ *  three-dimensional. The device quantizes the bounds matrix to int8 over the molecule's whole bound range,
+ *  so one level is the range over 255 and the reference below mirrors that rather than float bounds the
+ *  kernel never saw. The range is a property of the input, so this file smooths first as the metric prepass
+ *  does, replacing the builder's 1000 angstrom placeholders with real diameters, which costs around 0.05 % of
+ *  the energy rather than twenty times it; what it does cost is narrated beside the comparison, which is gated
+ *  at `energy_relative_tolerance_k`. The chirality section presses
+ *  each center onto its neighbors' plane and asserts the volume window rejects it, since a signed volume
+ *  alone reads a coplanar center as whichever handedness it was asked for.
  *
- *  The device quantizes the bounds matrix to int8 over the molecule's whole bound range before it reads a
- *  single bound, so one level is the range over 255 and the reference below mirrors the quantization rather
- *  than reading the float bounds the kernel never saw. That range is a property of the input: triangle
- *  smoothing replaces the builder's 1000 angstrom placeholders with real diameters, which is what the metric
- *  prepass does before the pipeline kernel quantizes, so this file smooths too and the quantization costs
- *  around 0.05 % of the energy rather than twenty times it. What it does cost is narrated beside the
- *  comparison, which is gated at 1e-3.
- *
- *  The chirality section presses each center onto the plane of its neighbors and asserts the descriptor's
- *  volume window rejects it and pushes back, since a signed volume alone classifies a coplanar center as
- *  whichever handedness it was asked for.
- *
- *  Corpus: a `.smi` path in `argv[1]` or in `SMALLFIELD_TEST_CORPUS` streams real molecules, capped by
- *  `argv[2]` or `SMALLFIELD_TEST_MAX_MOLS`. Absent both, the built-in list runs on its own, which is what
- *  `ctest` invokes. The finite-difference section is capped separately: it costs two kernel launches per
- *  coordinate component, so it walks only the first few molecules whatever the corpus holds.
- *
+ *  Corpus: a `.smi` path in `argv[1]` or `SMALLFIELD_TEST_CORPUS`, capped by `argv[2]` or
+ *  `SMALLFIELD_TEST_MAX_MOLS`; absent both the built-in list runs, which is what `ctest` invokes. The
+ *  finite-difference section costs two launches per component, so it walks only the first few molecules.
  *  Compiled with g++, C++20. CUDA kernels in test_dg_energy_kernels.cu.
  */
 
@@ -63,10 +55,8 @@ static constexpr std::string_view test_name_k = "test_dg_energy";
 
 /**
  *  @brief A gradient over an embedding's four axes; nothing but the role separates it from the embedding.
- *
- *  Both are addressed `(atom, axis)`: axes zero through two are x, y, and z, and axis three is the w the crush
- *  penalty flattens before the structure is projected back to three dimensions. Every buffer this file hands a
- *  kernel carries all four.
+ *  Both are addressed `(atom, axis)`, axes zero through two being x, y, z and axis three the w the crush
+ *  penalty flattens before projection back to 3D. Every buffer this file hands a kernel carries all four.
  */
 using gradient_t = sft::coordinates_soa<coordinate_role_t::gradient_k, float, sft::embedding_dimensions_k>;
 
@@ -88,16 +78,13 @@ static sft::conformer_aos_t reset_interleaved_(std::vector<float> &storage, std:
 /**
  *  @brief Triangle-smooth a bounds matrix in place, the way the metric prepass does before the kernel.
  *
- *  The builder leaves every unconstrained pair's upper bound at its 1000 angstrom placeholder, and no
- *  kernel in the pipeline ever sees one: the metric prepass smooths the matrix and writes it back
- *  before the pipeline kernel quantizes it. Handing the placeholder to the device instead spans the
- *  int8 range over a thousand angstroms, so one of the 256 levels covers four of them, every lower
- *  bound under two angstroms quantizes to zero, and the distance geometry has no repulsion left — a
- *  minimum where two atoms coincide is then the correct answer to the question actually asked.
- *
- *  Upper bounds contract along the triangle inequality; lower bounds expand against both of the
- *  candidates it offers, rather than the one an `else if` would keep.
- *
+ *  The builder leaves every unconstrained pair's upper bound at its 1000 angstrom placeholder, which no
+ *  pipeline kernel ever sees: the metric prepass smooths and writes back before quantization. Handing the
+ *  placeholder over instead spans the int8 range across a thousand angstroms, so one of the 256 levels
+ *  covers four, every lower bound under two angstroms quantizes to zero, and no repulsion is left -- two
+ *  coincident atoms then being the correct answer to the question actually asked.
+ *  Upper bounds contract along the triangle inequality; lower bounds expand against both candidates it
+ *  offers, rather than the one an `else if` would keep.
  *  @param[inout] bounds Square matrix, upper bounds above the diagonal and lower bounds below.
  */
 static void smooth_bounds_(sft::packed_matrix<float> bounds) {
@@ -124,8 +111,6 @@ static void smooth_bounds_(sft::packed_matrix<float> bounds) {
 
 /**
  *  @brief Build the bounds matrix into caller storage and hand back a view whose extent cannot drift.
- *
- *  @param[in] descriptor Molecule the bounds are derived from.
  *  @param[inout] storage Caller-owned buffer, reused across molecules so growth happens once.
  *  @return Row-major N × N view: upper bounds above the diagonal, lower bounds below.
  */
@@ -169,15 +154,15 @@ static sftest::dg_problem_t problem_for_(sft::packed_matrix<float const> bounds,
  *  @brief The int8 bounds the device actually reads, reproduced on the host.
  *
  *  `quantize_bounds_into_shared_` rescales the whole matrix into 256 levels and the energy functor reads
- *  every bound back through one fused multiply-add. A reference that skips this compares against numbers
- *  the kernel never saw.
+ *  each bound back through one fused multiply-add; a reference skipping this compares against numbers the
+ *  kernel never saw.
  */
 struct quantized_bounds_t {
     sft::packed_matrix<std::uint8_t> levels;
     float minimum = 0.0f;
     float inverse_scale = 0.0f;
 
-    /** The bound the kernel reads at @p row, @p column — upper above the diagonal, lower below. */
+    /** The bound the kernel reads at @p row, @p column -- upper above the diagonal, lower below. */
     float bound(std::uint32_t row, std::uint32_t column) const noexcept {
         return minimum + static_cast<float>(levels(row, column)) * inverse_scale;
     }
@@ -211,7 +196,6 @@ static quantized_bounds_t quantize_bounds_(sft::packed_matrix<float const> bound
 
 /**
  *  @brief Host mirror of `evaluate_distance_geometry_energy` for one molecule, in double precision.
- *
  *  @param[in] coordinates Four-axis SoA embedding; every axis participates in the pair distances.
  *  @param[in] read_bound Called as `read_bound(row, column)`, upper above the diagonal and lower below.
  *  @param[in] weights Penalty weights, matching what the kernel was handed.
@@ -296,11 +280,9 @@ static float mean_fourth_dimension_magnitude_(sft::embedding_soa_t coordinates) 
 }
 
 /**
- *  @brief Fill the embedding's fourth axis with small deterministic offsets.
- *
- *  The arithmetic is signed on purpose: `atom % 3 - 1` on an unsigned atom index wraps to 4294967295 for
- *  every third atom, which is how this file once fed the kernel coordinates near 4e8 and compared two
- *  reference implementations of the same nonsense.
+ *  @brief Fill the embedding's fourth axis with small deterministic offsets. The arithmetic is signed on
+ *  purpose: `atom % 3 - 1` on an unsigned index wraps to 4294967295 for every third atom, putting the
+ *  kernel's coordinates near 4e8 with reference and kernel agreeing on the nonsense.
  */
 static void fill_fourth_dimension_(sft::embedding_soa_t coordinates) {
     for (std::uint32_t atom = 0; atom < coordinates.extent(0); ++atom)
@@ -332,10 +314,9 @@ static constexpr std::size_t max_gradient_molecules_k = 3;
 /**
  *  @brief How far each coordinate of a well-posed start is displaced, in angstrom.
  *
- *  Large enough that the minimizer has real work to do and cannot pass by standing still, small
- *  enough that the basin RDKit's own embedding sits in is the one it relaxes back into. The random
- *  `random_start_span_k` cloud is a different question: from there only descent is demanded, because
- *  requiring convergence out of noise would ratchet the suite on noise.
+ *  Large enough that the minimizer cannot pass by standing still, small enough that it relaxes back into
+ *  the basin RDKit's own embedding sits in. From the random `random_start_span_k` cloud only descent is
+ *  demanded, since requiring convergence out of noise would ratchet the suite on noise.
  */
 static constexpr float perturbation_span_angstrom_k = 0.2f;
 
@@ -361,10 +342,9 @@ static constexpr float chiral_weight_k = 100.0f;
 /** Fraction of its out-of-plane height a flattened center keeps, small enough to be flat, not zero. */
 static constexpr float near_flat_retention_k = 0.02f;
 /**
- *  Fraction kept for the finite-difference sweep. The penalty is active while `|V| < minimum_volume`,
- *  so this has to be small enough that a realized volume times it still lands under that floor —
- *  otherwise `excess_volume` is zero, the sweep compares zero against zero, and the assertion passes
- *  without exercising anything. `chirality_penalty_is_active` is the check that this still holds.
+ *  Fraction kept for the finite-difference sweep. The penalty is active while `|V| < minimum_volume`, so
+ *  a realized volume times this must still land under that floor; otherwise `excess_volume` is zero and
+ *  the sweep compares zero against zero. `chirality_penalty_is_active` checks that it still holds.
  */
 static constexpr float penalized_retention_k = 0.3f;
 
@@ -404,10 +384,8 @@ struct molecule_scratch_t {
 };
 
 /**
- *  @brief One molecule as every section sees it.
- *
- *  The bounds carry their own extent and the centers their own count, so no section restates either,
- *  and the three travel together rather than as five positional arguments per call.
+ *  @brief One molecule as every section sees it. The bounds carry their own extent and the centers their
+ *  own count, so nothing restates either and the three travel together rather than as five arguments.
  */
 struct molecule_case_t {
     std::string_view smiles;
@@ -418,9 +396,9 @@ struct molecule_case_t {
 /**
  *  @brief The reporters this test closes: one per gated section, plus one that only narrates.
  *
- *  `quantization` is never summarized, because it compares nothing — both of its operands are host
- *  references and their divergence is the expected cost of the device's int8 bounds, not a defect. A
- *  section that compares nothing is a failure by construction, which is exactly the rule keeping it out.
+ *  `quantization` is never summarized because it compares nothing -- both operands are host references,
+ *  and their divergence is the expected cost of the device's int8 bounds rather than a defect. A section
+ *  comparing nothing is a failure by construction, which is the rule keeping it out.
  */
 struct dg_reporters_t {
     sftest::diagnostic_reporter_t energy {"cpu", "gpu"};
@@ -481,9 +459,8 @@ static molecule_setup_t setup_molecule_(std::string const &smiles, std::unique_p
  *  @brief Gate the device energy against the host mirror, and gate that the penalty responds to a violation.
  *
  *  Two comparisons per call: the kernel's arithmetic against a reference reading the same quantized bounds,
- *  and the energy before a known 1.5 angstrom shift against the energy after it. The first would pass on a
- *  kernel that always returned zero; the second is what rules that out.
- *
+ *  and the energy across a known 1.5 angstrom shift. The first would pass on a kernel that always returned
+ *  zero; the second rules that out.
  *  @return Whether every launch ran, so a refusal reaches the gate instead of being compared.
  */
 static sftest::dg_probe_t check_energy_(sftest::diagnostic_reporter_t &reporter,
@@ -508,10 +485,9 @@ static sftest::dg_probe_t check_energy_(sftest::diagnostic_reporter_t &reporter,
                                              &relaxed_energy);
     if (probe != sftest::dg_probe_t::completed_k) return probe;
 
-    // Push atom zero along x past every bound it has, so each of its pairs is strictly on the
-    // upper-bound branch and strictly further out than before, and no other pair moves at all —
-    // which is what makes the energy's rise a theorem rather than a plausible expectation. A small
-    // fixed nudge is not: it made this section fail on the first ring diol added to the built-ins.
+    // Push atom zero along x past every bound it has: each of its pairs lands strictly on the upper-bound
+    // branch and further out than before while no other pair moves, making the energy's rise a theorem
+    // rather than an expectation. A small fixed nudge is not, and fails on ring diols.
     coordinates(0, 0) += largest_bound_(bounds) + coordinate_span_(coordinates) + bound_clearance_angstrom_k;
 
     float gpu_energy = 0.0f;
@@ -530,8 +506,8 @@ static sftest::dg_probe_t check_energy_(sftest::diagnostic_reporter_t &reporter,
         .field("energy", quantized_reference, gpu_energy, energies_agree_)
         .field("energy_under_shift", relaxed_energy, gpu_energy, increased_);
 
-    // What the int8 bounds cost is expected to be large, so it is narrated rather than compared: with
-    // unconstrained pairs sitting at 1000 angstroms, one of the 256 levels spans nearly four angstroms.
+    // Narrated rather than compared: with unconstrained pairs at 1000 angstroms, one of the 256 levels spans
+    // nearly four angstroms.
     quantization
         .note("dg_bounds", "smiles={} atoms={} fourth_dimension_weight={}", smiles, num_atoms, weights.fourth_dimension)
         .field("energy", exact_reference, quantized_reference);
@@ -539,11 +515,9 @@ static sftest::dg_probe_t check_energy_(sftest::diagnostic_reporter_t &reporter,
 }
 
 /**
- *  @brief Gate the analytic gradient against a central difference of the same kernel's energy.
- *
- *  Every one of the four axes is swept, and the fourth-dimension weight is non-zero so the crush term's
- *  contribution to the w axis is covered rather than multiplied away.
- *
+ *  @brief Gate the analytic gradient against a central difference of the same kernel's energy. All four
+ *  axes are swept under a non-zero fourth-dimension weight, so the crush term's contribution to w is
+ *  covered rather than multiplied away.
  *  @return Whether every launch ran, so a refusal reaches the gate instead of being compared.
  */
 static sftest::dg_probe_t check_gradient_(sftest::diagnostic_reporter_t &reporter, molecule_case_t const &subject,
@@ -560,8 +534,8 @@ static sftest::dg_probe_t check_gradient_(sftest::diagnostic_reporter_t &reporte
     sftest::read_conformer_into(molecule, interleaved);
     sft::transpose_into(interleaved, coordinates);
 
-    // A conformer sits close to its bounds, and a gradient of exact zeros compares equal to anything.
-    // Displacing every component by up to 0.3 angstroms puts the penalty terms on their active branch.
+    // A conformer sits close to its bounds and a gradient of exact zeros compares equal to anything, so
+    // displacing every component by up to 0.3 angstroms puts the penalties on their active branch.
     std::mt19937 generator(123);
     std::uniform_real_distribution<float> displacement(-0.3f, 0.3f);
     for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
@@ -589,8 +563,7 @@ static sftest::dg_probe_t check_gradient_(sftest::diagnostic_reporter_t &reporte
                 probe = gpu_dg_energy(problem, coordinates.data_handle(), spare.data_handle(), &energy_minus);
 
             coordinates(atom, dimension) = original;
-            // Restored first, so the sweep leaves the coordinates it borrowed as it found them whatever
-            // the device answered, and only then does the refusal end the sweep.
+            // Restored first, so a refusal still leaves the borrowed coordinates as the sweep found them.
             if (probe != sftest::dg_probe_t::completed_k) return probe;
 
             float const finite_difference = (energy_plus - energy_minus) / (2.0f * finite_difference_step_k);
@@ -604,15 +577,11 @@ static sftest::dg_probe_t check_gradient_(sftest::diagnostic_reporter_t &reporte
 /**
  *  @brief Slide every chiral center's pivot toward the plane of the other three stored neighbors.
  *
- *  At @p retained zero the signed volume is exactly zero, the geometry a sign test cannot classify at
- *  all; at a small positive fraction the sign is still the one the descriptor asks for and only the
- *  magnitude has collapsed, which is the case a sign test passes and a volume window rejects.
- *
- *  The atom moved is `neighbor_atoms[3]`, because that is the point the volume is measured from. For
- *  a three-coordinate center it is the center itself, so that case flattens exactly as it always did.
- *
+ *  At @p retained zero the signed volume is exactly zero, which a sign test cannot classify at all; at a
+ *  small positive fraction the sign is still the descriptor's and only the magnitude has collapsed, the
+ *  case a sign test passes and a volume window rejects. The atom moved is `neighbor_atoms[3]`, the point
+ *  the volume is measured from, which for a three-coordinate center is the center itself.
  *  @param[inout] coordinates Four-axis embedding, modified in place.
- *  @param[in] centers Chiral centers whose pivot atoms are moved.
  *  @param[in] retained Fraction of the out-of-plane height each center keeps.
  */
 static void flatten_chiral_centers_(sft::embedding_soa_t coordinates,
@@ -651,17 +620,12 @@ static double gradient_norm_(gradient_t gradient) {
 /**
  *  @brief Gate that a chiral center has to prove it is not flat.
  *
- *  Three geometries per molecule, with the distance penalties switched off so every number below
- *  belongs to the chiral term alone. The embedded conformer must validate and carry no penalty. The
- *  same conformer with every center pressed exactly onto its neighbors' plane must fail validation —
- *  a signed volume of zero used to satisfy whichever target it was handed — and must carry both an
- *  energy and a restoring force. And the near-flat case, whose sign is still correct, must do the
- *  same: that is the geometry the old product test read as healthy and left with no force at all.
- *
- *  The gradient of the chiral term is then swept against a central difference of the same kernel's
- *  energy, on a geometry well inside the penalty's active branch so the sweep never crosses the
- *  window's kink.
- *
+ *  Three geometries per molecule, distance penalties off so every number belongs to the chiral term. The
+ *  embedded conformer must validate and carry no penalty; pressed exactly onto its neighbors' plane it
+ *  must fail validation, a signed volume of zero satisfying neither target, and carry both an energy and
+ *  a restoring force; the near-flat case, whose sign is still correct, must do the same, since a sign-only
+ *  test reads it as healthy and leaves no force at all. The chiral gradient is then swept against a
+ *  central difference well inside the penalty's active branch, so it never crosses the window's kink.
  *  @return Whether every launch ran, so a refusal reaches the gate instead of being compared.
  */
 static sftest::dg_probe_t check_chirality_(sftest::diagnostic_reporter_t &reporter, molecule_case_t const &subject,
@@ -679,7 +643,7 @@ static sftest::dg_probe_t check_chirality_(sftest::diagnostic_reporter_t &report
     dg_weights_t const chiral_only {.upper = 0.0f, .lower = 0.0f, .chiral = chiral_weight_k, .fourth_dimension = 0.0f};
     auto const problem = problem_for_(subject.bounds, centers, chiral_only);
 
-    /** Reload the embedded conformer and press its centers toward flatness by the given fraction. */
+    // Reload the embedded conformer and press its centers toward flatness by the given fraction.
     auto const reload_ = [&](float retained) {
         sftest::read_conformer_into(molecule, interleaved);
         sft::transpose_into(interleaved, coordinates);
@@ -720,9 +684,8 @@ static sftest::dg_probe_t check_chirality_(sftest::diagnostic_reporter_t &report
     probe = gpu_dg_energy(problem, coordinates.data_handle(), gradient.data_handle(), &energy_at_center);
     if (probe != sftest::dg_probe_t::completed_k) return probe;
 
-    // The sweep below only means something while the penalty is in its active branch. Outside it
-    // `excess_volume` is zero, so the analytical gradient and the finite difference are both zero and
-    // every comparison passes having exercised nothing. These are chiral-only weights, so a positive
+    // The sweep means something only inside the penalty's active branch; outside it `excess_volume` is
+    // zero and every comparison passes having exercised nothing. Under chiral-only weights a positive
     // energy is exactly the statement that the flattened centers are still being penalised.
     reporter.mismatch("dg_chirality", "smiles={} retained={}", subject.smiles, penalized_retention_k)
         .field("chirality_penalty_is_active", true, energy_at_center > 0.0f, sftest::exactly_equal);
@@ -742,8 +705,7 @@ static sftest::dg_probe_t check_chirality_(sftest::diagnostic_reporter_t &report
                     probe = gpu_dg_energy(problem, coordinates.data_handle(), spare.data_handle(), &energy_minus);
 
                 coordinates(atom, axis) = original;
-                // Restored first, so the sweep leaves the coordinates it borrowed as it found them whatever
-                // the device answered, and only then does the refusal end the sweep.
+                // Restored first, so a refusal still leaves the borrowed coordinates as the sweep found them.
                 if (probe != sftest::dg_probe_t::completed_k) return probe;
 
                 float const finite_difference = (energy_plus - energy_minus) / (2.0f * finite_difference_step_k);
@@ -756,12 +718,10 @@ static sftest::dg_probe_t check_chirality_(sftest::diagnostic_reporter_t &report
 /**
  *  @brief Gate that FIRE minimization improves what it is asked to improve.
  *
- *  A random 4D start is minimized, and each of the three quantities the energy is built from has to end
- *  below where it began: the energy itself, the worst bound violation, and the mean fourth-dimension
- *  magnitude the crush penalty exists to flatten. The MMFF94 energy of the projected structure is then
- *  compared for finiteness against RDKit's own embedding, which is what makes the number a reference
- *  rather than a lone `isfinite` that any garbage satisfies.
- *
+ *  A random 4D start is minimized and each of the three quantities the energy is built from must end below
+ *  where it began: the energy, the worst bound violation, and the mean fourth-dimension magnitude the
+ *  crush penalty flattens. The MMFF94 energy of the projected structure is then compared for finiteness
+ *  against RDKit's own embedding, making it a reference rather than an `isfinite` any garbage satisfies.
  *  @return Whether every launch ran, so a refusal reaches the gate instead of being compared.
  */
 static sftest::dg_probe_t check_minimization_(sftest::diagnostic_reporter_t &reporter, molecule_case_t const &subject,
@@ -797,8 +757,8 @@ static sftest::dg_probe_t check_minimization_(sftest::diagnostic_reporter_t &rep
     float const final_violation = max_bound_violation_(coordinates, bounds);
     float const final_fourth = mean_fourth_dimension_magnitude_(coordinates);
 
-    // The report has to describe the positions it handed back rather than a state one step earlier,
-    // so both of its numbers are checked against a fresh evaluation exactly where it stopped.
+    // The report must describe the positions handed back, not a state one step earlier, so both of its
+    // numbers are checked against a fresh evaluation exactly where it stopped.
     float recomputed_energy = 0.0f;
     probe = gpu_dg_energy(problem, coordinates.data_handle(), gradient.data_handle(), &recomputed_energy);
     if (probe != sftest::dg_probe_t::completed_k) return probe;
@@ -824,17 +784,13 @@ static sftest::dg_probe_t check_minimization_(sftest::diagnostic_reporter_t &rep
 /**
  *  @brief Relax from a well-posed start and require the minimizer to report that it converged.
  *
- *  `check_minimization_` starts from a uniform random cloud and demands only that energy, violation
- *  and fourth-dimension magnitude fall — which one downhill step satisfies, so it cannot distinguish
- *  a minimizer that finishes from one that stops early. This section removes that excuse: the start
- *  is RDKit's own embedding displaced by `perturbation_span_angstrom_k` per coordinate, which is
- *  a basin the distance bounds were built from, so `exhausted_k` inside `max_iterations_k` means
- *  the iteration budget is short rather than the problem hard.
- *
- *  Both the status and the gradient are gated. `fire_minimize_` returns `converged_k` exactly when
- *  the RMS gradient fell under the threshold it was handed, so asserting the pair keeps that
- *  equivalence a checked fact instead of an assumed one.
- *
+ *  `check_minimization_` demands only that energy, violation and fourth-dimension magnitude fall, which
+ *  one downhill step satisfies, so it cannot tell a minimizer that finishes from one that stops early.
+ *  Here the start is RDKit's own embedding displaced by `perturbation_span_angstrom_k` per coordinate, a
+ *  basin the distance bounds were built from, so `exhausted_k` inside `max_iterations_k` means the budget
+ *  is short rather than the problem hard. Status and gradient are both gated: `fire_minimize_` returns
+ *  `converged_k` exactly when the RMS gradient fell under its threshold, and asserting the pair keeps
+ *  that equivalence checked rather than assumed.
  *  @return Whether every launch ran, so a refusal reaches the gate instead of being compared.
  */
 static sftest::dg_probe_t check_convergence_(sftest::diagnostic_reporter_t &reporter, molecule_case_t const &subject,
@@ -863,8 +819,8 @@ static sftest::dg_probe_t check_convergence_(sftest::diagnostic_reporter_t &repo
                                                      gradient_threshold_k, &report);
     if (probe != sftest::dg_probe_t::completed_k) return probe;
 
-    // The status rides in the key, where it is readable and greppable, and the field gates on the one
-    // question: `append_delta` needs operands it can subtract, so a name cannot be the compared value.
+    // The status rides in the key where it is greppable: `append_delta` needs subtractable operands, so a
+    // name cannot be the compared value.
     reporter
         .mismatch("dg_convergence", "smiles={} atoms={} status={} iterations={}", smiles, num_atoms,
                   fire_status_name_(report.status), report.iterations)
@@ -879,9 +835,9 @@ static sftest::dg_probe_t check_convergence_(sftest::diagnostic_reporter_t &repo
 /**
  *  @brief The molecules the bare `ctest` invocation walks.
  *
- *  Small and always embeddable: an aromatic ring, and four stereocenters covering the shapes the
- *  chiral window distinguishes — an open-chain carbon, one in a ring, two adjacent ones, and a
- *  three-coordinate sulfoxide sulfur, whose fourth substituent is a lone pair.
+ *  Small and always embeddable: an aromatic ring, and four stereocenters covering the shapes the chiral
+ *  window distinguishes -- an open-chain carbon, one in a ring, two adjacent, and a three-coordinate
+ *  sulfoxide sulfur whose fourth substituent is a lone pair.
  */
 static std::vector<std::string> builtin_smiles_() {
     return {"CCO",
@@ -924,8 +880,8 @@ int main(int argc, char **argv) {
     std::size_t convergence_molecules = 0;
     std::size_t refused_sections = 0;
 
-    // A launch the driver declines leaves the kernel's outputs as the allocation found them, so a section
-    // that met one names the refusal here rather than closing as though it had compared something.
+    // A declined launch leaves the kernel's outputs as the allocation found them, so a section that met
+    // one names the refusal rather than closing as though it had compared something.
     auto const record_ = [&refused_sections](std::string_view section, std::string const &smiles,
                                              sftest::dg_probe_t probe) {
         if (probe == sftest::dg_probe_t::completed_k) return;
@@ -941,9 +897,8 @@ int main(int argc, char **argv) {
                                         .chiral = 0.0f,
                                         .fourth_dimension = fourth_dimension_weight_k};
 
-    // Minimization runs with the chiral term the pipeline actually carries. Without it a random 4D
-    // start can relax into a structure with coincident atoms, which is a degenerate minimum of the
-    // distance penalties alone rather than anything the pipeline would ever publish.
+    // Minimization runs with the chiral term the pipeline carries; without it a random 4D start can relax
+    // into coincident atoms, a degenerate minimum of the distance penalties alone.
     dg_weights_t const minimize_weights {.upper = 1.0f,
                                          .lower = 1.0f,
                                          .chiral = chiral_weight_k,

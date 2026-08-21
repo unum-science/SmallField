@@ -2,8 +2,7 @@
  *  @file bench/bench_mmff_kernels_device.cu
  *  @brief Device-side launcher for the MMFF GPU kernel trio.
  *
- *  Nothing is copied back: the outputs run to 10 GB or more on a large batch, and the correctness of the
- *  terms is the parity suite's job rather than this one's.
+ *  Nothing is copied back: outputs reach 10 GB on a large batch, and term correctness is the parity suite's job.
  */
 
 #include <cstddef> // `std::size_t`
@@ -37,15 +36,11 @@ char const *describe_trio_launch(trio_launch_t status) {
     return "was refused";
 }
 
-/**
- *  @brief Grow-only device storage on the default stream, which is the one everything below rides.
- *
- *  `device_allocator_t` defaults its stream to `nullptr` and every launch, upload and event here passes
- *  the same, so the allocations, the copies and the kernels are ordered against each other by
- *  construction. A benchmark that owns the device pays nothing for the legacy default stream's habit of
- *  serializing against every other one, and taking a stream of its own would be a handle to keep in
- *  agreement across five call sites in exchange for that nothing.
- */
+/** Grow-only device storage on the default stream, which is the one everything below rides. `device_allocator_t`
+ *  defaults its stream to `nullptr` and every launch, upload and event here passes the same, so allocations, copies
+ *  and kernels are ordered against each other by construction. A benchmark that owns the device pays nothing for the
+ *  legacy default stream's habit of serializing against every other one, and a stream of its own would be a handle
+ *  to keep in agreement across five call sites in exchange for that nothing. */
 template <typename value_type_>
 using device_array = types::buffer<value_type_, types::device_allocator_t>;
 
@@ -66,12 +61,8 @@ struct device_batch_t {
     device_array<sft::mmff94_atom_interaction_t> interactions;
     device_array<sft::mmff94_atom_offsets_t> atom_offsets_lookup;
 
-    /**
-     *  @brief Reserve every array for @p num_molecules molecules over @p total_atom_count atoms.
-     *
-     *  Every term array is sized at the per-molecule maximum stride, so the batch costs about 50 kB a
-     *  molecule whatever the molecules are.
-     */
+    /** Reserve every array for @p num_molecules molecules over @p total_atom_count atoms. Every term array is sized
+     *  at the per-molecule maximum stride, so a batch costs about 50 kB a molecule. */
     [[nodiscard]] bool reserve(std::uint32_t num_molecules, std::uint32_t total_atom_count) {
         bool reserved = true;
         auto reserve_ = [&](auto &array, std::size_t count) {
@@ -152,8 +143,8 @@ trio_launch_t launch_mmff94_kernel_trio_benchmark(sfparam::mmff94_tables_host_t 
         return trio_launch_t::allocation_failed_k;
     }
 
-    // The allocations above are stream-ordered against the default stream, which is the one the uploads,
-    // the kernels and the events below all name, so they see each other without a synchronize.
+    // The allocations above are stream-ordered against the default stream the uploads, kernels and events below all
+    // name, so they see each other without a synchronize.
     if (!types::upload_into(batch.descriptors.view(), descriptors, nullptr)) return trio_launch_t::allocation_failed_k;
     if (!types::upload_into(batch.atom_offsets.view(), atom_offsets, nullptr))
         return trio_launch_t::allocation_failed_k;
@@ -165,9 +156,8 @@ trio_launch_t launch_mmff94_kernel_trio_benchmark(sfparam::mmff94_tables_host_t 
             batch.atom_types.data(), batch.partial_charges.data(), batch.status_codes.data());
     };
 
-    // Warm the driver, so the one-shot setup of a first launch is not charged to the steady-state cost.
-    // The drain clears the sticky slot, so a refusal here has to be read before it, or the timed pass
-    // below reports a zero-length launch as a measured cost.
+    // Warm the driver, so a first launch's one-shot setup is not charged to the steady state. The drain clears the
+    // sticky slot, so a refusal here must be read before it or the timed pass reports a zero-length launch as cost.
     launch_type_and_charge_();
     if (cudaError_t const warm_error = cudaGetLastError(); warm_error != cudaSuccess) {
         fmt::println(stderr, "kernel error: {}", cudaGetErrorString(warm_error));

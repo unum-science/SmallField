@@ -129,8 +129,7 @@ def bench_smallfield(smiles: List[str], num_conformers: int, random_seed: int, g
     import smallfield.api as smallfield
 
     result = Result("SmallField (GPU)")
-    # One reused context, plus the warm-up call below, keeps device initialisation and the first-call
-    # kernel load out of the timed region.
+    # One reused context plus the warm-up below keeps device init and the first-call kernel load out of the timing.
     context = smallfield.Context(gpu_ids)
     smallfield.generate_conformers(
         smiles[: min(100, len(smiles))],
@@ -271,8 +270,7 @@ def main() -> int:
         try:
             results.append(runner())
         except Exception as error:
-            # One system failing is a result about that system, so the rest still run and the table
-            # still prints; the exit code carries that something did not.
+            # One system failing is a result about that system, so the rest still run and the table still prints.
             log.error("{} failed: {}", label, error)
             failed = Result(label)
             failed.note = f"error: {error}"

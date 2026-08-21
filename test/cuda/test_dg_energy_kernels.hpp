@@ -15,11 +15,9 @@
 namespace smallfield::tests {
 
 /**
- *  @brief Which step of a device round trip refused, so a caller can say why it compared nothing.
- *
- *  A launch the driver declines never writes an output buffer, and none of the entry points below zeroes
- *  one first, so a caller that reads the buffer anyway scores whatever the allocation found and reports it
- *  as an energy, a gradient, or a chiral-center count.
+ *  @brief Which step of a device round trip refused, so a caller can say why it compared nothing. A declined
+ *  launch never writes an output buffer and no entry point below zeroes one first, so a caller reading it
+ *  anyway reports whatever the allocation found as an energy, a gradient, or a chiral-center count.
  */
 enum class dg_probe_t {
     completed_k,
@@ -34,18 +32,16 @@ std::string_view dg_probe_reason(dg_probe_t outcome) noexcept;
 /**
  *  @brief Everything a device call needs about the molecule it is scoring, except the coordinates.
  *
- *  The three penalty weights and the two counts are all scalars of the same type, so the entry
- *  points below take them as one named aggregate rather than as eleven positional arguments a call
- *  site can silently transpose.
+ *  The three penalty weights and the two counts are all scalars of the same type, so the entry points below
+ *  take them as one named aggregate rather than as eleven positional arguments a call site can silently
+ *  transpose. `bounds` is flat `num_atoms` squared with upper bounds above the diagonal, `chiral_centers`
+ *  is `nullptr` when the molecule has none, and `spatial_dimension` is three or four.
  */
 struct dg_problem_t {
-    /** Flat `num_atoms` squared bounds matrix, upper bounds above the diagonal. */
     float const *bounds = nullptr;
-    /** Chiral center descriptors, or `nullptr` when the molecule has none. */
     types::chiral_center_descriptor_t const *chiral_centers = nullptr;
     std::uint32_t num_atoms = 0;
     std::uint32_t num_chiral_centers = 0;
-    /** Coordinate dimensionality — three or four. */
     std::uint32_t spatial_dimension = 4;
     float upper_weight = 1.0f;
     float lower_weight = 1.0f;
@@ -55,8 +51,6 @@ struct dg_problem_t {
 
 /**
  *  @brief Evaluate distance-geometry energy and its gradient on the device for one molecule.
- *
- *  @param[in] problem Bounds, chiral centers, extents, and penalty weights.
  *  @param[in] host_coords Coordinates as `(axis, atom)`, `spatial_dimension * num_atoms` entries, which is
  *      the layout the kernel indexes; an interleaved block passed here scores a different molecule.
  *  @param[out] host_gradient Receives the gradient, same layout as @p host_coords; untouched on a refusal.
@@ -67,12 +61,10 @@ struct dg_problem_t {
                                        float *out_energy);
 
 /**
- *  @brief Count the chiral centers whose realized geometry contradicts their descriptor.
- *
- *  The count is an output rather than the return, because zero is the answer "the stereochemistry is
- *  intact" and a refused launch must not be able to spell it.
- *
- *  @param[in] problem Bounds, chiral centers, extents, and penalty weights; only the centers are read.
+ *  @brief Count the chiral centers whose realized geometry contradicts their descriptor. The count is an
+ *  output rather than the return, since zero means "the stereochemistry is intact" and a refused launch
+ *  must not be able to spell it.
+ *  @param[in] problem Only the chiral centers are read.
  *  @param[in] host_coords Coordinates as `(axis, atom)`.
  *  @param[out] out_invalid Receives how many centers failed; untouched on a refusal.
  *  @return Whether the round trip completed, and which step refused it.
@@ -90,11 +82,7 @@ struct dg_minimize_report_t {
 
 /**
  *  @brief Run FIRE minimization of the distance-geometry energy on the device for one molecule.
- *
- *  @param[in] problem Bounds, chiral centers, extents, and penalty weights.
  *  @param[inout] host_coords Coordinates as `(axis, atom)`, overwritten with the minimized positions.
- *  @param[in] max_iterations Iteration cap for the FIRE loop.
- *  @param[in] gradient_threshold Convergence threshold on the gradient norm.
  *  @param[out] out_report Receives the final energy, RMS gradient, iteration count, and status; untouched
  *      on a refusal, as are @p host_coords.
  *  @return Whether the round trip completed, and which step refused it.

@@ -61,16 +61,18 @@ class ShardStats:
 
 @dataclass
 class CrossValidation:
-    """Per-sample comparison of SmallField coordinates against RDKit MMFF94."""
+    """Per-sample comparison of SmallField coordinates against RDKit MMFF94.
+
+    `atom_count_mismatch` counts rows whose reference molecule and stored slot describe different atom counts, and
+    `skipped` marks RDKit not being importable, which is a skip rather than a verdict.
+    """
 
     num_samples: int = 0
     compared: int = 0
     nan_coordinates: int = 0
     rdkit_failures: int = 0
-    #: Rows whose reference molecule and stored slot describe different atom counts.
     atom_count_mismatch: int = 0
     energy_deltas: np.ndarray = field(default_factory=lambda: np.array([]))
-    #: True when RDKit is not importable, which is a skip rather than a verdict.
     skipped: bool = False
 
 
@@ -193,10 +195,9 @@ def cross_validate_with_rdkit(first_shard: str, sample_indices: np.ndarray) -> C
         num_atoms = molecule.GetNumAtoms()
 
         coordinates = np.asarray(stored_coordinates, dtype=np.float16).astype(np.float32)
-        # The parse must reproduce the atom order the writer stored, and a length mismatch is exactly
-        # where it did not. Counted apart from an RDKit refusal: parsing the whole SMILES rather than
-        # the parent lands every multi-fragment row here, which on PubChem is 8.8 % of a shard, and
-        # a validator that drops a tenth of its sample must not read like one that compared it.
+        # The parse must reproduce the atom order the writer stored; a length mismatch is where it did not. Counted
+        # apart from an RDKit refusal: parsing the whole SMILES rather than the parent lands every multi-fragment row
+        # here, 8.8 % of a PubChem shard, and a validator dropping a tenth of its sample must not read as comparing it.
         if coordinates.size != num_atoms * 3:
             result.atom_count_mismatch += 1
             continue

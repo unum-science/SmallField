@@ -56,8 +56,7 @@ def test_batch_generation_returns_flat_buffers_and_status_codes():
     )
 
     expected_conformer_count = len(smiles_batch) * num_conformers
-    # Coordinates cross as float16, which is the storage the pipeline produces; widening them here
-    # would assert a precision the slots never held.
+    # Coordinates cross as float16, the storage the pipeline produces; widening asserts unheld precision.
     assert batch.coordinates.dtype == np.float16
     assert batch.coordinates.shape == (expected_conformer_count * atom_stride * 3,)
     assert batch.energies.shape == (expected_conformer_count,)
@@ -65,8 +64,7 @@ def test_batch_generation_returns_flat_buffers_and_status_codes():
     assert np.isfinite(batch.energies).all()
     assert any(int(code) == int(sfa.ConformerStatus.SUCCESS) for code in batch.status)
 
-    # The per-molecule descriptors come from the molecule SmallField embedded, so they are one per
-    # input rather than one per conformer.
+    # Descriptors come from the molecule SmallField embedded: one per input, not one per conformer.
     assert batch.num_atoms.shape == (len(smiles_batch),)
     assert batch.num_heavy_atoms.shape == (len(smiles_batch),)
     assert batch.num_bonds.shape == (len(smiles_batch),)
@@ -74,10 +72,8 @@ def test_batch_generation_returns_flat_buffers_and_status_codes():
 
 
 def test_atom_stride_is_published_rather_than_restated():
-    """The stride is the output layout, so a caller reads it rather than hard-coding 128 or 192.
-
-    It stays under ``smallfield.api`` rather than the package root, which holds only submodules —
-    the same reason ``Context`` is not re-exported there.
+    """The stride is the output layout, so a caller reads it rather than hard-coding 128 or 192, and it
+    stays under ``smallfield.api`` rather than the submodules-only package root, as ``Context`` does.
     """
     assert sfa.MAX_ATOMS_PER_MOLECULE > 0
     assert not hasattr(smallfield, "MAX_ATOMS_PER_MOLECULE")

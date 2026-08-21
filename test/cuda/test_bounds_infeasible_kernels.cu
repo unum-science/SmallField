@@ -44,9 +44,8 @@ struct prepass_scratch_t {
 /**
  *  @brief Every device array one molecule's pass through the three launches needs.
  *
- *  The five term arrays hold a single unused element each: the molecule declares no chiral centers, torsions,
- *  constraints or interactions, so the kernel only ever offsets into them, and a null pointer would make that
- *  arithmetic undefined rather than merely unread.
+ *  The five term arrays hold one unused element each: the molecule declares no chiral centers, torsions,
+ *  constraints or interactions, so the kernel only offsets into them and a null would make that undefined.
  */
 struct pipeline_arena_t {
     device_array<float> bounds;
@@ -98,8 +97,8 @@ struct pipeline_arena_t {
 conformer_status_t gpu_pipeline_status_of_bounds(sft::packed_matrix<float> bounds) {
     std::uint32_t const num_atoms = bounds.extent(0);
     std::size_t const cell_count = std::size_t {num_atoms} * num_atoms;
-    // The prepass pads every molecule up to its bin's cap before launching, and refuses a scratch that is
-    // not sized for that cap rather than for the molecule — which is what a wave's own reservation carries.
+    // The prepass pads every molecule to its bin's cap and refuses a scratch sized for the molecule
+    // instead, which is what a wave's own reservation carries.
     std::uint32_t const bin_atoms = sft::atom_limited_bin_caps_k[sft::atom_limited_bin_for(num_atoms)];
 
     // Neither launch ran, which is exactly what the caller should be told when staging refuses below.
@@ -118,8 +117,8 @@ conformer_status_t gpu_pipeline_status_of_bounds(sft::packed_matrix<float> bound
         etkdg_molecule_metadata_t metadata {};
         metadata.num_atoms = num_atoms;
         std::uint32_t const input_index = 0;
-        // The status slot starts where no kernel would leave it, so a launch that never ran is legible; the
-        // verdict starts saying nothing, which is the state a wave memsets it to.
+        // The status slot starts where no kernel would leave it, so a launch that never ran is legible;
+        // the verdict starts saying nothing, the state a wave memsets it to.
         std::uint8_t const unreached = static_cast<std::uint8_t>(conformer_status_t::mmff_unconverged_k);
         conformer_status_t const no_complaint = conformer_status_t::success_k;
 
@@ -136,8 +135,7 @@ conformer_status_t gpu_pipeline_status_of_bounds(sft::packed_matrix<float> bound
                                            stream) == cudaSuccess;
 
         if (staged) {
-            // The wave sets this attribute once per device at construction; a harness driving the kernel
-            // directly has to raise it for itself.
+            // The wave raises this once per device at construction; a harness driving the kernel must too.
             cudaFuncSetAttribute(sfc::embed_4d_power_iter_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  static_cast<int>(sfc::embed_shared_bytes(bin_atoms)));
 
@@ -152,9 +150,8 @@ conformer_status_t gpu_pipeline_status_of_bounds(sft::packed_matrix<float> bound
                 arena.metadata.data(), arena.input_indices.data(), arena.coordinates.data(), arena.energies.data(),
                 arena.status.data(), 1u, 1u, 4u, num_atoms, num_atoms, num_atoms, 0x5eedull);
 
-            // The pipeline kernel asks for shared memory proportional to the atom count, so it is the
-            // launch in this file a device can refuse. Read before the stamp is enqueued, because the
-            // sticky slot holds one error and the caller has to be told which kernel it belongs to.
+            // Shared memory scales with atom count, so this is the launch a device can refuse. Read before
+            // the stamp is enqueued: the sticky slot holds one error and the caller needs to know whose.
             cudaError_t const pipeline_enqueued = cudaGetLastError();
 
             sfc::stamp_refused_molecules_kernel<<<1, 1, 0, stream>>>(arena.verdicts.data(), arena.status.data(), 1u,
@@ -169,10 +166,9 @@ conformer_status_t gpu_pipeline_status_of_bounds(sft::packed_matrix<float> bound
                                    custd::span<std::uint8_t const> {arena.status.view()}, stream);
 
             cudaError_t const finished = cudaStreamSynchronize(stream);
-            // A refused enqueue leaves the status slot at `unreached`, which is `mmff_unconverged_k` —
-            // the same byte a molecule the kernels reached and failed to converge carries. The drain
-            // returns success either way, so without these two the suite would read a launch the device
-            // declined as a verdict the pipeline reached.
+            // A refused enqueue leaves the status at `unreached`, `mmff_unconverged_k`, the same byte a
+            // molecule the kernels reached and failed to converge carries. The drain returns success
+            // either way, so without these two a declined launch would read as a verdict.
             if (pipeline_enqueued != cudaSuccess)
                 std::fprintf(stderr, "etkdg_pipeline_warp_kernel: refused at %u atoms: %s\n", num_atoms,
                              cudaGetErrorString(pipeline_enqueued));

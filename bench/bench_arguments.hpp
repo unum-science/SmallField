@@ -2,8 +2,8 @@
  *  @file bench/bench_arguments.hpp
  *  @brief Command-line and corpus plumbing shared by the benchmark drivers.
  *
- *  Every benchmark flag goes through `parse_number` from `smallfield/number_parse.hpp`, whose ceiling is what
- *  stops a four-billion conformer count from reaching `std::vector::resize`.
+ *  Every flag goes through `parse_number` from `smallfield/number_parse.hpp`, whose ceiling stops a four-billion
+ *  conformer count from reaching `std::vector::resize`.
  */
 
 #pragma once
@@ -27,26 +27,19 @@ namespace smallfield::bench {
 /** Environment variable naming a corpus when no `--smi` flag is given. */
 inline constexpr char const *corpus_environment_variable_k = "SMALLFIELD_TEST_CORPUS";
 
-/**
- *  @brief Why a SMILES corpus was accepted or refused.
- *
- *  A path that never opened is kept apart from one that opened and held nothing, because a corpus read as
- *  zero molecules is a run that measures nothing and still exits clean.
- */
+/** Why a SMILES corpus was accepted or refused. A path that never opened stays apart from one that opened and held
+ *  nothing — and `unnamed_k` from both, being neither a flag nor the environment naming one — since a zero-molecule
+ *  corpus measures nothing and still exits clean. */
 enum class corpus_load_t {
     loaded_k,
-    /** Neither a flag nor the environment named a corpus. */
     unnamed_k,
     cannot_open_k,
     empty_k,
 };
 
-/**
- *  @brief Read up to @p capacity SMILES from @p path into a cleared @p smiles, one per line.
- *
- *  Lines that are empty or start with `#` are skipped, and each kept line is truncated at its first run of
- *  whitespace, which drops a trailing name field along with any `\r`.
- */
+/** Read up to @p capacity SMILES from @p path into a cleared @p smiles, one per line. Empty and `#` lines are
+ *  skipped; each kept line truncates at its first whitespace run, dropping a trailing name field along with any
+ *  `\r`. */
 inline corpus_load_t load_corpus_into(std::string_view path, std::size_t capacity, std::vector<std::string> &smiles) {
     smiles.clear();
     if (path.empty()) return corpus_load_t::unnamed_k;
@@ -85,12 +78,9 @@ inline std::string_view corpus_path_from_environment() {
 /** How a command line was answered: usable arguments, a help request, or a refusal. */
 enum class arguments_parse_t { accepted_k, help_requested_k, refused_k };
 
-/**
- *  @brief The command line as one cursor: the tokens, the position in them, and the name to blame.
- *
- *  Three things are refusals rather than silent defaults: a token that is not a number, a token outside the
- *  caller's bounds, and a value-taking flag that appears last with nothing after it.
- */
+/** The command line as one cursor: the tokens, the position in them, and the name to blame. Three things are
+ *  refusals rather than silent defaults: a non-numeric token, one outside the caller's bounds, and a value-taking
+ *  flag appearing last with nothing after it. */
 class command_line_t {
     char const *executable_name_;
     int argc_;

@@ -29,31 +29,24 @@ namespace sfbench = smallfield::bench;
 /** Name printed on every throughput line so a concatenated CI log stays attributable. */
 static constexpr char const *executable_name_k = "bench_profile";
 
-/**
- *  @brief Ceiling on `--conformers`.
- *
- *  The coordinate buffer is molecules times conformers times `max_atoms` times three halves, so an
- *  unbounded count turns a typo into a multi-terabyte `resize` and a `std::bad_alloc` naming no token.
- */
+/** Ceiling on `--conformers`: the coordinate buffer is molecules times conformers times `max_atoms` times three
+ *  halves, so an
+ *  unbounded count turns a typo into a multi-terabyte `resize` and a `std::bad_alloc` naming no token. */
 static constexpr std::uint32_t max_conformers_per_molecule_k = 1024;
 
 /** Ceiling on the host coordinate buffer, refused before allocation rather than during it. */
 static constexpr std::size_t max_coordinate_bytes_k = 64ull << 30;
 
-/**
- *  @brief What a conformer slot carries before `generate_conformers` has written it.
- *
- *  A value-initialized `conformer_status_t` is `success_k`, so a slot the pipeline never reached would
- *  join the succeeded count and the status histogram would report a run that produced nothing as a run
- *  that produced everything.
- */
+/** What a conformer slot carries before `generate_conformers` has written it. A value-initialized
+ *  `conformer_status_t` is `success_k`, so a slot the pipeline never reached would join the succeeded count and the
+ *  histogram would report a run that produced nothing as one that produced everything. */
 static constexpr sfapi::conformer_status_t unwritten_status_k = sfapi::conformer_status_t::invalid_smiles_k;
 
 #pragma region Command Line
 
-/** Everything this driver takes from the command line. */
+/** Everything this driver takes from the command line; `smiles_path` comes from `--smi` or
+ *  `SMALLFIELD_TEST_CORPUS`, with no default. */
 struct profile_arguments_t {
-    /** From `--smi` or from `SMALLFIELD_TEST_CORPUS`; there is no default. */
     std::string_view smiles_path;
     std::uint32_t conformers_per_molecule = 1;
 };
@@ -140,8 +133,8 @@ int main(int argc, char **argv) {
     auto generation_end = std::chrono::steady_clock::now();
     double milliseconds = std::chrono::duration<double, std::milli>(generation_end - generation_start).count();
 
-    // The mol/s figure counts molecules that never reached the GPU, so a corpus that rejects more looks
-    // faster than it is; conf/s and the breakdown below are what stay comparable.
+    // mol/s counts molecules that never reached the GPU, so a corpus rejecting more looks faster than it is; conf/s
+    // and the breakdown below are what stay comparable.
     auto const histogram = sfbench::status_histogram_of(status);
     std::uint64_t const succeeded = sfbench::successful_conformers_of(histogram);
     fmt::println("{}: wall {:.1f} ms, mol/s {:.1f}, conf/s {:.1f}, succeeded {} / {}", executable_name_k, milliseconds,

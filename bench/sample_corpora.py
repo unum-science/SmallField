@@ -66,8 +66,7 @@ def main() -> int:
     parser.add_argument("--out", required=True)
     arguments = parser.parse_args()
 
-    # A `--root` is taken as typed; a named corpus resolves under the repository, so the script works
-    # from any working directory.
+    # A `--root` is taken as typed; a named corpus resolves under the repository, so any cwd works.
     root = arguments.root or os.path.join(REPOSITORY_ROOT, CORPUS_ROOTS[arguments.corpus])
     paths = shard_paths(root)
     if not paths:

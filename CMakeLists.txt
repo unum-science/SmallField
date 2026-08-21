@@ -234,7 +234,7 @@ target_compile_options(
 #
 # `CMAKE_INTERPROCEDURAL_OPTIMIZATION ON` combined with `CUDA_SEPARABLE_COMPILATION ON` switches nvcc from emitting SASS
 # to emitting NVVM LTO IR, which defers every architecture's `ptxas` codegen to the device-link step. That step then
-# runs once per executable -- 26 of them -- each regenerating the whole library's SASS. Measured at 101.9 s per device
+# runs once per executable, each regenerating the whole library's SASS. Measured at 101.9 s per device
 # link against 0.25 s for a plain `nvlink`, it was roughly 84 % of all CPU work in the build, and `ccache` cannot cache
 # a device link at all.
 #

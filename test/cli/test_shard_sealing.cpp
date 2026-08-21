@@ -2,15 +2,13 @@
  *  @file test/cli/test_shard_sealing.cpp
  *  @brief Pin the two ways an input shard leaves the set a later run is offered: its sentinel, and parking.
  *
- *  Completeness downstream is the `.encoded` sentinel and nothing else, so a shard that ends a run with
- *  neither a sentinel nor a move out of the corpus is offered again on every pass, forever, while the run
- *  logs success. Two shapes of that were live here. A sentinel whose write failed reported nothing a caller
- *  could count, so a shard whose parquet was durable and whose seal was not was counted complete. And parking
- *  renamed the path it was handed, which under the production runner is a symlink into a staging view -- so a
- *  shard that faulted the driver had its link moved, its file left where the corpus is globbed, and its fault
- *  repeated on the next pass.
- *
- *  Both are filesystem behaviour, so both are asserted against a real temporary tree rather than a fake.
+ *  Completeness downstream is the `.encoded` sentinel and nothing else, so a shard ending a run with neither
+ *  a sentinel nor a move out of the corpus is offered again forever while the run logs success. Two shapes of
+ *  that: a sentinel whose write fails must report something a caller can count, or a shard whose parquet is
+ *  durable and whose seal is not reads as complete; and parking must move the shard, not the path it was
+ *  handed, which under the production runner is a symlink into a staging view -- renaming the link leaves the
+ *  file where the corpus is globbed, so a shard that faults the driver repeats its fault next pass. Both are
+ *  filesystem behaviour, so both are asserted against a real temporary tree rather than a fake.
  */
 
 #include <cstdio> // `std::fopen`
@@ -56,8 +54,7 @@ static void check_sentinel_outcomes_(fs::path const &directory, diagnostic_repor
     reporter.mismatch("sentinel", "case=writable")
         .field("sentinel_exists", true, fs::exists(sentinel, error_code), exactly_equal);
 
-    // A directory occupying the sentinel's own name is the cheapest way to fail the `fopen` alone: the shard
-    // beside it is written and durable, which is exactly the case that used to count as complete.
+    // A directory on the sentinel's name fails the `fopen` alone: the shard beside it is written and durable.
     fs::path const blocked = directory / "blocked.3D.parquet";
     touch_(blocked);
     fs::path blocked_sentinel = blocked;
@@ -76,9 +73,9 @@ static void check_sentinel_outcomes_(fs::path const &directory, diagnostic_repor
 /**
  *  @brief Parking a staging symlink must move the shard it names, not the link.
  *
- *  The production runner rebuilds its view of symlinks on every pass, so a link moved aside is recreated and
- *  the shard behind it is offered again -- which is the loop this asserts is closed. The `_skip` folder is a
- *  sibling of the shard's own directory rather than of the view's, or the corpus would keep it.
+ *  The runner rebuilds its symlink view every pass, so a link moved aside is recreated and its shard
+ *  re-offered -- the loop this closes. `_skip` is a sibling of the shard's own directory rather than of
+ *  the view's, or the corpus would keep it.
  */
 static void check_parking_resolves_the_link_(fs::path const &directory, diagnostic_reporter_t &reporter) {
     fs::path const corpus = directory / "corpus";

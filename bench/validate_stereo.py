@@ -3,8 +3,8 @@
 
 The control decides whether the number means anything. RDKit's own ETKDGv3 geometries are scored
 through the identical path first, and a control above `CONTROL_INVERSION_LIMIT` means the instrument
-is broken rather than the pipeline — the failure mode that produced, and then hid, a withdrawn energy
-table in this project's own history.
+is broken rather than the pipeline — a harness that miscounts scores every subject alike, so without
+the control a broken instrument reads as a uniform result.
 
 Exit code 1 is a check that failed and 2 is a refused command line or an input directory holding
 nothing to validate, so a broken shard and a mistyped path do not read alike.
@@ -35,55 +35,51 @@ SUCCESS_STATUS = 0
 #: RDKit scoring its own geometry has no mechanism to fail, so anything above zero is a harness bug.
 CONTROL_INVERSION_LIMIT = 0.5
 
-#: Inversion share, in percent, the subject may show before the run fails. These are regression
-#: ratchets set at twice the worst rate current code is recorded at, not targets: tetrahedral stereo
-#: sits at 6.1 % and 5.5 % on the two standing corpora, so 12 % catches a regression toward the 20 %
-#: and 23.3 % those corpora scored before the chiral-volume target landed, and toward the 22.9 % the
-#: shipped corpus still carries. Override per corpus rather than loosening these, because the two
-#: differ in stereo density and one ceiling for both would be the looser of the two.
+#: Inversion share, in percent, the subject may show before the run fails: a regression ratchet at twice the worst
+#: rate current code records, not a target. Tetrahedral stereo sits at 6.1 % and 5.5 % on the two standing corpora,
+#: so 12 % catches a regression toward the 20 % and 23.3 % a corpus scores without the check. Override per corpus
+#: rather than loosening it, since the two differ in stereo density and one ceiling would be the looser of them.
 SHARD_CHIRAL_INVERSION_LIMIT = 12.0
 
-#: E/Z rests on a smaller draw — 1 of 584 declared bonds, 0.171 %, with the post-polish check in
-#: place — and `BENCH.md` cautions that the sample wants a larger one. Set at 1 %, about six bonds of
-#: that draw, so counting noise cannot fail a run while a regression toward the 6.441 % of the
-#: pre-check configuration or the 52.08 % of the shipped corpus still does.
+#: E/Z rests on a smaller draw — 1 of 584 declared bonds, 0.171 %, with the post-polish check in place — and
+#: `BENCH.md` cautions that the sample wants a larger one. Set at 1 %, about six bonds of that draw, so counting
+#: noise cannot fail a run while a regression toward the 6.441 % of the pre-check configuration still does. PubChem
+#: declares roughly 1,147 bonds per 10,000 molecules and REAL 60 to 80, so only PubChem can answer this row.
 SHARD_EZ_INVERSION_LIMIT = 1.0
 
-#: Share of scored rows, in percent, that may fail the bond-length window. Measured at 0.140 % over
-#: 1,432 rows of the shipped PubChem corpus. This ceiling is what makes the two above meaningful: an
-#: unusable row leaves the inversion ratio entirely, so without it a geometry that degrades until
-#: nothing is scorable reports a perfect rate.
+#: Share of scored rows, in percent, that may fail the bond-length window, measured at 0.140 % over 1,432 rows of the
+#: shipped PubChem corpus. It is what makes the two above meaningful: an unusable row leaves the inversion ratio
+#: entirely, so without it a geometry degrading until nothing is scorable reports a perfect rate.
 GEOMETRY_UNUSABLE_LIMIT = 1.0
 
-#: Declared centers or bonds the subject's score must rest on before it is a measurement rather than
-#: an accident. `StereoScore.percent` divides by `max(declared, 1)`, so zero declared renders as a
-#: clean `0.000 %` — the same shape a validator that compared nothing has, and the same failure.
+#: Declared centers or bonds the subject's score must rest on before it is a measurement rather than an accident.
+#: `StereoScore.percent` divides by `max(declared, 1)`, so zero declared renders as a clean `0.000 %` — the shape a
+#: validator that compared nothing has, and the same failure.
 MINIMUM_DECLARED = 100
 
-#: Bond-length window, in angstrom, every bond must land inside before a geometry is trusted.
-#: A wrong atom-order guess fails this instantly, which is what it exists for.
+#: Bond-length window, in angstrom, every bond must land inside before a geometry is trusted. A wrong atom-order
+#: guess fails this instantly, which is what it exists for.
 BOND_LENGTH_WINDOW = (0.8, 2.2)
 
-#: Seconds `EmbedMolecule` may spend on one control geometry. A handful of PubChem molecules take
-#: minutes each and would otherwise set the runtime of the whole harness; a control that skips them
-#: measures fewer molecules, which the report prints, rather than measuring them slowly.
+#: Seconds `EmbedMolecule` may spend on one control geometry. A handful of PubChem molecules take minutes each and
+#: would otherwise set the harness runtime; skipping them measures fewer molecules, which the report prints.
 CONTROL_EMBED_TIMEOUT_SECONDS = 10
 
 
 @dataclass
 class StereoScore:
-    """Centers or bonds declared by the input, and how many the geometry contradicts."""
+    """Centers or bonds declared by the input, and how many the geometry contradicts.
+
+    `carrying` counts molecules with at least one declared center or bond; `mirror`, `partial` and `clean` split
+    those with two or more declared centers by whether all, some or none of them inverted.
+    """
 
     molecules: int = 0
     declared: int = 0
     inverted: int = 0
-    #: Molecules carrying at least one declared center or bond.
     carrying: int = 0
-    #: Of molecules with two or more declared centers: every one inverted together.
     mirror: int = 0
-    #: Of molecules with two or more declared centers: some inverted, some not.
     partial: int = 0
-    #: Of molecules with two or more declared centers: none inverted.
     clean: int = 0
 
     @property
@@ -93,22 +89,23 @@ class StereoScore:
 
 @dataclass
 class FidelityReport:
-    """Everything one run measured, control beside subject so neither can be read alone."""
+    """Everything one run measured, control beside subject so neither can be read alone.
+
+    `atom_count_mismatch` counts rows whose reference molecule and stored slot describe different atom counts, and
+    `geometry_unusable` those whose geometry failed the bond-length window so no verdict was taken. `rows_scored` is
+    what the latter is a share of: an unusable row leaves both sides of the inversion ratio, so without that
+    denominator a geometry degrading until nothing is scorable reports a perfect score. `skipped` is RDKit not being
+    importable, which is a skip rather than a verdict.
+    """
 
     control_chiral: StereoScore = field(default_factory=StereoScore)
     control_ez: StereoScore = field(default_factory=StereoScore)
     shard_chiral: StereoScore = field(default_factory=StereoScore)
     shard_ez: StereoScore = field(default_factory=StereoScore)
-    #: Rows whose reference molecule and stored slot describe different atom counts.
     atom_count_mismatch: int = 0
-    #: Rows whose geometry failed the bond-length window, so no verdict was taken.
     geometry_unusable: int = 0
-    #: Rows that reached the scorer at all, which is what `geometry_unusable` is a share of. An
-    #: unusable row leaves both sides of the inversion ratio, so without this denominator a geometry
-    #: that degrades until nothing is scorable reports a perfect score.
     rows_scored: int = 0
     unparsable: int = 0
-    #: True when RDKit is not importable, which is a skip rather than a verdict.
     skipped: bool = False
 
 
@@ -282,10 +279,9 @@ def measure_shard(path: str, num_samples: int, seed: int, report: FidelityReport
     coordinates_column = table.column("conformer_coords").to_pylist()
     input_rows = table.column("input_row").to_numpy(zero_copy_only=False)
 
-    # Selected by `input_row` at an even stride rather than by a random draw over surviving rows.
-    # Which molecules survive depends on the code under test, so a draw over survivors samples a
-    # different molecule set per run and two runs cannot be compared. An even stride over the shared
-    # input ordering picks the same molecules on both sides, up to the few whose status differs.
+    # Selected by `input_row` at an even stride rather than a random draw over survivors: which molecules survive
+    # depends on the code under test, so a stride over the shared input ordering picks the same molecules on both
+    # sides, up to the few whose status differs.
     candidates = np.where((status == SUCCESS_STATUS) & (conformer_index == 0))[0]
     candidates = candidates[np.argsort(input_rows[candidates], kind="stable")]
     if candidates.size > num_samples:
@@ -447,8 +443,8 @@ def main() -> int:
         measure_shard(path, args.num_samples, args.seed, report)
 
     render_report(report, os.path.basename(os.path.normpath(args.input)), len(shards))
-    # Both verdicts are taken rather than short-circuited: a broken instrument and an out-of-budget
-    # shard are different failures, and a run carrying both should say so once for each.
+    # Both verdicts are taken, not short-circuited: a broken instrument and an out-of-budget shard differ, and a run
+    # carrying both says so once for each.
     sound = control_is_sound(report)
     within_budget = shard_is_within_budget(report, args.max_chiral_inversion, args.max_ez_inversion, args.max_unusable)
     return 0 if sound and within_budget else 1

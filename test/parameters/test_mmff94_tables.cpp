@@ -2,20 +2,18 @@
  *  @file test/parameters/test_mmff94_tables.cpp
  *  @brief Cross-validate the extracted MMFF94 tables against RDKit on the host, then against the device.
  *
- *  Two comparisons run over one shared set of probe keys. The host suite puts every key to RDKit's live
- *  `operator()` and to our binary-search cascade; the device suite puts the same keys to the lookup kernels
- *  and to the host cascade the first comparison has just vouched for.
+ *  Two comparisons share one key set: the host suite puts every key to RDKit's live `operator()` and to our
+ *  binary-search cascade, the device suite puts the same keys to the lookup kernels and to the host cascade the
+ *  first just vouched for. Keys come from three sources — a sweep of the whole atom-type range, two types past the
+ *  last tabulated one, covering vdW exhaustively; one key per tabulated entry, reaching every parameter the tables
+ *  carry; and a uniform draw over the range, reaching the equivalence cascades and the miss paths neither of the
+ *  others exercises. A corpus named on the command line adds the keys real molecules ask for, taken from RDKit's
+ *  own bond, angle and torsion typing of each structure.
  *
- *  Keys come from three sources. A sweep of the whole atom-type range, including two types past the last
- *  tabulated one, covers the vdW table exhaustively. One key per tabulated entry reaches every parameter the
- *  tables carry. A uniform draw over the type range reaches the equivalence cascades and the miss paths that
- *  neither of the first two exercise. A corpus named on the command line adds the keys real molecules ask
- *  for, taken from RDKit's own bond, angle and torsion typing of each structure.
- *
- *  Every key is a comparison whether or not it finds an entry, because two lookups agreeing that a table has
- *  nothing at a key is exactly the agreement a spurious device-side hit would break. How many keys reached a
- *  real entry is reported separately: a suite that agreed ten thousand times about empty space has compared
- *  no parameters at all, and its `compared=` count alone cannot say so.
+ *  Every key counts as a comparison whether or not it hits, since two lookups agreeing a table is empty at a key is
+ *  exactly what a spurious device-side hit would break. How many keys reached a real entry is reported separately:
+ *  a suite that agreed ten thousand times about empty space compared no parameters at all, and its `compared=`
+ *  count alone cannot say so.
  */
 
 #include <cstddef> // `std::size_t`
@@ -60,39 +58,35 @@ namespace smallfield::tests {
 
 #pragma region Predicates and Budgets
 
-/** What our `float` may differ from RDKit's `double` by, which is the narrowing and nothing else. The device
- *  suite carries no such constant: it reads the very bytes the host uploaded, so any difference there is a
- *  lookup bug and its comparison is `bitwise_equal`. */
+/** What our `float` may differ from RDKit's `double` by — the narrowing, nothing else. The device suite carries no
+ *  such constant: it reads the bytes the host uploaded, so any difference is a lookup bug and its comparison is
+ *  `bitwise_equal`. */
 static constexpr float rdkit_narrowing_tolerance_k = 1e-5f;
 
-/** How many mismatching fields a reporter prints before the rest are only counted. A systematic divergence
- *  would otherwise print one line per probe and bury every other section in the log. */
+/** Mismatching fields a reporter prints before the rest are only counted; a systematic divergence would otherwise
+ *  print one line per probe and bury every other section. */
 static constexpr std::size_t max_reported_mismatches_k = 64;
 
-/** Uniform draws per table, over the whole atom-type range. These are the keys that reach the equivalence
- *  cascades and the miss paths, since a key taken from a tabulated entry hits by construction. */
+/** Uniform draws per table over the whole atom-type range: the keys reaching the equivalence cascades and the miss
+ *  paths, since a key taken from a tabulated entry hits by construction. */
 static constexpr std::uint32_t random_probes_per_table_k = 2000;
 
 /** Molecules read from a named corpus when neither the flag nor `SMALLFIELD_TEST_MAX_MOLS` caps it. */
 static constexpr std::size_t default_max_molecules_k = 256;
 
-/** Corpus molecules above this atom count are skipped: the angle and torsion walks below are quadratic in
- *  the neighborhood, and one 900-atom aggregate contributes more keys than a hundred drug-like structures. */
+/** Corpus molecules above this atom count are skipped: the angle and torsion walks are quadratic in the
+ *  neighborhood, and one 900-atom aggregate contributes more keys than a hundred drug-like structures. */
 static constexpr std::uint32_t max_corpus_atoms_k = 128;
 
 #pragma endregion Predicates and Budgets
 
 #pragma region Coverage
 
-/**
- *  @brief Probe-granularity coverage for one lookup suite, owned by `main` and threaded by reference.
- *
- *  The reporter beside it owns the verdict and counts field comparisons, so one vdW probe that hits
- *  contributes six comparisons there and one probe here. What the reporter cannot know is how many probes
- *  reached a real entry, and that is the number separating a suite that compared parameters from one that
- *  agreed several thousand times that a table is empty at a random key. Neither count is derivable from the
- *  other, and only the reporter's decides the verdict.
- */
+/** Probe-granularity coverage for one lookup suite, owned by `main` and threaded by reference. The reporter beside
+ *  it owns the verdict and counts field comparisons, so one vdW probe that hits contributes six comparisons there
+ *  and one probe here. What it cannot know is how many probes reached a real entry, which is what separates a suite
+ *  that compared parameters from one that agreed several thousand times about empty space. Neither count is
+ *  derivable from the other, and only the reporter's decides the verdict. */
 struct lookup_coverage_t {
     std::uint64_t probes = 0;
     std::uint64_t table_hits = 0;
@@ -115,12 +109,9 @@ static void report_coverage_(std::string_view subject, lookup_coverage_t const &
 
 #pragma region Probe Keys
 
-/**
- *  @brief Every key both comparisons put to the tables, filled once and read twice.
- *
- *  One key set for the host and the device suite is what makes their two verdicts comparable: a key that our
- *  cascade resolved against RDKit on the host is the same key the kernel resolves against our cascade.
- */
+/** Every key both comparisons put to the tables, filled once and read twice. One key set is what makes the two
+ *  verdicts comparable: a key our cascade resolved against RDKit on the host is the same key the kernel resolves
+ *  against our cascade. */
 struct probe_keys_t {
     std::vector<vdw_query_t> vdw_keys;
     std::vector<bond_query_t> bond_keys;
@@ -128,41 +119,29 @@ struct probe_keys_t {
     std::vector<torsion_query_t> torsion_keys;
 };
 
-/**
- *  @brief The highest atom type RDKit's own equivalence table defines.
- *
- *  95 against the 99 the vdW table reaches, and the gap is not cosmetic: the cascades below index `MMFFDef`
- *  by atom type and dereference the row without a null check, so a type past its last row is an RDKit-side
- *  segfault rather than a miss.
- */
+/** The highest atom type RDKit's own equivalence table defines: 95, against the 99 the vdW table reaches. The gap
+ *  is not cosmetic — the cascades below index `MMFFDef` by atom type and dereference the row without a null check,
+ *  so a type past its last row is an RDKit-side segfault rather than a miss. */
 static std::uint8_t highest_defined_atom_type_() {
     return static_cast<std::uint8_t>(RDKit::MMFF::DefaultParameters::getMMFFDef()->d_params.size());
 }
 
-/**
- *  @brief Whether every atom type in a key is one RDKit's angle and torsion lookups can be asked about.
- *
- *  Those two walk the equivalence table and dereference what it answers, and it answers null both for the
- *  wildcard 0 and for anything past its last row, so either kind of key faults inside RDKit instead of
- *  missing. Neither is lost coverage: the wildcard rows are what the last level of the cascade rewrites a
- *  real type into, and an undefined type reaches no parameters on either side.
- *
+/** Whether every atom type in a key is one RDKit's angle and torsion lookups can be asked about. Those two walk the
+ *  equivalence table and dereference what it answers, which is null both for the wildcard 0 and for anything past
+ *  its last row, so either key faults inside RDKit instead of missing. Neither is lost coverage: the wildcard rows
+ *  are what the cascade's last level rewrites a real type into, and an undefined type reaches no parameters either
+ *  side.
  *  @param[in] highest_defined Last atom type the equivalence table carries.
  *  @param[in] atom_types The key's atom types, in any order.
- *  @return True when every one of them lies in the closed range from 1 to @p highest_defined .
- */
+ *  @return True when every one of them lies in the closed range from 1 to @p highest_defined . */
 static bool every_type_is_defined_(std::uint8_t highest_defined, std::initializer_list<std::uint8_t> atom_types) {
     for (std::uint8_t const atom_type : atom_types)
         if (atom_type == 0 || atom_type > highest_defined) return false;
     return true;
 }
 
-/**
- *  @brief Append the exhaustive sweep, one key per tabulated entry, and a uniform draw over the type range.
- *
- *  @param[in] host_tables Extracted tables, read for their entry keys and their type ceiling.
- *  @param[inout] keys Key set to extend.
- */
+/** Append the exhaustive sweep, one key per tabulated entry, and a uniform draw over the type range.
+ *  @param[in] host_tables Extracted tables, read for their entry keys and their type ceiling. */
 static void append_synthetic_keys_into_(sf::parameters::mmff94_tables_host_t const &host_tables, probe_keys_t &keys) {
     // Two types past the last tabulated one, so the out-of-range miss is covered on both sides.
     for (std::uint32_t atom_type = 0; atom_type <= host_tables.max_atom_type + 2u; ++atom_type)
@@ -221,13 +200,8 @@ struct neighbor_scratch_t {
     std::vector<std::uint32_t> around_second;
 };
 
-/**
- *  @brief Collect the atom indices bonded to @p atom.
- *
- *  @param[in] molecule Molecule to walk.
- *  @param[in] atom Index of the atom whose neighbors are wanted.
- *  @param[out] out Cleared, then filled with the neighbor indices.
- */
+/** Collect the atom indices bonded to @p atom.
+ *  @param[out] out Cleared, then filled with the neighbor indices. */
 static void fill_neighbors_into_(RDKit::ROMol const &molecule, std::uint32_t atom, std::vector<std::uint32_t> &out) {
     out.clear();
     for (auto const *neighbor : molecule.atomNeighbors(molecule.getAtomWithIdx(atom)))
@@ -240,23 +214,17 @@ enum class molecule_typing_t {
     refused_k,
 };
 
-/**
- *  @brief Append the keys one molecule's MMFF terms actually use.
- *
- *  RDKit answers with the bond, angle and torsion types the force field itself would build, so these keys
- *  carry the distribution a production run sees where the uniform draws carry the one that reaches the miss
- *  paths. The vdW table is left alone: the sweep above already covers every atom type exhaustively, and a
- *  key per atom would only add duplicates.
- *
+/** Append the keys one molecule's MMFF terms actually use. RDKit answers with the bond, angle and torsion types the
+ *  force field itself would build, so these carry the distribution a production run sees where the uniform draws
+ *  carry the one reaching the miss paths. The vdW table is left alone: the sweep above already covers every atom
+ *  type, and a key per atom would only add duplicates.
  *  @param[inout] molecule Molecule with explicit hydrogens; RDKit marks and types it in place.
  *  @param[inout] scratch Neighbor lists, reused across molecules.
- *  @param[inout] keys Key set to extend.
- *  @return Whether RDKit typed the molecule.
- */
+ *  @return Whether RDKit typed the molecule. */
 static molecule_typing_t append_molecule_keys_into_(RDKit::RWMol &molecule, neighbor_scratch_t &scratch,
                                                     probe_keys_t &keys) {
-    // The constructor kekulizes @p molecule and re-marks only the rings MMFF's own pi-electron count
-    // accepts, so the keys below are the ones a production force field asks the tables for.
+    // The constructor kekulizes @p molecule and re-marks only the rings MMFF's own pi-electron count accepts, so
+    // the keys below are the ones a production force field asks the tables for.
     RDKit::MMFF::MMFFMolProperties properties(molecule);
     if (!properties.isValid()) return molecule_typing_t::refused_k;
 
@@ -311,20 +279,15 @@ static molecule_typing_t append_molecule_keys_into_(RDKit::RWMol &molecule, neig
     return molecule_typing_t::typed_k;
 }
 
-/**
- *  @brief Type every corpus molecule and append the keys its terms use.
- *
+/** Type every corpus molecule and append the keys its terms use.
  *  @param[in] corpus SMILES already loaded from the named path.
- *  @param[inout] keys Key set to extend.
- *  @return How many molecules RDKit typed; one it refuses contributes no keys.
- */
+ *  @return How many molecules RDKit typed; one it refuses contributes no keys. */
 static std::size_t append_corpus_keys_into_(std::vector<std::string> const &corpus, probe_keys_t &keys) {
     neighbor_scratch_t scratch;
     std::size_t typed_molecules = 0;
     for (auto const &smiles : corpus) {
         std::unique_ptr<RDKit::RWMol> molecule;
-        // `SmilesToMol` throws on some malformed input rather than returning null, so it belongs inside the
-        // guard alongside `addHs`.
+        // `SmilesToMol` throws on some malformed input rather than returning null, so it belongs inside the guard.
         try {
             RDKit::SmilesParserParams parser_params;
             parser_params.sanitize = true;
@@ -363,8 +326,8 @@ static void compare_vdw_against_rdkit_(sf::parameters::mmff94_tables_view_t cons
         entry.field("present", reference != nullptr, ours != nullptr, exactly_equal);
         if (reference == nullptr || ours == nullptr) continue; // one side carries no parameters to compare
         ++coverage.table_hits;
-        // RDKit stores the donor/acceptor flag as the tabulated character; the extraction maps it onto a
-        // small enumeration, and this restates that mapping rather than reading it back from the extractor.
+        // RDKit stores the donor/acceptor flag as the tabulated character; this restates the extraction's mapping
+        // onto a small enumeration rather than reading it back from the extractor.
         std::uint8_t const reference_donor_acceptor = static_cast<std::uint8_t>((reference->DA == 'D')   ? 2
                                                                                 : (reference->DA == 'A') ? 1
                                                                                                          : 0);
@@ -456,16 +419,13 @@ static void compare_torsion_against_rdkit_(sf::parameters::mmff94_tables_view_t 
     reporter.summarize("torsion");
 }
 
-/**
- *  @brief Check the collection-wide VdW scalars, which reach the device as compiled-in constants.
- *
- *  No table carries these, so no probe key can reach them: the nonbonded kernel compiles `B`, `Beta`,
- *  `DARAD` and `DAEPS` in as `mmff94_vdw_*_k`, and this is the only place a parameter file that changed
- *  one of them would be noticed. `power` has no consumer at all — `r_star` arrives already combined from
- *  the tabulated `R_star` column — so it is compared against the value that assumption rests on.
- */
+/** Check the collection-wide VdW scalars, which reach the device as compiled-in constants. No table carries these,
+ *  so no probe key reaches them: the nonbonded kernel compiles `B`, `Beta`, `DARAD` and `DAEPS` in as
+ *  `mmff94_vdw_*_k`, and this is the only place a changed parameter file would be noticed. `power` has no consumer
+ *  at all — `r_star` arrives already combined from the tabulated `R_star` column — so it is compared against the
+ *  value that assumption rests on. */
 static void compare_vdw_constants_against_rdkit_(diagnostic_reporter_t &reporter) {
-    /** MMFF `power`. Nothing raises `alpha_i` to it, and a change here is a reason to re-read the rule. */
+    // MMFF `power`. Nothing raises `alpha_i` to it, and a change here is a reason to re-read the rule.
     constexpr float unconsumed_vdw_power_k = 0.25f;
     auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFVdW();
     reporter.mismatch("vdw_constants", "collection=MMFFVdW")
@@ -481,14 +441,11 @@ static void compare_vdw_constants_against_rdkit_(diagnostic_reporter_t &reporter
     reporter.summarize("vdw_constants");
 }
 
-/**
- *  @brief Put every key to RDKit's live lookups and to ours.
- *
+/** Put every key to RDKit's live lookups and to ours.
  *  @param[in] host_tables Extracted tables, viewed for the lookups under test.
  *  @param[in] keys Shared probe keys.
  *  @param[inout] reporter Owns the verdict for all four sections.
- *  @param[inout] coverage Probe counts per table.
- */
+ *  @param[inout] coverage Probe counts per table. */
 static void compare_against_rdkit_(sf::parameters::mmff94_tables_host_t const &host_tables, probe_keys_t const &keys,
                                    diagnostic_reporter_t &reporter, suite_coverage_t &coverage) {
     // Both suites close a section per table under the same subject names, so each says which one it is.
@@ -523,20 +480,15 @@ static std::string_view device_probe_reason_(device_probe_t outcome) noexcept {
     }
 }
 
-/**
- *  @brief Ship @p queries to the device, run @p launch over them, and bring the results back.
- *
- *  Every section's round trip is this one function, so the reserve, copy, launch, copy sequence is written
- *  once and each section holds only its comparison. Both buffers are released in @p stream's order when
- *  they go out of scope, so @p stream must outlive this call.
- *
+/** Ship @p queries to the device, run @p launch over them, and bring the results back. Every section's round trip
+ *  is this one function, so the reserve, copy, launch, copy sequence is written once and each section holds only
+ *  its comparison. Both buffers are released in @p stream's order at scope exit, so @p stream must outlive the call.
  *  @param[in] device_tables Uploaded tables the kernel reads, passed straight through to @p launch.
  *  @param[in] queries Probe keys for one table.
  *  @param[out] results Resized to match @p queries and overwritten with what the kernel wrote.
  *  @param[in] stream Carries the allocations, the transfers and the launch, and with them the device.
- *  @param[in] launch One of the table launchers, which this calls with the device pointers it just staged.
- *  @return Whether the round trip completed, and which step refused it.
- */
+ *  @param[in] launch One of the table launchers, called with the device pointers this just staged.
+ *  @return Whether the round trip completed, and which step refused it. */
 template <typename query_type_, typename result_type_>
 static device_probe_t run_device_probes_(sf::parameters::mmff94_tables_view_t const &device_tables,
                                          std::vector<query_type_> const &queries, std::vector<result_type_> &results,
@@ -558,9 +510,8 @@ static device_probe_t run_device_probes_(sf::parameters::mmff94_tables_view_t co
 
     launch(device_tables, query_device.data(), result_device.data(), static_cast<std::uint32_t>(queries.size()),
            stream);
-    // A launch the driver refuses to enqueue reports here and nowhere else. The kernel never runs, so the
-    // drain below has nothing to fail on and the result buffer still holds whatever the allocation found,
-    // which the section would then compare against the host lookups and read as a device defect.
+    // A launch the driver refuses to enqueue reports here and nowhere else: the kernel never runs, so the drain
+    // below has nothing to fail on and the result buffer still holds whatever the allocation found.
     if (cudaGetLastError() != cudaSuccess) return device_probe_t::launch_failed_k;
 
     custd::span<result_type_> const host_results {results.data(), results.size()};
@@ -572,15 +523,11 @@ static device_probe_t run_device_probes_(sf::parameters::mmff94_tables_view_t co
     return device_probe_t::completed_k;
 }
 
-/**
- *  @brief Close a section that never ran, so the skip reaches the gate.
- *
- *  The vacuous-section count only rises inside `summarize`, so a section that returns before closing leaves
- *  a passing reporter behind and takes the whole comparison with it silently.
- */
+/** Close a section that never ran, so the skip reaches the gate. The vacuous-section count only rises inside
+ *  `summarize`, so a section returning before it closes leaves a passing reporter behind, silently. */
 static void close_skipped_section_(std::string_view subject, std::string_view reason, diagnostic_reporter_t &reporter) {
-    // Deliberately not the word `FAILED`: this line is narration, and a CI log filtered on the verdict
-    // grammar must not answer a `FAIL` grep with a line that never decided anything.
+    // Deliberately not `FAILED`: this line is narration, and a CI log filtered on the verdict grammar must not
+    // answer a `FAIL` grep with a line that decided nothing.
     fmt::println("NOTE {} device_probe={}", subject, reason);
     reporter.summarize(subject);
 }
@@ -702,14 +649,11 @@ static void compare_torsion_on_device_(sf::parameters::mmff94_tables_view_t cons
     reporter.summarize("torsion");
 }
 
-/**
- *  @brief Upload the tables and put every key to the kernels, against the host lookups.
- *
+/** Upload the tables and put every key to the kernels, against the host lookups.
  *  @param[in] host_tables Extracted tables, uploaded and also viewed as the reference.
  *  @param[in] keys Shared probe keys.
  *  @param[inout] reporter Owns the verdict for all four sections.
- *  @param[inout] coverage Probe counts per table.
- */
+ *  @param[inout] coverage Probe counts per table. */
 static void compare_against_device_(sf::parameters::mmff94_tables_host_t const &host_tables, probe_keys_t const &keys,
                                     diagnostic_reporter_t &reporter, suite_coverage_t &coverage) {
     fmt::println("NOTE suite=device reference=host observed=device");
@@ -717,17 +661,17 @@ static void compare_against_device_(sf::parameters::mmff94_tables_host_t const &
     if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess)
         return close_skipped_section_("device_upload", "device_stream_unavailable", reporter);
 
-    // Every allocation this suite makes is ordered against `stream`, so all of them are released inside this
-    // scope and the stream is destroyed only once nothing is left to free against it.
+    // Every allocation is ordered against `stream`, so all are released inside this scope and the stream is
+    // destroyed only once nothing is left to free against it.
     {
         sf::parameters::mmff94_tables_device_t device_storage;
-        // The residency is the verdict, not the span length: an upload that silently refused would leave
-        // every table empty and turn the four sections below into a comparison of nothing against nothing.
+        // The residency is the verdict, not the span length: an upload that silently refused would leave every
+        // table empty and turn the four sections below into nothing compared against nothing.
         sf::types::table_residency_t const residency = sf::parameters::upload_mmff94_tables_to_device(
             host_tables, device_storage, stream);
         if (cudaStreamSynchronize(stream) != cudaSuccess || residency == sf::types::table_residency_t::refused_k) {
-            // One skipped section rather than four: no upload means no device suite at all, and closing it
-            // empty is what carries the skip to the gate in `main`.
+            // One skipped section rather than four: no upload means no device suite, and closing it empty is what
+            // carries the skip to the gate in `main`.
             close_skipped_section_("device_upload", "device_upload_failed", reporter);
         }
         else {
@@ -777,16 +721,10 @@ enum class command_line_t {
     refused_k,
 };
 
-/**
- *  @brief Answer the two conventional flags, so an operator reaching for either gets the usage.
- *
- *  The corpus itself arrives positionally, as it does in the seven other corpus-driven tests, so this walks
- *  the arguments only far enough to tell a flag from a path.
- *
- *  @param[in] argc Argument count as `main` received it.
- *  @param[in] argv Argument vector as `main` received it.
- *  @return Whether to carry on, print the usage, or refuse the command line.
- */
+/** Answer the two conventional flags, so an operator reaching for either gets the usage. The corpus itself arrives
+ *  positionally, as in the seven other corpus-driven tests, so this walks the arguments only far enough to tell a
+ *  flag from a path.
+ *  @return Whether to carry on, print the usage, or refuse the command line. */
 static command_line_t parse_flags_(int argc, char const *const *argv) {
     for (int argument = 1; argument < argc; ++argument) {
         std::string_view const text {argv[argument]};
@@ -819,8 +757,8 @@ int main(int argc, char **argv) {
     fmt::println("{}: MMFF94 table lookups against RDKit on the host, then against the host on the device",
                  test_name_k);
 
-    // Naming a corpus is a request to probe with it, so a path that does not open is a command line that
-    // named the wrong thing rather than an empty run: exit 2, before any work, naming the path.
+    // Naming a corpus is a request to probe with it, so a path that does not open named the wrong thing rather
+    // than asking for an empty run: exit 2, before any work, naming the path.
     std::vector<std::string> corpus;
     if (corpus_selection.knob == sftest::corpus_knob_t::named_k) {
         auto const outcome = sftest::load_smiles_into(corpus_selection.path, corpus_selection.max_molecules, corpus);
@@ -861,8 +799,8 @@ int main(int argc, char **argv) {
                  mismatched, host_reporter.comparison_count(), device_reporter.comparison_count());
     if (mismatched != 0)
         return sftest::report_fail(test_name_k, "{} of {} field comparisons disagreed", mismatched, compared);
-    // A section that compared nothing is indistinguishable from a passing one in the count above, so the
-    // reporters gate on having actually compared something as well as on having agreed.
+    // A section that compared nothing is indistinguishable from a passing one above, so the reporters gate on
+    // having compared something as well as on having agreed.
     if (!host_reporter.passed() || !device_reporter.passed())
         return sftest::report_fail(test_name_k, "a lookup section compared nothing at all");
     return sftest::report_pass(test_name_k);

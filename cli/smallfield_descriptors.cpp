@@ -3,10 +3,9 @@
  *  @brief Augment `*.3D.parquet` shards that predate the canonical schema, in place.
  *
  *  A shard carrying no `usrcat` column and unsorted conformers is re-emitted through the producer's own
- *  `write_shard`, with the descriptors computed from the stored coordinates rather than from a fresh GPU
- *  run, which would perturb the geometry. Both paths round through fp16 identically — the producer also
- *  reads its own fp16 buffer back before describing it — so the output is byte-identical to what
- *  `smallfield_batch` would have written for the same geometry.
+ *  `write_shard`, descriptors computed from stored coordinates rather than a fresh GPU run that would perturb
+ *  the geometry. Both paths round through fp16 identically — the producer reads its own fp16 buffer back
+ *  before describing it — so output is byte-identical to `smallfield_batch` on the same geometry.
  */
 
 #include <csignal> // `std::signal`
@@ -60,11 +59,9 @@ constexpr char const *executable_name_k = "smallfield_descriptors";
 
 #pragma region Interruption
 
-/* Set by SIGINT/SIGTERM. The shard walk stops at the next shard boundary, so the shard in flight still
- * writes its parquet and its sentinel and a resume run continues from there.
- *
- * `handle_stop_signal_` keeps C language linkage for `std::signal`, which an ordinary `static` function
- * cannot combine with, so this unnamed namespace supplies the internal linkage. */
+/* Set by SIGINT/SIGTERM: the shard walk stops at the next shard boundary, so the shard in flight still writes
+ * its parquet and its sentinel and a resume run continues from there. `handle_stop_signal_` keeps C language
+ * linkage for `std::signal`, which `static` cannot combine with, so this unnamed namespace supplies it. */
 std::atomic<bool> stop_requested_ {false};
 extern "C" void handle_stop_signal_(int) { stop_requested_.store(true, std::memory_order_relaxed); }
 
@@ -75,18 +72,18 @@ extern "C" void handle_stop_signal_(int) { stop_requested_.store(true, std::memo
 /** Ceiling on `--threads`: an OpenMP team wider than this is a mistyped token, not a machine. */
 constexpr int max_threads_k = 4096;
 
-/** All CLI flags. Immutable after parse. */
+/**
+ *  All CLI flags, immutable after parse. An empty `reembed_dir` disables the override, an empty `dataset`
+ *  omits that key from shard metadata, zero `threads` resolves to the core count in `parse_cli_` so no consumer
+ *  re-derives it, and `max_atoms` is both the coordinate slot stride and the provenance metadata's `max_atoms`.
+ */
 struct cli_config_t {
     fs::path input_dir;
     fs::path output_dir;
-    /** Empty disables the reembed override. */
     fs::path reembed_dir;
-    /** Empty omits the key from the shard's metadata. */
     std::string dataset;
-    /** Zero resolves to the core count in `parse_cli_`, so no consumer re-derives what it meant. */
     int threads = 0;
     sfcli::restart_policy_t restart_policy = sfcli::restart_policy_t::resume_k;
-    /** Both the coordinate slot stride and the `max_atoms` written into the provenance metadata. */
     std::uint32_t max_atoms = sfapi::max_atoms_per_molecule_k;
 };
 
@@ -159,12 +156,9 @@ inline float half_bits_to_float_(std::uint16_t bits) {
 
 #pragma region Shard Reading
 
-/**
- *  @brief A single input 3D shard read into typed columns.
- *
- *  `CombineChunks` leaves every column one contiguous array, so per-row access is a plain index. The bound
- *  pointers and the SMILES views are into `table`'s own buffers, so the table must outlive them.
- */
+/** A single input 3D shard read into typed columns. `CombineChunks` leaves every column one contiguous array,
+ *  so per-row access is a plain index. The bound pointers and the SMILES views are into `table`'s own buffers,
+ *  so the table must outlive them. */
 struct input_shard_t {
     std::shared_ptr<arrow::Table> table;
     arrow::StringArray const *input_shard = nullptr;
@@ -256,12 +250,9 @@ enum class shard_listing_t {
     empty_k,
 };
 
-/**
- *  @brief Collect every `*.3D.parquet` in @p directory into a cleared @p out, sorted lexicographically.
- *
- *  Here a `*.3D.parquet` is an @b input, the opposite of `smallfield_batch` where the same name marks an
- *  output. A refusal is returned rather than thrown, so a misspelled folder reaches the exit code.
- */
+/** Collect every `*.3D.parquet` in @p directory into a cleared @p out, sorted lexicographically. Here a
+ *  `*.3D.parquet` is an @b input, the opposite of `smallfield_batch` where the same name marks an output. A
+ *  refusal is returned rather than thrown, so a misspelled folder reaches the exit code. */
 shard_listing_t fill_shard_paths_into_(fs::path const &directory, std::vector<fs::path> &out) {
     out.clear();
     std::error_code error;
@@ -291,35 +282,31 @@ char const *describe_shard_listing_(shard_listing_t status) {
 
 #pragma region Reembed Store
 
-/** One conformer row copied verbatim from a `--reembed` shard. */
+/** One conformer row copied verbatim from a `--reembed` shard. `coordinate_bits` is tight interleaved
+ *  `(num_atoms, 3)` fp16 bit patterns, empty when the row carried no geometry. */
 struct reembed_conformer_t {
     sft::conformer_status_t status = sft::conformer_status_t::success_k;
     float energy = 0.0f;
-    /** Tight interleaved `(num_atoms, 3)` fp16 bit patterns, empty when the row carried no geometry. */
     std::vector<std::uint16_t> coordinate_bits;
     std::array<double, sfcli::usrcat_components_k> usrcat {};
 };
 
-/** One molecule copied verbatim from a `--reembed` shard, with its already-corrected geometry. */
+/** One molecule copied verbatim from a `--reembed` shard, with its already-corrected geometry. `num_conformers`
+ *  is K as the source shard recorded it, not what its rows carried; `shape_described` is downgraded by the first
+ *  success row whose source carried no descriptor, so its zeros stay unpublished. */
 struct reembed_molecule_t {
     std::uint8_t num_atoms = 0;
     std::uint16_t num_heavy_atoms = 0;
     std::uint16_t num_bonds = 0;
     float molecular_weight = 0.0f;
-    /** K as the source shard recorded it, which is not the same fact as the rows actually carried. */
     std::uint8_t num_conformers = 0;
-    /** Downgraded by the first success row whose source carried no descriptor, so its zeros stay unpublished. */
     sfcli::shape_described_t shape_described = sfcli::shape_described_t::described_k;
     std::string smiles;
     std::vector<reembed_conformer_t> conformers;
 };
 
-/**
- *  @brief Every molecule a `--reembed` run corrected, keyed by `(input_shard, input_row)`.
- *
- *  Every output shard's slot stride has to cover the widest reembed molecule, so that width is derived
- *  once as the map is filled rather than by re-walking the map per shard.
- */
+/** Every molecule a `--reembed` run corrected, keyed by `(input_shard, input_row)`. Every output shard's slot
+ *  stride must cover the widest reembed molecule, so that width is derived as the map fills. */
 struct reembed_store_t {
     std::unordered_map<std::string, reembed_molecule_t> molecules;
     std::uint32_t widest_molecule_conformers = 0;
@@ -341,8 +328,7 @@ inline void fill_reembed_key_into_(std::string_view input_shard, std::uint64_t i
  *  @brief Copy one reembed shard's molecules into @p store, keyed by `(input_shard, input_row)`.
  *
  *  @param[in] max_atoms Coordinate stride of an output slot. A molecule claiming more atoms than this is
- *      carried with its geometry dropped, because narrowing the count would describe another molecule's
- *      atoms.
+ *      carried with its geometry dropped, because narrowing the count would describe another molecule's atoms.
  */
 void load_reembed_shard_(input_shard_t const &shard, std::uint32_t max_atoms, reembed_store_t &store) {
     arrow::HalfFloatArray const &coords_values = *shard.coords_values;
@@ -394,8 +380,7 @@ void load_reembed_shard_(input_shard_t const &shard, std::uint32_t max_atoms, re
                 row_described = sfcli::shape_described_t::described_k;
             }
         }
-        // The writer nulls `usrcat` on the molecule axis, so one success row copied from a source that held
-        // no descriptor for it leaves the whole molecule undescribed rather than publishing its zeros.
+        // The writer nulls `usrcat` per molecule, so one success row without a descriptor undescribes the whole.
         if (conformer.status == sft::conformer_status_t::success_k &&
             row_described == sfcli::shape_described_t::undescribed_k)
             molecule.shape_described = sfcli::shape_described_t::undescribed_k;
@@ -434,9 +419,9 @@ shard_listing_t fill_reembed_store_(fs::path const &reembed_dir, std::uint32_t m
 
 #pragma region Shard Augmentation
 
-/** Per-shard counters folded into the progress log. */
+/** Per-shard counters folded into the progress log. `molecules_undescribed` counts molecules that ship
+ *  coordinates and no shape fingerprint, which is a hole in a similarity index. */
 struct shard_stats_t {
-    /** Molecules that ship coordinates and no shape fingerprint, which is a hole in a similarity index. */
     std::atomic<std::uint64_t> molecules_undescribed {0};
     std::atomic<std::uint64_t> fragments_separated {0};
 };
@@ -447,12 +432,10 @@ void grow_if_needed_(std::vector<element_type_> &buffer, std::size_t count) {
     if (buffer.size() < count) buffer.resize(count);
 }
 
-/**
- *  @brief Every array one shard's augmentation writes, owned by the shard walk and reused across shards.
- *
- *  The slot arrays mirror the layout the GPU producer hands to `write_shard`, so `write_shard` cannot tell
- *  the two producers apart.
- */
+/** Every array one shard's augmentation writes, owned by the shard walk and reused across shards. The slot
+ *  arrays mirror the layout the GPU producer hands to `write_shard`, so it cannot tell the two producers apart.
+ *  `molecule_row_offsets` holds `num_molecules + 1` bucket bounds into `molecule_rows`, which is every row of
+ *  the shard grouped by molecule and in file order within one. */
 struct shard_buffers_t {
     std::vector<__half> coordinates;
     std::vector<float> energies;
@@ -467,17 +450,11 @@ struct shard_buffers_t {
     std::vector<std::uint8_t> num_conformers_per_molecule;
     std::vector<sfcli::shape_described_t> shape_described;
 
-    /** `num_molecules + 1` bucket bounds into `molecule_rows`. */
     std::vector<std::uint64_t> molecule_row_offsets;
-    /** Every row of the shard, grouped by molecule and in file order within a molecule. */
     std::vector<std::int64_t> molecule_rows;
 
-    /**
-     *  @brief Grow to fit one shard and put the used prefix back into its start-of-shard state.
-     *
-     *  Every element the writer can read is rewritten here, because a stale `smiles` view would otherwise
-     *  point into the previous shard's released Arrow table.
-     */
+    /** Grow to fit one shard and put the used prefix back into its start-of-shard state. Every readable element
+     *  is rewritten: a stale `smiles` view would point into the previous shard's table. */
     void reset_for(std::uint64_t num_molecules, sfapi::conformer_slot_layout_t const &layout) {
         std::size_t const total_slots = static_cast<std::size_t>(num_molecules) * layout.num_conformers;
         std::size_t const coordinate_total = total_slots * layout.slot_stride();
@@ -496,8 +473,7 @@ struct shard_buffers_t {
         reset_(num_bonds_per_molecule, num_molecules, std::uint16_t {0});
         reset_(molecular_weight_per_molecule, num_molecules, 0.0f);
         reset_(num_conformers_per_molecule, num_molecules, std::uint8_t {0});
-        // Same reason as the status fill above: a molecule no branch of the walk claims must not publish the
-        // zero-filled `usrcat` block its slots hold.
+        // Same reason as the status fill: an unclaimed molecule must not publish the zero-filled `usrcat` it holds.
         reset_(shape_described, num_molecules, sfcli::shape_described_t::undescribed_k);
     }
 
@@ -515,18 +491,13 @@ struct molecule_grouping_t {
     std::uint32_t widest_conformers = 1;
     /** Molecules inside the `input_row` span owning no row, which is the gap a contiguous shard never has. */
     std::uint64_t unclaimed_molecules = 0;
-    /** `input_row` of the first such molecule, so a diagnostic points at the hole rather than counting it;
-     *  meaningless while `unclaimed_molecules` is zero. */
+    /** `input_row` of the first such molecule, so a diagnostic points at the hole; meaningless when none. */
     std::uint64_t first_unclaimed_row = 0;
 };
 
-/**
- *  @brief Bucket the shard's rows by molecule into @p buffers, keeping file order inside each bucket.
- *
- *  File order is `conformer_index` order within a molecule, which is what makes slot `conformer_slot` of
- *  the output the same conformer the input row described. The histogram this walks is also the only place
- *  a gap in `input_row` is visible, so the unclaimed molecules are counted in the same pass.
- */
+/** Bucket the shard's rows by molecule into @p buffers, keeping file order inside each bucket. File order is
+ *  `conformer_index` order within a molecule, so output slot `conformer_slot` is the conformer the input row
+ *  described. The histogram is also where a gap in `input_row` shows, so it counts them too. */
 molecule_grouping_t group_rows_by_molecule_(input_shard_t const &shard, std::uint64_t base_row,
                                             std::uint64_t num_molecules, shard_buffers_t &buffers) {
     std::vector<std::uint64_t> &offsets = buffers.molecule_row_offsets;
@@ -547,8 +518,7 @@ molecule_grouping_t group_rows_by_molecule_(input_shard_t const &shard, std::uin
         offsets[molecule + 1] += offsets[molecule];
     }
 
-    // Scatter with `offsets[molecule]` as the cursor, which leaves every entry holding the end of its own
-    // bucket; shifting the array right by one restores the bounds `rows_of` reads.
+    // Scatter with `offsets[molecule]` as cursor, leaving each entry at its bucket end; a right shift restores it.
     for (std::int64_t row = 0; row < shard.num_rows; ++row)
         buffers.molecule_rows[offsets[shard.input_row->Value(row) - base_row]++] = row;
     for (std::uint64_t molecule = num_molecules; molecule > 0; --molecule) offsets[molecule] = offsets[molecule - 1];
@@ -569,13 +539,9 @@ struct molecule_span_t {
     std::uint64_t first_row = 0;
     std::uint64_t last_row = 0;
 
-    /**
-     *  @brief Whether the range names more molecules than @p num_rows rows can each claim one of.
-     *
-     *  Every molecule of a contiguous shard owns at least one row, so a wider range already carries a
-     *  hole. Written as a comparison of the two ends rather than of `num_molecules`, because the count
-     *  is what overflows on a range spanning the whole of `std::uint64_t`.
-     */
+    /** Whether the range names more molecules than @p num_rows rows can each claim one of. Every molecule of a
+     *  contiguous shard owns at least one row, so a wider range already carries a hole. Compares the two ends
+     *  rather than `num_molecules`, whose count overflows on a full-`uint64_t` range. */
     [[nodiscard]] bool spans_more_molecules_than(std::uint64_t num_rows) const noexcept {
         return last_row - first_row >= num_rows;
     }
@@ -584,12 +550,8 @@ struct molecule_span_t {
     [[nodiscard]] std::uint64_t num_molecules() const noexcept { return last_row - first_row + 1; }
 };
 
-/**
- *  @brief The `input_row` range the shard's rows cover.
- *
- *  Only the ends are read here. Whether the range is genuinely contiguous is what
- *  `molecule_grouping_t::unclaimed_molecules` answers, because only the bucket histogram can see a hole.
- */
+/** The `input_row` range the shard's rows cover. Only the ends are read;
+ *  `molecule_grouping_t::unclaimed_molecules` answers contiguity, seeing the holes. */
 molecule_span_t molecule_span_of_(input_shard_t const &shard) {
     std::uint64_t first_row = shard.input_row->Value(0);
     std::uint64_t last_row = first_row;
@@ -601,11 +563,8 @@ molecule_span_t molecule_span_of_(input_shard_t const &shard) {
     return {.first_row = first_row, .last_row = last_row};
 }
 
-/**
- *  @brief Copy one already-corrected `--reembed` molecule into its slots, verbatim.
- *
- *  Nothing here is recomputed, so a corrected molecule survives the augmentation unchanged.
- */
+/** Copy one already-corrected `--reembed` molecule into its slots, verbatim. Nothing here is recomputed, so a
+ *  corrected molecule survives the augmentation unchanged. */
 void copy_reembed_molecule_into_(reembed_molecule_t const &molecule, std::uint64_t molecule_index,
                                  sfapi::conformer_slot_layout_t const &layout, shard_buffers_t &buffers) {
     // A view into the reembed store's storage, which outlives every shard.
@@ -629,8 +588,7 @@ void copy_reembed_molecule_into_(reembed_molecule_t const &molecule, std::uint64
         // The row's own geometry is shorter than the atom count it claims, so it cannot fill the slot.
         if (conformer.coordinate_bits.size() < static_cast<std::size_t>(num_atoms) * 3u) continue;
 
-        // `coordinate_bits` holds Arrow's float16 patterns, which is the pool's own storage, so naming them
-        // `__half` keeps the transposition a verbatim copy rather than a conversion of the bit pattern.
+        // `coordinate_bits` holds Arrow float16 patterns, so naming them `__half` keeps the transposition verbatim.
         auto const *coordinate_halves = reinterpret_cast<__half const *>(conformer.coordinate_bits.data());
         sfapi::scatter_interleaved_into_slot(
             coordinate_halves, layout, num_atoms,
@@ -680,13 +638,9 @@ molecule_geometry_t copy_molecule_scalars_into_(input_shard_t const &shard, std:
     return stored_atoms == 0 ? molecule_geometry_t::preprocess_failed_k : molecule_geometry_t::wider_than_stride_k;
 }
 
-/**
- *  @brief Copy every stored row's status and energy into its conformer slot.
- *
- *  This runs for every molecule, geometry or not, because the stored status is the only record of why a
- *  molecule was refused and a slot left at `reset_for`'s fill would publish the fill instead — a molecule
- *  turned away at the SMILES parser reported as one whose force field did not converge.
- */
+/** Copy every stored row's status and energy into its conformer slot. Runs for every molecule, geometry or not:
+ *  the stored status is the only record of why one was refused, and a slot left at `reset_for`'s fill would
+ *  report a parser refusal as an unconverged force field. */
 void copy_row_outcomes_into_(input_shard_t const &shard, custd::span<std::int64_t const> rows,
                              std::uint64_t molecule_index, molecule_geometry_t geometry,
                              sfapi::conformer_slot_layout_t const &layout, shard_buffers_t &buffers) {
@@ -695,9 +649,8 @@ void copy_row_outcomes_into_(input_shard_t const &shard, custd::span<std::int64_
         std::int64_t const row = rows[conformer_slot];
         std::size_t const flat = layout.flat_slot(molecule_index, static_cast<std::uint32_t>(conformer_slot));
         auto const stored = static_cast<sft::conformer_status_t>(shard.status->Value(row));
-        // A success this run has no slot wide enough to carry is restated as the refusal it is, so it is not
-        // published as a success with an empty coordinate list. Every other stored value already is the
-        // truest thing known about the row.
+        // A success this run has no slot wide enough to carry is restated as the refusal it is, not published
+        // as a success with an empty coordinate list; every other stored value is already the truest known.
         buffers.status[flat] = geometry == molecule_geometry_t::wider_than_stride_k &&
                                        stored == sft::conformer_status_t::success_k
                                    ? sft::conformer_status_t::too_many_atoms_k
@@ -726,22 +679,19 @@ std::size_t read_row_coordinates_into_(input_shard_t const &shard, std::int64_t 
 /**
  *  @brief Lay one molecule's stored conformers into its slots and compute their descriptors.
  *
- *  The status each slot carries is already there, from `copy_row_outcomes_into_`, and is what decides which
- *  slots get geometry. The loop runs to completion deliberately, even past a failed row: a `break` would
- *  leave the later slots holding no coordinates. Where the reparsed atom order cannot be trusted the
- *  coordinates are still preserved and only the descriptors stay unwritten.
+ *  The status each slot carries is already there from `copy_row_outcomes_into_`, and decides which slots get
+ *  geometry. The loop deliberately runs past a failed row — a `break` would leave later slots without
+ *  coordinates — and where the reparsed atom order cannot be trusted, coordinates survive and descriptors do not.
  *
- *  @return `undescribed_k` where any success slot was left without a computed descriptor, because the writer
- *      nulls `usrcat` on the molecule axis and a published zero block reads as a measurement. A molecule
- *      whose every row failed keeps `described_k`: no row of it publishes a descriptor either way.
+ *  @return `undescribed_k` where any success slot lacks a descriptor, since the writer nulls `usrcat` per
+ *      molecule and a zero block reads as a measurement; an all-failed molecule keeps `described_k` regardless.
  */
 sfcli::shape_described_t augment_molecule_(input_shard_t const &shard, custd::span<std::int64_t const> rows,
                                            std::uint64_t molecule_index, std::uint32_t num_atoms,
                                            sfpost::molecule_shape_context_t const &context,
                                            sfpost::shape_typing_t typing, sfapi::conformer_slot_layout_t const &layout,
                                            shard_buffers_t &buffers, shard_stats_t &stats) {
-    // Left uninitialized: a row that fills fewer than `3 * num_atoms` components is skipped below, so nothing
-    // past what `read_row_coordinates_into_` wrote is ever read.
+    // Left uninitialized: a row short of `3 * num_atoms` is skipped, so nothing past what was written is read.
     std::array<float, sfapi::max_atoms_per_molecule_k * 3u> interleaved;
     sfcli::shape_described_t described = sfcli::shape_described_t::described_k;
     std::size_t const num_slots = std::min<std::size_t>(rows.size(), layout.num_conformers);
@@ -755,8 +705,7 @@ sfcli::shape_described_t augment_molecule_(input_shard_t const &shard, custd::sp
             continue;
         }
 
-        // A row holding fewer components than its atom count claims cannot fill the slot, and copying the
-        // prefix would leave the previous conformer's coordinates in the tail of the shared scratch.
+        // A row short of its claimed atom count cannot fill the slot; a prefix copy would leave stale scratch.
         std::size_t const wanted = static_cast<std::size_t>(num_atoms) * 3u;
         if (read_row_coordinates_into_(shard, row, num_atoms, interleaved) < wanted) {
             described = sfcli::shape_described_t::undescribed_k;
@@ -764,8 +713,7 @@ sfcli::shape_described_t augment_molecule_(input_shard_t const &shard, custd::sp
         }
         custd::span<float> const coordinates {interleaved.data(), wanted};
 
-        // Separating disconnected components needs the context's per-atom labels, so it is skipped along
-        // with the descriptors on every typing the reparse could not be trusted for.
+        // Separating components needs the context's per-atom labels, so an untrusted reparse skips it too.
         if (typing == sfpost::shape_typing_t::typed_k && context.num_components > 1) {
             sfpost::separate_fragments(coordinates, context);
             stats.fragments_separated.fetch_add(1, std::memory_order_relaxed);
@@ -787,12 +735,8 @@ sfcli::shape_described_t augment_molecule_(input_shard_t const &shard, custd::sp
     return described;
 }
 
-/**
- *  @brief Hand the reconstructed slot layout to the producer's own writer.
- *
- *  Each span carries the extent this shard filled, which is below the buffers' own size whenever an
- *  earlier shard was the wider one.
- */
+/** Hand the reconstructed slot layout to the producer's own writer. Each span carries the extent this shard
+ *  filled, below the buffers' own size whenever an earlier shard was wider. */
 sfcli::writer_inputs_t shard_writer_inputs_(input_shard_t const &shard, cli_config_t const &config,
                                             molecule_span_t const &span, sfapi::conformer_slot_layout_t const &layout,
                                             shard_buffers_t const &buffers) {
@@ -820,26 +764,22 @@ sfcli::writer_inputs_t shard_writer_inputs_(input_shard_t const &shard, cli_conf
 /**
  *  @brief Augment one input shard and write the canonical output shard.
  *
- *  Every molecule's rows are laid into conformer slots exactly as the GPU producer would lay them, so it is
- *  `sfcli::write_shard` that energy-sorts, ranks `conformer_index`, nulls the failures and packs the
- *  descriptors — which is what makes the output bytes identical to the producer's. A molecule found in
- *  @p reembed is copied verbatim from there instead of being described again.
+ *  Every molecule's rows are laid into conformer slots exactly as the GPU producer would, so `sfcli::write_shard`
+ *  energy-sorts, ranks `conformer_index`, nulls failures and packs descriptors — which is what makes the output
+ *  bytes identical to the producer's. A molecule found in @p reembed is copied verbatim instead.
  *
  *  @param[inout] buffers Grown and reset in place; owned by the shard walk.
  */
 augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config, reembed_store_t const &reembed,
                          shard_buffers_t &buffers, fs::path const &input_path, fs::path const &output_path,
                          logger_t const &logger, shard_stats_t &stats) {
-    // The producer emits a zero-row shard for an input file that carried no rows, and the only completeness
-    // signal downstream is the sentinel — so this shard owes a zero-row output of its own or it is offered
-    // again on every pass, forever. It is written here rather than through the walk below because neither
-    // `molecule_span_of_`, which reads row zero, nor `num_molecules`, which counts the ends inclusively,
-    // means anything over no rows.
+    // The sentinel is the only completeness signal downstream, so a zero-row input owes a zero-row output or it
+    // is offered again forever. Written here rather than through the walk because neither `molecule_span_of_`,
+    // which reads row zero, nor `num_molecules`, which counts the ends inclusively, means anything over no rows.
     if (shard.num_rows == 0) {
         logger.info("{} holds no rows — sealing a zero-row output shard", input_path.string());
-        // K is the shard's own property and no row of an empty one carries it, so the metadata the producer
-        // recorded is carried across rather than replaced by a number this run made up — a consumer sizing a
-        // slot stride from the corpus's first shard would otherwise read the wrong one off an empty shard.
+        // K is the shard's own property and no row of an empty one carries it, so the producer's recorded
+        // metadata carries across — else a consumer sizing a stride from the corpus's first shard reads wrong.
         std::uint32_t num_conformers = std::max(reembed.widest_molecule_conformers, 1u);
         if (auto const metadata = shard.table->schema()->metadata(); metadata) {
             std::string const declared = metadata->Get("num_conformers").ValueOr("");
@@ -863,9 +803,8 @@ augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config,
 
     molecule_span_t const span = molecule_span_of_(shard);
 
-    // The histogram below is sized by this range and indexed by it, so a range no set of rows could have
-    // produced has to be refused before the sizing rather than after it. The same hole the check further
-    // down names, seen one pass earlier and without an allocation it cannot survive.
+    // The histogram below is sized and indexed by this range, so a range no set of rows could produce must be
+    // refused before the sizing — the same hole the check below names, a pass earlier and without the alloc.
     if (span.spans_more_molecules_than(static_cast<std::uint64_t>(shard.num_rows))) {
         logger.error("shard {} is gapped over input_row {}..{}, skipping — that range names more molecules " //
                      "than its {} rows can each claim one of",                                               //
@@ -877,8 +816,7 @@ augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config,
     std::uint64_t const num_molecules = span.num_molecules();
     molecule_grouping_t const grouping = group_rows_by_molecule_(shard, span.first_row, num_molecules, buffers);
 
-    // A molecule with no rows would be written out as an all-null row carrying an `input_row` the input
-    // shard never held, so a hole is refused rather than filled.
+    // A rowless molecule would emit an all-null row at an `input_row` the shard never held, so holes are refused.
     if (grouping.unclaimed_molecules > 0) {
         logger.error("shard {} is gapped over input_row {}..{}, skipping — {} of {} molecules own no row, " //
                      "the first at input_row {}",                                                           //
@@ -888,15 +826,13 @@ augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config,
         return augment_t::gapped_input_k;
     }
 
-    // The slot stride K must cover the widest molecule, original or reembed, and match the producer's
-    // `num_conformers` provenance value. Reembed molecules can only add rows.
+    // K covers the widest molecule, original or reembed — reembed only adds rows — matching `num_conformers`.
     sfapi::conformer_slot_layout_t const layout {
         config.max_atoms, std::max(grouping.widest_conformers, reembed.widest_molecule_conformers)};
     buffers.reset_for(num_molecules, layout);
 
-    // `private` hands each thread its own key buffer and its own typing context, both of which keep their
-    // capacity across the molecules that thread walks; declaring either inside the body would allocate and
-    // free once per molecule — six heap blocks between them.
+    // `private` gives each thread its own key buffer and typing context, both keeping capacity across that
+    // thread's molecules; declaring either in the body would allocate and free six heap blocks per molecule.
     std::string reembed_key;
     sfpost::molecule_shape_context_t context;
 
@@ -917,12 +853,10 @@ augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config,
         molecule_geometry_t const geometry = copy_molecule_scalars_into_(shard, first_row, molecule_index,
                                                                          config.max_atoms, buffers);
         copy_row_outcomes_into_(shard, rows, molecule_index, geometry, layout, buffers);
-        // A molecule this run cannot describe carries the refusal just written and nothing else: there are no
-        // coordinates to lay out, and no atom order for a reparse to agree with.
+        // A molecule this run cannot describe carries only the refusal: no coordinates, no atom order to match.
         if (geometry != molecule_geometry_t::describable_k) continue;
 
-        // Typed once, under the same parse contract the producer uses. Every refusal names a way the reparse
-        // failed to reproduce the atom order the stored coordinates were written in.
+        // Typed once under the producer's parse contract; a refusal names a way the reparse lost the atom order.
         std::uint8_t const num_atoms = buffers.num_atoms_per_molecule[molecule_index];
         sfpost::shape_typing_t const typing = sfpost::build_shape_context_into(
             buffers.smiles[molecule_index], num_atoms, smallfield::keep_largest_fragment_k, context);
@@ -979,8 +913,7 @@ void process_shard_(fs::path const &input_path, cli_config_t const &config, reem
     case augment_t::write_failed_k: ++tally.failed; return;
     }
 
-    // A shard written and not sealed is offered again by every later run, so an unsealed one is a failure
-    // however durable its parquet is; `write_encoded_sentinel` already named which half of the write stopped.
+    // An unsealed shard is re-offered forever, so it fails however durable its parquet; the writer already logged.
     if (sfcli::write_encoded_sentinel(output_path, &logger) != sfcli::sentinel_write_t::sealed_k) {
         ++tally.failed;
         return;
@@ -1003,11 +936,8 @@ void process_shard_(fs::path const &input_path, cli_config_t const &config, reem
                 fmt::group_digits(undescribed), fmt::group_digits(separated));
 }
 
-/**
- *  @brief Walk @p inputs in order, augmenting each shard into `--output`.
- *
- *  A stop signal is honoured between shards, where the last output and its sentinel agree.
- */
+/** Walk @p inputs in order, augmenting each shard into `--output`. A stop signal is honoured between shards,
+ *  where the last output and its sentinel agree. */
 void augment_shards_(custd::span<fs::path const> inputs, cli_config_t const &config, reembed_store_t const &reembed,
                      logger_t const &logger, run_tally_t &tally) {
     shard_buffers_t buffers;

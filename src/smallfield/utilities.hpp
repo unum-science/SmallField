@@ -2,27 +2,17 @@
  *  @file src/smallfield/utilities.hpp
  *  @brief Type-generic helpers shared by more than one SmallField subsystem.
  *
- *  Admission rule, applied to every candidate before it lands here. A helper belongs in this header only
- *  when all three hold:
- *   - it is generic over its operand type rather than tied to one struct or one table layout,
- *   - it needs no `#include` at all — this file has none, and that is the property being maintained rather
- *     than an accident of what has landed so far,
- *   - it has two or more `src/` subsystems as consumers; `cli/` and `bench/` are tooling, not subsystems.
- *  A helper failing any of the three belongs to the subsystem that owns it, where its name sits next to
- *  the data it serves. `lower_bound_` in `parameters/mmff94_tables.hpp` is the worked example: generic and
- *  standalone, but read by that one header, so it stays there. Without the rule a file named "utilities"
- *  becomes the junk drawer every subsystem reaches into and nobody prunes.
+ *  A helper lands here only if it is generic over its operand type, needs no `#include`, and is read by
+ *  two or more `src/` subsystems; anything else belongs to the subsystem that owns it.
  *
- *  @b Why the second clause is stricter than "standard headers only". `cuda/etkdg_pipeline.cuh`,
- *  `cuda/warp_primitives.cuh` and `mmff94/mmff94_extract_device.cuh` all pull this header in, so every
- *  include here reaches three translation units `nvcc` compiles. A host-only standard header such as
- *  `<charconv>` costs all three of them to serve a helper no kernel can call — which is why the
- *  command-line number parser lives in `number_parse.hpp` at the root instead of here.
+ *  The empty include list is the property being maintained, not an accident. `cuda/etkdg_pipeline.cuh`,
+ *  `cuda/warp_primitives.cuh` and `mmff94/mmff94_extract_device.cuh` all pull this header in, so one
+ *  include here costs three translation units `nvcc` compiles — which is why the command-line number
+ *  parser lives in `number_parse.hpp` rather than here.
  *
- *  Neither helper is marked `__host__ __device__`. `parameters/mmff94_tables.hpp` pulls this header in and
- *  is compiled as plain C++ by `test/parameters/test_mmff94_tables.cpp` and `test/mmff94/test_mmff_typer.cpp`,
- *  where a CUDA attribute is not a keyword g++ knows. Device code reaches both helpers as `constexpr`
- *  through `--expt-relaxed-constexpr`, the same route the `lookup_*` cascades take.
+ *  Neither helper is marked `__host__ __device__`, because `parameters/mmff94_tables.hpp` pulls this
+ *  header into translation units compiled as plain C++, where a CUDA attribute is not a keyword. Device
+ *  code reaches both as `constexpr` through `--expt-relaxed-constexpr`.
  */
 
 #pragma once

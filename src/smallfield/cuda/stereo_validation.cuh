@@ -2,14 +2,11 @@
  *  @file src/smallfield/cuda/stereo_validation.cuh
  *  @brief Re-read a conformer's stereochemistry out of the coordinates that will actually ship.
  *
- *  `mmff_polish_warp_kernel` rewrites every coordinate after `etkdg_pipeline_warp_kernel` has already
- *  stamped its verdict, and carries no stereochemistry term of its own, so a centre or bond it inverts
- *  leaves no trace anywhere — not in the status byte, not in any counter. This is the only stage that
- *  looks at the geometry the writer will pack.
- *
- *  Separate from `etkdg_pipeline.cuh` because it reads `molecule_descriptor_t`, whose header pulls in
- *  RDKit: the replay bench consumes the pipeline header and deliberately links no RDKit, so the two
- *  cannot share one file.
+ *  `mmff_polish_warp_kernel` rewrites every coordinate after `etkdg_pipeline_warp_kernel` stamped its verdict
+ *  and carries no stereochemistry term of its own, so a centre or bond it inverts leaves no trace in the status
+ *  byte or any counter; this is the only stage that looks at the geometry the writer will pack. It cannot live
+ *  in `etkdg_pipeline.cuh` because it reads `molecule_descriptor_t`, whose header pulls in RDKit, while the
+ *  replay bench consumes the pipeline header and deliberately links none.
  */
 
 #pragma once
@@ -31,31 +28,25 @@ using smallfield::types::etkdg_molecule_metadata_t;
 using smallfield::types::molecule_descriptor_t;
 
 /**
- *  Smallest `|cos phi|` across a declared double bond before its sense is read at all.
- *  A bond twisted near ninety degrees carries no cis-or-trans answer to compare against, and calling
- *  one wrong would refuse a geometry for being undecided rather than for being incorrect. At 0.5 the
- *  band is sixty degrees either side of planar, which is where 90 % of declared bonds land.
+ *  Smallest `|cos phi|` across a declared double bond before its sense is read at all. Twisted near ninety
+ *  degrees a bond carries no cis-or-trans answer, and calling it wrong would refuse a geometry for being
+ *  undecided rather than incorrect. At 0.5 the band is ±60° from planar, where 90 % of declared bonds land.
  */
 constexpr float bond_stereo_planarity_floor_k = 0.5f;
 
 /**
  *  @brief Count the declared centers a re-perception of the shipped geometry will read the other way.
  *
- *  A tetrahedral center carries two signed volumes over the same three neighbors, and the pipeline
- *  and its consumer read different ones. `count_invalid_chiral_centers_` takes the triple product
- *  from the @b fourth neighbor, which is RDKit's `DistGeom::ChiralSet` expression and the quantity
- *  the embedding restrains. RDKit's `assignChiralTypesFrom3D` takes it from the @b center atom and
- *  never reads the fourth neighbor at all. The two agree for any center whose atom lies on the same
- *  side of its first three neighbors' plane as the fourth, which is every ordinary tetrahedron, and
- *  disagree once it does not.
+ *  A tetrahedral center carries two signed volumes over the same three neighbors, and the pipeline and its
+ *  consumer read different ones: `count_invalid_chiral_centers_` takes the triple product from the @b fourth
+ *  neighbor — RDKit's `DistGeom::ChiralSet` expression, the quantity the embedding restrains — while
+ *  `assignChiralTypesFrom3D` takes it from the @b center atom and never reads the fourth. They agree wherever
+ *  the center lies on the same side of its neighbors' plane as the fourth, every ordinary tetrahedron.
  *
- *  Both are taken here, because only one of them is the embedding's. The pivot-based volume has to be
- *  handed correctly and clear the flatness floor, which is the question the embedding gate asked; the
- *  center-based one has to agree with it, which is the question the consumer will ask. The MMFF polish
- *  restrains both, so this stage is the audit of that rather than the stage that discovers the gap:
- *  over a 100,000-molecule Enamine REAL slice at K=3 it refuses no center at all, against 1.586 % of
- *  molecules when only the pivot-based volume was restrained. A three-coordinate center stores itself
- *  as its own fourth neighbor, so the two expressions coincide there and the second test is free.
+ *  Both are taken: the pivot-based volume must be handed correctly and clear the flatness floor, which the
+ *  embedding gate asks, and the center-based one must agree, which the consumer asks. The MMFF polish
+ *  restrains both, so this stage audits rather than discovers the gap — `BENCH.md`, _Restraining Only One Of
+ *  The Two Volumes_. A three-coordinate center is its own fourth neighbor, so there the second test is free.
  *
  *  Centers are spread across the warp, so the count is warp-reduced and every lane returns it.
  *
@@ -92,12 +83,10 @@ __device__ __forceinline__ std::uint32_t count_unreadable_chiral_centers_(
 /**
  *  @brief Count the declared double bonds whose geometry contradicts their flag.
  *
- *  The center walk above is blind to these: it walks tetrahedral centers, and no chiral descriptor is
- *  ever emitted for a double bond, so `stereo_failure_k` was unreachable for one.
- *
- *  The flag states the relationship of the two @b recorded reference substituents, one per end, so the
- *  test is the sign of `cos phi` over (reference, end, end, reference) — positive is cis, which is what
- *  the Z flag asserts. Bonds are spread across the warp and the count is warp-reduced.
+ *  No chiral descriptor is ever emitted for a double bond, so nothing else in the pipeline can refuse one.
+ *  The flag relates the two @b recorded reference substituents, one per end, so the test is the sign of
+ *  `cos phi` over (reference, end, end, reference) — positive is cis, which the Z flag asserts. Bonds are
+ *  spread across the warp and the count is warp-reduced.
  *
  *  @param[in] positions SoA coordinate array.
  *  @param[in] stride Distance between coordinate planes, which need not be the atom count.
@@ -153,17 +142,15 @@ __device__ __forceinline__ std::uint32_t count_invalid_bond_stereo_(float const 
 /**
  *  @brief Re-read each conformer's stereochemistry out of the coordinates that will actually ship.
  *
- *  One warp per slot against the post-polish geometry, in single precision and before the
- *  half-precision narrowing. The predicates are not the pipeline kernel's: this stage asks what a
- *  re-perception of the shipped coordinates will say, which for a tetrahedral center is a different
- *  signed volume than the one the embedding constrains.
+ *  One warp per slot against the post-polish geometry, in single precision and before the half-precision
+ *  narrowing. The predicates are not the pipeline kernel's: this stage asks what a re-perception of the
+ *  shipped coordinates will say, which for a tetrahedral center is a different signed volume.
  *
- *  Only slots already holding `success_k` are read, and only those are demoted, so a more specific
- *  refusal keeps its own cause. The verdict names which kind of stereochemistry moved —
- *  `polish_inverted_center_k` or `polish_inverted_bond_k` — rather than the `stereo_failure_k` the
- *  pipeline kernel writes when the embedding could not satisfy a constraint to begin with. Both route
- *  to the CPU retry, which recovers them; the split is what separates a stage that cannot reach a
- *  geometry from a stage that walks out of one it had.
+ *  Only slots already holding `success_k` are read and demoted, so a more specific refusal keeps its cause.
+ *  The verdict names which stereochemistry moved — `polish_inverted_center_k` or `polish_inverted_bond_k` —
+ *  rather than the `stereo_failure_k` the pipeline writes when the embedding never satisfied a constraint at
+ *  all. Both route to the CPU retry, which recovers them; the split separates a stage that cannot reach a
+ *  geometry from one that walked out of the geometry it had.
  *
  *  Launched between the last polish and `stamp_refused_molecules_kernel`, so the stamp stays the last
  *  word and a molecule the metric prepass refused outright is not relabelled by this.
@@ -180,23 +167,19 @@ __global__ __launch_bounds__(32, 8) void validate_polished_stereo_kernel(
         std::uint32_t const molecule = slot / num_conformers_per_molecule;
         auto const &meta = molecule_metadata[molecule];
 
-        // The counter reads its second argument only as the dimension stride, so the slot's padded
-        // stride is what it wants rather than the molecule's own atom count.
+        // The counter uses its second argument as a plane stride, so the padded slot stride goes here.
         float const *const positions = conformer_coordinates + static_cast<std::size_t>(slot) * output_atoms_stride *
                                                                    types::conformer_dimensions_k;
         std::uint32_t invalid_centers = 0;
         if (meta.num_chiral_centers != 0)
             invalid_centers = count_unreadable_chiral_centers_(
                 positions, output_atoms_stride, chiral_centers + meta.chiral_offset, meta.num_chiral_centers, lane);
-        // No metadata field counts declared double bonds, so the bond walk is the membership test —
-        // it reads one flag byte per bond and leaves immediately on the ones carrying no E/Z.
+        // No metadata counts declared double bonds, so the walk is the test: one flag byte, out on non-E/Z.
         std::uint32_t const invalid_bonds = count_invalid_bond_stereo_(positions, output_atoms_stride,
                                                                        descriptors[molecule], lane);
-        // The two counts were summed here and the distinction died in the sum. They answer different
-        // questions — an inverted tetrahedral center and an inverted double bond have different causes
-        // and different fixes — and the shipped corpus was wrong in both at once, at rates nobody could
-        // separate. Naming them costs one branch on a value both counters already carry, and the split
-        // then rides the parquet `status` column and every histogram built on it.
+        // Counted apart rather than summed: an inverted center and an inverted bond have different causes
+        // and fixes, and a corpus can be wrong in both at rates a sum cannot separate. The split costs one
+        // branch and rides the parquet `status` column and every histogram built on it.
         if (lane == 0 && (invalid_centers != 0 || invalid_bonds != 0))
             conformer_status[slot] = static_cast<std::uint8_t>(invalid_centers != 0
                                                                    ? conformer_status_t::polish_inverted_center_k

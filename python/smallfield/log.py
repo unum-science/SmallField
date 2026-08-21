@@ -82,8 +82,7 @@ class Logger:
             self._emit(self.console, "trace2", message, *args)
 
 
-#: Module-level logger for one-shot scripts. Library code should
-#: construct a local ``Logger`` rather than reach for this.
+#: Module-level logger for one-shot scripts; library code constructs a local ``Logger`` instead.
 log = Logger()
 
 __all__ = ["Logger", "log", "thousands"]

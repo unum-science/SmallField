@@ -103,13 +103,25 @@ check_void_discards() {
 # previously-found eigenvectors" describes deflation state, not code history. Rephrase such a line
 # ("already-found") rather than widening the exception list: the alternative is a noun allowlist
 # that silently stops catching the real cases as vocabulary drifts.
+#
+# Prose sits somewhere different in each language, so the line filter does too. C++ keeps its
+# comment markers. Markdown is prose on every line, and drops backticked spans and quoted phrases
+# first so a document naming the banned words to ban them still commits. Python is prose on every
+# line as well but keeps its literals, because a docstring is a literal and stripping those would
+# leave nothing to read. `CHANGELOG.md` and `ROADMAP.md` are where history is supposed to live, so
+# the dispatch never reaches them.
 check_backward_references() {
-    local history
-    history=$(printf '%s\n' "$added" |
-        strip_literals |
-        grep -inE '(//|/\*|^\+[[:space:]]*\*).*\b(previously|used to (be|do|work)|no longer|formerly|was replaced|the (old|previous) (design|implementation|version|approach|chain|form)|prior attempt|Phase [0-9])\b' || true)
+    local history prose
+    case "$file" in
+    *.md) prose=$(printf '%s\n' "$added" | sed 's/`[^`]*`//g' | strip_literals) ;;
+    *.c | *.h | *.hpp | *.cpp | *.cc | *.cxx | *.cu | *.cuh)
+        prose=$(printf '%s\n' "$added" | strip_literals | grep -E '(//|/\*|^\+[[:space:]]*\*)' || true) ;;
+    *) prose=$(printf '%s\n' "$added" | sed 's/`[^`]*`//g') ;;
+    esac
+    history=$(printf '%s\n' "$prose" |
+        grep -inE '\b(previously|used to (be|do|work)|no longer|formerly|was replaced|the (old|previous) (design|implementation|version|approach|chain|form)|prior attempt|Phase [0-9])\b' || true)
     [ -z "$history" ] || fail "$history" \
-        "$file carries backward-looking prose in a comment - describe the present behavior;" \
+        "$file carries backward-looking prose - describe the present behavior;" \
         "            history lives in commit messages and ROADMAP.md:"
 }
 
@@ -721,6 +733,19 @@ check_markdown_asterisks() {
         "$file uses asterisk emphasis - bold is __like this__ and italic is _like this_:"
 }
 
+# Every sentence starts on its own line, so a diff stays per-sentence and rewording one sentence
+# does not rewrite the paragraph under it. Code spans and bold spans are dropped first, because a
+# term-then-definition bullet ends its lead-in with a period inside the bold and is one sentence.
+# Table rows and indented blocks are skipped: neither is prose.
+check_sentence_per_line() {
+    local packed
+    packed=$(printf '%s\n' "$added" | sed -e 's/`[^`]*`//g' -e 's/__[^_]*__//g' |
+        grep -vE '^\+[[:space:]]*\||^\+[[:space:]]{4,}' |
+        grep -E '[a-z0-9)]\.[[:space:]]+[A-Z]' || true)
+    [ -z "$packed" ] || fail "$packed" \
+        "$file packs several sentences onto one line - start each on its own:"
+}
+
 #pragma endregion Markdown
 
 # The staged list is computed once and read from a plain file by all three loops below. NUL
@@ -791,7 +816,14 @@ while IFS= read -r -d '' file; do
         ;;
     *.md)
         check_markdown_asterisks
+        check_sentence_per_line
         check_absolute_paths
+        # A changelog and a roadmap narrate history by definition, and the rule below names them as
+        # the place history belongs, so it cannot also police them.
+        case "$file" in
+        CHANGELOG.md | ROADMAP.md) ;;
+        *) check_backward_references ;;
+        esac
         ;;
     # An absolute path is wrong in a build file, a script or a config for the same reason it is wrong
     # in a source file, so this one rule reaches every text file the project ships.
@@ -802,6 +834,7 @@ while IFS= read -r -d '' file; do
     *.py | *.sh | *.toml | *.json | *.yml | *.yaml | *.cmake | CMakeLists.txt | */CMakeLists.txt)
         check_absolute_paths
         check_cuda_build_settings
+        check_backward_references
         ;;
     # The hooks are extensionless, so no glob above reaches them and they went unchecked by
     # themselves. A rule the enforcement breaks is a rule nobody believes.

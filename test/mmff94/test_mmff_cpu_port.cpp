@@ -2,14 +2,13 @@
  *  @file test/mmff94/test_mmff_cpu_port.cpp
  *  @brief Cross-validate the native MMFF CPU port against the existing RDKit-backed path.
  *
- *  Both native extractors are held to the same oracle: a cache-free baseline built from RDKit's own per-term
+ *  Both native extractors are held to one oracle: a cache-free baseline built from RDKit's own per-term
  *  `getMMFF*Params`. `extract_mmff94_params_native` takes atom types and charges from RDKit, while
- *  `extract_mmff94_params_fully_native` derives them itself with zero runtime RDKit. Both must produce
- *  byte-identical MMFF term arrays on a curated SMILES set; small numerical deltas ≤ 1e-3 are allowed on
- *  empirical-rule fallback terms due to float/double rounding in MMFF.V eqs 18-19 and the torsion rules, and on
- *  the fully-native partial charges, which sum bond-charge increments in `float` where RDKit sums in `double`.
- *  A term count that does not match fails outright; molecules whose terms differ only in value get the ppm
- *  budget of `max_molecule_value_mismatch_ppm_k`.
+ *  `extract_mmff94_params_fully_native` derives them with zero runtime RDKit, and both must produce byte-identical
+ *  MMFF term arrays on a curated SMILES set. Deltas ≤ 1e-3 are allowed on empirical-rule fallback terms, from
+ *  float/double rounding in MMFF.V eqs 18-19 and the torsion rules, and on the fully-native partial charges, which
+ *  sum bond-charge increments in `float` where RDKit sums in `double`. A term count that does not match fails
+ *  outright; terms differing only in value get the ppm budget of `max_molecule_value_mismatch_ppm_k`.
  */
 
 #include <cstdint> // `std::uint8_t`, `std::uint64_t`
@@ -53,26 +52,21 @@ static constexpr std::string_view test_name_k = "test_mmff_cpu_port";
 
 namespace smallfield::tests {
 
-/** How many failing molecules to describe before going silent. A cap of three turned a thirteen-molecule
- *  structural class into what read as a single stray molecule, so the default is generous; lower it locally
- *  when triaging one molecule. */
+/** Failing molecules described before going silent. A cap of three made a thirteen-molecule structural class read
+ *  as one stray molecule, so the default is generous; lower it locally when triaging one. */
 static int constexpr max_reported_failing_molecules_k = 32;
 
 /** Ceiling on molecules whose native terms differ in value from the RDKit oracle, in parts per million.
  *  Structural differences — a term count that does not match — are never tolerated. */
 static double constexpr max_molecule_value_mismatch_ppm_k = 100.0;
 
-/** Atom ceiling this comparison holds itself to, below `types::max_atoms_per_molecule_k`; a larger
- *  molecule is skipped rather than compared. */
+/** Atom ceiling this comparison holds itself to, below `types::max_atoms_per_molecule_k`; a larger molecule is
+ *  skipped rather than compared. */
 static std::uint32_t constexpr max_atoms_compared_k = 128;
 
-/**
- *  @brief How one molecule compared against the RDKit oracle.
- *
- *  The three verdicts partition the molecules tested, which is the point of naming them: counting a
- *  structural failure and a value failure in two independent buckets double-counts any molecule that is
- *  both, and every ppm below is a fraction of that total.
- */
+/** How one molecule compared against the RDKit oracle. The three verdicts partition the molecules tested, which is
+ *  the point of naming them: independent structural and value buckets would double-count a molecule that is both,
+ *  and every ppm below is a fraction of that total. */
 enum class molecule_verdict_t : std::uint8_t {
     matched_k,
     value_differs_k,
@@ -97,31 +91,25 @@ enum class narration_policy_t : std::uint8_t {
     first_failures_k,
 };
 
-/**
- *  @brief Why a SMILES never reached the comparison, or that it did.
- *
- *  Each refusal names a molecule about which nothing was measured, so it stays out of the ppm
- *  denominator instead of counting as a match and diluting the rate.
- */
+/** Why a SMILES never reached the comparison, or that it did: RDKit refused the SMILES or refused to add hydrogens,
+ *  the molecule has more atoms than `max_atoms_compared_k`, `build_descriptor` refused it, or `MMFFMolProperties`
+ *  came back invalid so there are no reference atom types or charges. Each refusal names a molecule about which
+ *  nothing was measured, so it stays out of the ppm denominator instead of diluting the rate as a match. */
 enum class molecule_intake_t : std::uint8_t {
     comparable_k,
-    /** RDKit refused the SMILES, or refused to add hydrogens to it. */
     unparsable_k,
-    /** More atoms than `max_atoms_compared_k`. */
     above_atom_ceiling_k,
-    /** `build_descriptor` refused the molecule. */
     undescribable_k,
-    /** `MMFFMolProperties` came back invalid, so there are no reference atom types or charges. */
     untypable_k,
 };
 
-/** Counts for one sweep, threaded by reference so the curated probe and the external corpus aggregate. */
+/** Counts for one sweep, threaded by reference so the curated probe and the external corpus aggregate.
+ *  `molecules` is indexed by `molecule_verdict_t`, so its three buckets sum to the number tested; the molecules a
+ *  `molecule_intake_t` refusal kept out of the comparison are counted apart, and out of every ppm below. */
 struct port_tally_t {
     std::uint64_t term_checks = 0;
     std::uint64_t term_failures = 0;
-    /** Molecules per `molecule_verdict_t`, so the three buckets sum to the number tested. */
     std::array<std::uint64_t, 3> molecules {};
-    /** Molecules a `molecule_intake_t` refusal kept out of the comparison, and out of every ppm below. */
     std::uint64_t molecules_skipped = 0;
 
     std::uint64_t &molecules_with(molecule_verdict_t verdict) { return molecules[static_cast<std::size_t>(verdict)]; }
@@ -131,11 +119,10 @@ struct port_tally_t {
     std::uint64_t total_molecules() const { return molecules[0] + molecules[1] + molecules[2]; }
 };
 
-/** Which native extractor produced the terms under test. */
+/** Which native extractor produced the terms under test: `extract_mmff94_params_native`, handed atom types and
+ *  partial charges from RDKit, or `extract_mmff94_params_fully_native`, deriving both with zero runtime RDKit. */
 enum class native_extractor_t : std::uint8_t {
-    /** `extract_mmff94_params_native` — atom types and partial charges handed in from RDKit. */
     hybrid_k,
-    /** `extract_mmff94_params_fully_native` — types and charges derived with zero runtime RDKit. */
     fully_native_k,
 };
 
@@ -153,16 +140,11 @@ static std::uint32_t packed_ijkl_of_(torsion_type_ const &torsion) {
            (static_cast<std::uint32_t>(torsion.atom_k) << 16) | (static_cast<std::uint32_t>(torsion.atom_l) << 24);
 }
 
-/**
- *  @brief Name the torsions @p present enumerated and @p absent did not, one line each.
- *
- *  The scan runs to completion and the budget decides only what is printed, so the trailing count is
- *  the true number of one-sided torsions rather than the number that fit on screen.
- *
+/** Name the torsions @p present enumerated and @p absent did not, one line each. The scan runs to completion and
+ *  the budget decides only what is printed, so the trailing count is the true number of one-sided torsions.
  *  @param[in] label Which extractor the listed torsions came from.
  *  @param[in] present Sorted packed keys from that extractor.
- *  @param[in] absent Sorted packed keys from the other one.
- */
+ *  @param[in] absent Sorted packed keys from the other one. */
 static void report_one_sided_torsions_(std::string_view label, std::vector<std::uint32_t> const &present,
                                        std::vector<std::uint32_t> const &absent) {
     int one_sided = 0, printed = 0;
@@ -185,8 +167,8 @@ static term_structure_t compare_mol_(std::string_view smiles, native_extractor_t
     bool const verbose = narration == narration_t::narrated_k;
     term_structure_t structure = term_structure_t::matches_k;
 
-    // Printed once, ahead of the first differing count, so the run of names that follows is
-    // attributable to a molecule and to the extractor that produced it.
+    // Printed once ahead of the first differing count, so the run of names that follows is attributable to a
+    // molecule and to the extractor that produced it.
     bool structure_header_printed = false;
     auto complain = [&](std::string_view what) {
         structure = term_structure_t::differs_k;
@@ -255,9 +237,8 @@ static term_structure_t compare_mol_(std::string_view smiles, native_extractor_t
             }
             ++tally.term_failures;
         }
-        // The hybrid path is handed RDKit's own `double` charges, so it must reproduce them bit for bit.
-        // The fully-native path sums bond-charge increments in `float` where RDKit sums in `double`, so it
-        // earns the shared charge tolerance the two typer suites hold the same quantity to.
+        // The hybrid path is handed RDKit's own `double` charges, so it reproduces them bit for bit; the
+        // fully-native path sums increments in `float` and earns the shared charge tolerance.
         bool const charge_matches =
             extractor == native_extractor_t::hybrid_k
                 ? bitwise_equal(rdkit_result.mmff_atom_charge[atom], native_result.mmff_atom_charge[atom])
@@ -419,33 +400,30 @@ static term_structure_t compare_mol_(std::string_view smiles, native_extractor_t
         }
     }
 
-    // CSR interactions are built only by the native path in this test
-    // (the rdkit_direct_extract baseline leaves them empty). Skip that
-    // comparison — the native CSR is validated implicitly by the bonded
-    // term counts above plus cross-checks in downstream ETKDG kernels.
+    // CSR interactions are built only by the native path here — the `rdkit_direct_extract_` baseline leaves them
+    // empty — so that comparison is skipped; the bonded term counts above and the downstream ETKDG kernels
+    // validate the native CSR instead.
 
-    // Every value difference above went into the tally rather than into this answer. Reaching here
-    // means the two term sets have the same shape, which is all this function decides.
+    // Every value difference above went into the tally, not into this answer: reaching here means the two term
+    // sets have the same shape, which is all this function decides.
     return term_structure_t::matches_k;
 }
 
-/** Build a "ground truth" prepared molecule by calling RDKit's per-term
- *  `getMMFF*Params` directly — bypasses the `mmff_param_cache`, whose
- *  torsion/angle/stbn keys miss ring context. The native CPU port is
- *  validated against this, not against `extract_mmff94_params_via_rdkit`, so that
- *  any latent cache bugs don't contaminate the comparison. */
+/** Build a ground-truth prepared molecule from RDKit's per-term `getMMFF*Params` directly, bypassing the
+ *  `mmff_param_cache` whose torsion, angle and stbn keys miss ring context. The native CPU port is validated
+ *  against this rather than `extract_mmff94_params_via_rdkit`, so latent cache bugs cannot contaminate it. */
 static void rdkit_direct_extract_(RDKit::ROMol &molecule, sft::molecule_descriptor_t const &descriptor,
                                   sfp::etkdg_prepared_molecule_t &out) {
-    // `out` is caller-owned scratch reused across the sweep, so every array this function appends to is
-    // emptied first; the two it resizes are covered by the resize.
+    // `out` is caller-owned scratch reused across the sweep, so every array appended to is emptied first; the two
+    // resized are covered by the resize.
     out.mmff_bonds.clear();
     out.mmff_angles.clear();
     out.mmff_torsions.clear();
     out.mmff_oops.clear();
     out.mmff_stretchbends.clear();
 
-    // `prepare_one_` already put the molecule through this constructor, so MMFF's own aromatic
-    // perception is what @p descriptor was snapshotted from and a second construction changes nothing.
+    // `prepare_one_` already ran this constructor, so @p descriptor was snapshotted from MMFF's own aromatic
+    // perception and a second construction changes nothing.
     RDKit::MMFF::MMFFMolProperties props(molecule);
     if (!props.isValid()) return;
     std::uint32_t const num_atoms = descriptor.num_atoms;
@@ -523,10 +501,9 @@ static void rdkit_direct_extract_(RDKit::ROMol &molecule, sft::molecule_descript
                  ++k_neighbor_slot) {
                 std::uint32_t atom_l = descriptor.neighbor_atom[k_neighbor_slot];
                 if (atom_l == atom_j) continue;
-                // `MMFF::Tools::addTorsions` skips `idx4 == idx1` — "make sure this isn't a
-                // three-membered ring" — so the force field RDKit minimises with carries no such
-                // term. Without this the baseline is a transliteration of the enumeration it is
-                // meant to check, and shares every omission with it.
+                // `MMFF::Tools::addTorsions` skips `idx4 == idx1` — "make sure this isn't a three-membered ring" —
+                // so RDKit's own force field carries no such term, and a baseline that kept it would share every
+                // omission of the enumeration it checks.
                 if (atom_l == atom_i) continue;
                 unsigned torsion_type;
                 ForceFields::MMFF::MMFFTor torsion_params;
@@ -600,38 +577,27 @@ static void rdkit_direct_extract_(RDKit::ROMol &molecule, sft::molecule_descript
     }
 }
 
-/**
- *  @brief Everything both extractors read for one molecule, plus the three term sets they are judged by.
- *
- *  Owned by the sweep and reused across molecules, so the growth phase happens once rather than eleven
- *  vectors per SMILES. Every array is refilled from scratch by the extractor that owns it.
- */
+/** Everything both extractors read for one molecule, plus the three term sets they are judged by. Owned by the
+ *  sweep and reused across molecules, so the growth phase happens once rather than eleven vectors per SMILES, and
+ *  every array is refilled from scratch by the extractor that owns it. `atom_types` and `charges` are RDKit's,
+ *  handed to the hybrid extractor; `rdkit_result` is the oracle, RDKit's own per-term answer built without the
+ *  parameter cache; `hybrid_result` is `extract_mmff94_params_native` given those types and charges, and
+ *  `fully_native_result` is `extract_mmff94_params_fully_native` deriving its own. */
 struct molecule_under_test_t {
     std::unique_ptr<RDKit::RWMol> molecule;
     sft::molecule_descriptor_t descriptor {};
-    /** Atom types RDKit assigned, which the hybrid extractor is handed. */
     std::vector<std::uint8_t> atom_types;
-    /** Partial charges RDKit assigned, which the hybrid extractor is handed. */
     std::vector<float> charges;
-    /** The oracle: RDKit's own per-term answer, built without the parameter cache. */
     sfp::etkdg_prepared_molecule_t rdkit_result;
-    /** `extract_mmff94_params_native`, handed RDKit's atom types and charges. */
     sfp::etkdg_prepared_molecule_t hybrid_result;
-    /** `extract_mmff94_params_fully_native`, deriving atom types and charges itself. */
     sfp::etkdg_prepared_molecule_t fully_native_result;
 };
 
-/**
- *  @brief Parse one SMILES and fill everything the comparison consumes, or name why it cannot.
- *
- *  Native and RDKit preprocessing share this one `SmilesToMol` / `addHs` / `build_descriptor` path, so a
- *  difference the comparison reports is a difference between the extractors and never in how the
- *  molecule was read.
- *
- *  @param[in] smiles Molecule to read.
+/** Parse one SMILES and fill everything the comparison consumes, or name why it cannot. Native and RDKit
+ *  preprocessing share this one `SmilesToMol` / `addHs` / `build_descriptor` path, so a difference the comparison
+ *  reports is between the extractors and never in how the molecule was read.
  *  @param[out] subject Overwritten with the parsed molecule, its descriptor, and RDKit's types and charges.
- *  @return Whether the molecule is comparable, and if not, which stage refused it.
- */
+ *  @return Whether the molecule is comparable, and if not, which stage refused it. */
 static molecule_intake_t prepare_one_(std::string_view smiles, molecule_under_test_t &subject) {
     try {
         std::string const smiles_string {smiles};
@@ -650,10 +616,9 @@ static molecule_intake_t prepare_one_(std::string_view smiles, molecule_under_te
     std::uint32_t const num_atoms = subject.molecule->getNumAtoms();
     if (num_atoms > max_atoms_compared_k) return molecule_intake_t::above_atom_ceiling_k;
 
-    // Both the oracle and the hybrid path read their atom types and charges here, so a molecule MMFF94
-    // cannot type has no reference to compare the native tables against. Constructing the properties
-    // rewrites the molecule into MMFF's own aromatic perception, so it precedes the descriptor: the
-    // native extractors would otherwise read the parser's rings while the types describe MMFF's.
+    // Both the oracle and the hybrid path read their types and charges here, so a molecule MMFF94 cannot type has
+    // no reference at all. Constructing the properties rewrites the molecule into MMFF's own aromatic perception,
+    // so it precedes the descriptor: the native extractors would otherwise read the parser's rings.
     RDKit::MMFF::MMFFMolProperties props(*subject.molecule);
     if (!props.isValid()) return molecule_intake_t::untypable_k;
     if (sft::build_descriptor(*subject.molecule, subject.descriptor) != sft::conformer_status_t::success_k)
@@ -668,19 +633,15 @@ static molecule_intake_t prepare_one_(std::string_view smiles, molecule_under_te
     return molecule_intake_t::comparable_k;
 }
 
-/**
- *  @brief Compare both native extractors for one prepared molecule against the RDKit oracle.
- *
- *  Both extractors always run, and every value difference lands in @p tally rather than in the verdict,
- *  so a molecule that differs in one term still contributes its remaining term checks to the totals.
- *
+/** Compare both native extractors for one prepared molecule against the RDKit oracle. Both always run, and every
+ *  value difference lands in @p tally rather than in the verdict, so a molecule differing in one term still
+ *  contributes its remaining term checks to the totals.
  *  @param[in] smiles Molecule under test, for the narration only.
  *  @param[in] tables MMFF94 parameter tables both native extractors read.
  *  @param[in] narration Whether the differences found are described or only counted.
  *  @param[inout] subject Prepared molecule; its three term sets are overwritten.
  *  @param[inout] tally Term checks and term failures, accumulated across molecules.
- *  @return How this one molecule compared, as one of three verdicts that partition the corpus.
- */
+ *  @return How this one molecule compared, as one of three verdicts that partition the corpus. */
 static molecule_verdict_t run_one_(std::string_view smiles, sfparam::mmff94_tables_view_t const &tables,
                                    narration_t narration, molecule_under_test_t &subject, port_tally_t &tally) {
     std::uint64_t const term_failures_before = tally.term_failures;
@@ -695,8 +656,8 @@ static molecule_verdict_t run_one_(std::string_view smiles, sfparam::mmff94_tabl
     term_structure_t structure = compare_mol_(smiles, native_extractor_t::hybrid_k, subject.rdkit_result,
                                               subject.hybrid_result, narration, tally);
 
-    // Zero runtime RDKit, held to the same oracle. A typer refusal is a structural difference rather
-    // than a value one, because the terms it would have produced do not exist at all.
+    // Zero runtime RDKit, held to the same oracle. A typer refusal is structural, not a value difference: the
+    // terms it would have produced do not exist at all.
     subject.fully_native_result.num_atoms = num_atoms;
     if (!sfmmff::extract_mmff94_params_fully_native(subject.descriptor, tables, subject.fully_native_result)) {
         if (narration == narration_t::narrated_k)
@@ -707,31 +668,26 @@ static molecule_verdict_t run_one_(std::string_view smiles, sfparam::mmff94_tabl
                           narration, tally) == term_structure_t::differs_k)
         structure = term_structure_t::differs_k;
 
-    // Structure is decided first because a molecule that is both is still one molecule: the three
-    // verdicts have to partition the corpus for the ppm computed over them to be a fraction of anything.
+    // Structure is decided first because a molecule that is both is still one molecule, and the three verdicts
+    // must partition the corpus for a ppm over them to be a fraction of anything.
     if (structure == term_structure_t::differs_k) return molecule_verdict_t::structure_differs_k;
     if (tally.term_failures != term_failures_before) return molecule_verdict_t::value_differs_k;
     return molecule_verdict_t::matched_k;
 }
 
-/**
- *  @brief Run every SMILES in @p corpus through both extractors, accumulating into @p tally.
- *
- *  The loop is deliberately non-short-circuiting: its counters are the test's output and feed the gate,
- *  so a differing molecule is described and then walked past rather than ending the sweep.
- *
+/** Run every SMILES in @p corpus through both extractors, accumulating into @p tally. Non-short-circuiting: the
+ *  counters are the test's output and feed the gate, so a differing molecule is described and then walked past.
  *  @param[in] corpus SMILES to compare, in order.
  *  @param[in] tables MMFF94 parameter tables both native extractors read.
  *  @param[in] policy Whether every molecule is narrated, or only the first molecules that differ.
- *  @param[inout] tally Molecule verdicts and term counts, accumulated across sweeps.
- */
+ *  @param[inout] tally Molecule verdicts and term counts, accumulated across sweeps. */
 static void sweep_(custd::span<std::string const> corpus, sfparam::mmff94_tables_view_t const &tables,
                    narration_policy_t policy, port_tally_t &tally) {
     molecule_under_test_t subject;
     int narrated_failures = 0;
     for (auto const &smiles : corpus) {
-        // A molecule RDKit cannot parse, size, describe or type measures nothing about the port, so it
-        // stays out of the denominator instead of counting as a match.
+        // A molecule RDKit cannot parse, size, describe or type measures nothing about the port, so it stays out
+        // of the denominator instead of counting as a match.
         if (prepare_one_(smiles, subject) != molecule_intake_t::comparable_k) {
             ++tally.molecules_skipped;
             continue;
@@ -751,12 +707,9 @@ static void sweep_(custd::span<std::string const> corpus, sfparam::mmff94_tables
     }
 }
 
-/**
- *  @brief Print what the sweeps counted and answer `main` with the exit code the gate decided.
- *
+/** Print what the sweeps counted and answer `main` with the exit code the gate decided.
  *  @param[in] tally Aggregated counts from every sweep.
- *  @return `0` when the port matches within budget, `1` otherwise.
- */
+ *  @return `0` when the port matches within budget, `1` otherwise. */
 static int report_(port_tally_t const &tally) {
     std::uint64_t const compared = tally.total_molecules();
     std::uint64_t const value_differs = tally.molecules_with(molecule_verdict_t::value_differs_k);
@@ -778,9 +731,9 @@ static int report_(port_tally_t const &tally) {
     fmt::println("ppm molecules_differing={:.3f} molecules_value_differing={:.3f} terms_differing={:.3f} budget={:.3f}",
                  molecule_ppm, value_ppm, term_ppm, max_molecule_value_mismatch_ppm_k);
 
-    // Structural mismatches are never tolerated; value differences get the ppm budget the file header
-    // documents. Exotic structures — pentacoordinate P, porphyrins — can exceed it and should be triaged
-    // on the full 10M USearch set rather than absorbed by loosening this.
+    // Structural mismatches are never tolerated; value differences get the ppm budget the file header documents.
+    // Exotic structures — pentacoordinate P, porphyrins — can exceed it and should be triaged on the full 10M
+    // USearch set rather than absorbed by loosening this.
     if (structure_differs > 0)
         return report_fail(test_name_k, "{} of {} molecules differ structurally from the RDKit baseline",
                            structure_differs, compared);
@@ -809,8 +762,8 @@ int main(int argc, char **argv) {
                  tables_host.bond.size(), tables_host.angle.size(), tables_host.torsion.size(), tables_host.oop.size(),
                  tables_host.stbn.size(), tables_host.dfsb.size());
 
-    // Curated handful of drug-like SMILES (aspirin, caffeine, ibuprofen,
-    // paracetamol, benzodiazepine, adenine, imidazolium, carboxylate).
+    // Curated drug-like SMILES: aspirin, caffeine, ibuprofen, paracetamol, benzodiazepine, adenine, imidazolium,
+    // carboxylate.
     std::vector<std::string> probe = {
         "CC(=O)OC1=CC=CC=C1C(=O)O",      // aspirin
         "CN1C=NC2=C1C(=O)N(C(=O)N2C)C",  // caffeine
@@ -824,8 +777,8 @@ int main(int argc, char **argv) {
         "C1CCOC1",                       // tetrahydrofuran
         "C1CC1",                         // cyclopropane
         "c1ccc2[nH]ccc2c1",              // indole
-        // Regression witnesses, one per way the typer used to read the descriptor wrong. Terms derived from
-        // a wrong atom type are wrong terms, so the fully-native extractor fails these before the fix too.
+        // Regression witnesses, one per way the typer can read the descriptor wrong; terms from a wrong atom type
+        // are wrong terms, so these gate the fully-native extractor as much as the typer.
         "CC1=CC=CC=[N+]1[O-]",                                              // aromatic N-oxide: O is 32, not 35
         "CC1=C(C=CN=C1C2=CC(=CC(=C2)Cl)[NH+](O)[O-])CC#N",                  // hydroxylammonium O the typer refused
         "C1=CC=C2C=C(C=CC2=C1)NC3=CC#CC=C3",                                // triple bond inside an aromatic ring
@@ -833,8 +786,8 @@ int main(int argc, char **argv) {
         "CC(C)NC(=O)C1=CC(=C(C=C1)C2=C3C=CC(=O)C=C3OC4=C2C=CC(=C4)O)C(=O)O" // quinoid single bond, fused system
     };
 
-    // A corpus arrives by flag or by `SMALLFIELD_TEST_CORPUS`, and a path that does not open is a
-    // failure rather than an empty run that passes because it compared nothing.
+    // A corpus arrives by flag or by `SMALLFIELD_TEST_CORPUS`; a path that does not open is a failure, never an
+    // empty run that passes having compared nothing.
     std::vector<std::string> extra;
     if (corpus.knob == sftest::corpus_knob_t::named_k) {
         auto const outcome = sftest::load_smiles_into(corpus.path, corpus.max_molecules, extra);

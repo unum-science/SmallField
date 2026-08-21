@@ -68,16 +68,13 @@ inline std::string format_hms(std::chrono::steady_clock::duration const &duratio
 /**
  *  @brief True when ANSI styling should be emitted to stdout.
  *
- *  Requires stdout to be a terminal and `NO_COLOR` to be unset, per https://no-color.org/. Cached after the
- *  first call.
+ *  Requires stdout to be a terminal and `NO_COLOR` to be unset, per https://no-color.org/. The answer is
+ *  cached by `logger_t::color_enabled`, once per logger, so this holds no state of its own.
  */
 inline bool detect_color_enabled() {
-    static bool const enabled = []() {
-        char const *no_color = std::getenv("NO_COLOR");
-        if (no_color != nullptr && no_color[0] != '\0') return false;
-        return ::isatty(fileno(stdout)) != 0;
-    }();
-    return enabled;
+    char const *no_color = std::getenv("NO_COLOR");
+    if (no_color != nullptr && no_color[0] != '\0') return false;
+    return ::isatty(fileno(stdout)) != 0;
 }
 
 /**

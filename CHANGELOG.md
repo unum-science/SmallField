@@ -9,7 +9,7 @@ An experiment that was tried and rejected without landing is dated by the commit
 Every number names the hardware it was measured on, because this project targets Hopper and Blackwell alike and at every tier from one GPU to a multi-node cluster.
 A number without that label is unlabelled, not implicitly the machine `BENCH.md` happens to use — entries here span single-H100 kernel work and 8-GPU Blackwell throughput runs, and the two do not transfer.
 
-## 2026-08-11 — Batch Region Offsets Past the 32-Bit Ceiling — `2b385db`
+## 2026-08-11 — Batch Region Offsets Past the 32-Bit Ceiling — `002e119`
 
 `per_mol_sizes_t::bounds` and `::bond_distance` summed `num_atoms * num_atoms` across a batch in `std::uint32_t`, and that sum sized the pinned allocation.
 At a uniform 104 atoms it wrapped at 397 094 molecules, under the 400 000-molecule wave clamp; at the clamp itself the 17.3 GB of bounds data reserved 125 MB.
@@ -22,7 +22,7 @@ The wave sizer applies the same bound, which leaves preprocess's own refusal unr
 
 `test_batch_layout` covers the cap either side of its boundary and the layout at 120 000 molecules of 192 atoms, needs no GPU, and fails on exactly this defect when the two fields are narrowed back.
 
-## 2026-08-03 — Reproducible Output at a Fixed Seed — `dd22f2e`
+## 2026-08-03 — Reproducible Output at a Fixed Seed — `ab4488d`
 
 Philox was keyed off the molecule's offset inside its device batch, which varies with host-thread timing under `schedule(dynamic, 64)`, so a fixed `random_seed` did not reproduce.
 It now seeds from the input row index.
@@ -30,7 +30,7 @@ It now seeds from the input row index.
 
 This was worth more than the throughput work it shipped alongside: before it, a quality comparison was not comparing the same sample twice, and a FIRE change had to be reverted because a genuine regression could not be told from run-to-run sample drift.
 
-## 2026-08-03 — Retiring the VF2 Fallback — `913c99d`
+## 2026-08-03 — Retiring the VF2 Fallback — `a87acd9`
 
 All 470 CSD patterns compile natively, verified at 9 020 710 pattern checks over 19 193 PubChem molecules with zero disagreements.
 The fallback is gone, and with it `scaffold_cache.hpp`, `native_murcko.hpp` and `preprocess_deadline.hpp` — three subsystems that served nothing else.
@@ -38,7 +38,7 @@ A pattern the compiler cannot read is now a load-time abort: the pattern library
 
 `conformer_status_t::preprocess_timeout` is kept and marked reserved, because status codes are written as integers into every shipped shard and removing the enumerator would renumber the ones after it.
 
-## 2026-08-03 — Preprocessing on the Device — `cb5e466`, `3236a2c`
+## 2026-08-03 — Preprocessing on the Device — `77d26c9`, `0973c89`
 
 Every expensive stage downstream of `build_descriptor` runs on the device: the bond-hop BFS, MMFF typing, MMFF term extraction with compaction, CSD torsion matching, and the ETK per-atom CSR build.
 The host uploads a descriptor, a bounds matrix, chiral centres, the 1-2 and 1-3 constraints, and per-molecule bases; nothing downstream of that returns to the CPU.
@@ -67,7 +67,7 @@ The improvement is a bug fix rather than a numerical gain: the host extractor sk
 
 What remains host-side and portable in principle: `build_bounds_matrix`, `extract_distance_constraints` and `extract_chiral_centers` are all already pure over `molecule_descriptor_t`.
 
-## 2026-08-03 — 192-Atom Dispatch Tier — `cce4f4d`
+## 2026-08-03 — 192-Atom Dispatch Tier — `9478135`
 
 Molecules past 128 atoms were rejected before binning, which after salt stripping was still 2.15 % of stratified PubChem and the largest remaining yield loss.
 The cap moves to 192 and the bin ladder gains a matching ninth tier.
@@ -78,7 +78,7 @@ One wide bin serves them, where a finer ladder up there would cost occupancy on 
 
 Raising the cap globally was the cheap route once the phase timings were known: upload plus every device preprocessing kernel is 1.29 % of GPU time, and the descriptor is about a third of upload.
 
-## 2026-08-03 — Largest-Fragment Salt Policy and One Shared Parse — `82938ec`
+## 2026-08-03 — Largest-Fragment Salt Policy and One Shared Parse — `c7eba33`
 
 Four call sites parsed SMILES independently and had already drifted.
 One gated the atom count against a hardcoded 128 where another used the shared cap, and their `AddHs` failure semantics differed four ways.
@@ -89,7 +89,7 @@ Dropping fragments before `AddHs` keeps the hydrogen count with the parent, and 
 
 `salt_policy_t` names the two readings, and `keep_largest_fragment_k` is the default because a counterion has no meaningful conformer and MMFF94 cannot type an isolated `HCl`, so keeping the fragment would reject the parent along with it.
 
-## 2026-08-03 — Optimizations Tried and Rejected — `dd22f2e`, `cce4f4d`
+## 2026-08-03 — Optimizations Tried and Rejected — `ab4488d`, `9478135`
 
 - __Kernel occupancy work__ — retired by measurement rather than delivered.
   `etkdg_pipeline_warp_kernel` went from 80 to 72 registers per thread, lifting it from 25 to 28 blocks per SM, and PubChem 5K at K=3 moved from 4351 to 4359 conf/s on an idle box — 0.2 %, inside a 0.6 % spread.
@@ -100,7 +100,7 @@ Dropping fragments before `AddHs` keeps the hydrogen count with the parent, and 
   Cutting the budget yields a worse starting geometry, and chirality validation is what notices.
   The stage is not oversized for small molecules; it is what makes their stereocentres survive.
 
-## 2026-07-27 — USR / USRCAT Shape Descriptors and the 3D Shard Contract — `4f2d43e`, `a2cab74`, `e55952c`
+## 2026-07-27 — USR / USRCAT Shape Descriptors and the 3D Shard Contract — `83d9883`, `9ee5be8`, `3be4d52`
 
 The batch producer emits the full reference-dataset contract per conformer.
 Native USR at 12 dimensions and USRCAT at 60 are computed in-tree, with pharmacophores typed once per molecule and the moments run per conformer, where RDKit's `GetUSRCAT` re-types the subsets on every call.
@@ -109,12 +109,12 @@ A golden test pins the output to RDKit's reference within 1e-4, at a USRCAT maxi
 Conformers are energy-sorted per molecule, so `conformer_index` is the energy rank rather than the raw generation slot.
 Disconnected components are separated on the finished coordinates so fragments no longer interpenetrate.
 Schema-level provenance records the producer git sha, conformer count, atom cap, dataset name, coordinate frame and schema version.
-The shipped frame is centered rather than principal-axis, corrected in `eb50aad` after the contract first named it wrongly.
+The shipped frame is centered rather than principal-axis, corrected in `3fb2597` after the contract first named it wrongly.
 
 `smallfield_descriptors` rewrites existing shards into the same schema from the already-stored fp16 coordinates, so a completed corpus gains descriptors without a GPU re-run.
 It rounds through fp16 exactly as the producer does, which is what makes its output byte-identical.
 
-## 2026-05-05 — MACE-OFF Module Removal — `746e2ae`
+## 2026-05-05 — MACE-OFF Module Removal — `8f8c410`
 
 The MACE-OFF inference module, the ThunderKittens integration, the standalone `smallfield_mace_refine` CLI, the MACE bindings, the `bench_mace_inference` target and the `test/mace` suite all leave the tree — 16 342 deleted lines against 36 added.
 The library builds the ETKDG and MMFF94 pipeline only.
@@ -130,18 +130,18 @@ Six landed phases plus the scaffolding committed in α, in increasing order of k
 | Phase | Commit    | What                                                                                                                    |
 | :---: | :-------- | :---------------------------------------------------------------------------------------------------------------------- |
 |   α   | —         | Scaffolding + design doc + no-op stub launcher                                                                          |
-|  β-1  | `c869c08` | Bf16-input element_residual + fold scale into path_weight                                                               |
-|  β-2  | `b93c121` | Pre-scale param on linear_post_tp; skip `launch_mace_scale`                                                             |
-| __γ__ | `aaea500` | __TK scalar matmul (M = 64 atoms) for L=0 linears (linear_up + product_linear) — replaces matmul_rowmajor brute force__ |
-| __δ__ | `5168746` | __TK backward scalar matmul (mm_ABt) — replaces fp32-ref `linear_per_irrep_irrep1_force_adjoint`__                      |
-|   ε   | `4593520` | Wire existing TK element_residual backward at active=1 for layer-N residual chain                                       |
-|  β-3  | `cae482e` | Bf16-input linear_post_tp; skip cast bridge between conv_tp_scatter and linear                                          |
+|  β-1  | `40ceba9` | Bf16-input element_residual + fold scale into path_weight                                                               |
+|  β-2  | `e87bab6` | Pre-scale param on linear_post_tp; skip `launch_mace_scale`                                                             |
+| __γ__ | `94faf09` | __TK scalar matmul (M = 64 atoms) for L=0 linears (linear_up + product_linear) — replaces matmul_rowmajor brute force__ |
+| __δ__ | `76b356b` | __TK backward scalar matmul (mm_ABt) — replaces fp32-ref `linear_per_irrep_irrep1_force_adjoint`__                      |
+|   ε   | `f72ceb9` | Wire existing TK element_residual backward at active=1 for layer-N residual chain                                       |
+|  β-3  | `c1f33b8` | Bf16-input linear_post_tp; skip cast bridge between conv_tp_scatter and linear                                          |
 
 Cumulative measurement at batch=2048 × n_atoms=30 + forces + capture:
 
 | Stage                  |  ms/config | confs/sec | Δ vs prior | Δ vs multi-warp |
 | :--------------------- | ---------: | --------: | ---------: | --------------: |
-| Multi-warp (`3471962`) |     0.0473 |       891 |          — |               — |
+| Multi-warp (`dda1823`) |     0.0473 |       891 |          — |               — |
 | + β-1                  |     0.0471 |       896 |     +0.5 % |          +0.5 % |
 | + β-2                  |     0.0470 |       898 |     +0.2 % |          +0.8 % |
 | + γ                    |     0.0448 |       939 |     +4.6 % |          +5.4 % |
@@ -224,7 +224,7 @@ __Practical batch-size guidance__:
 
 The way to push past 891 c/s on a single H100 is __not__ larger batches (saturated) but kernel-level work (TK ports of the residual fp32 fallbacks, conv_tp_scatter barrier reduction, etc.) or multi-GPU fan-out (8× cards estimated 5.1× of one H100 on the production hardware).
 
-## 2026-04-26 — MACE-OFF Symcontract Multi-Warp CTAs — `3471962`
+## 2026-04-26 — MACE-OFF Symcontract Multi-Warp CTAs — `dda1823`
 
 NCU's "73% local speedup from fixing warp-eligibility starvation" estimate on the symcontract backward (84% L1TEX scoreboard stalls, 0.31 eligible warps/scheduler with single-warp CTAs) translated almost 1:1 to wall-time:
 
@@ -262,7 +262,7 @@ Smem caching helps when load latency dominates the issue queue; here multi-warp 
 ### Transform #1 Forward, Canonical-Triple Iteration — Investigated, Reverted
 
 Followed the multi-warp commit with a Transform #1-style canonical-triple forward: iterate only the 816 canonical (i ≤ j ≤ k) cells against the already-precomputed `tk_precomputed_w3_sym_total_layer` slab, instead of the cubic 16³ = 4 096 ordered triples against `W3_eff`.
-The W3_sym_total tensor was added in commit `e12b4e4` precisely for this and noted in the CHANGELOG as "staged but not yet wired".
+The W3_sym_total tensor was added in commit `3edf44c` precisely for this and noted in the CHANGELOG as "staged but not yet wired".
 
 __Result: 0.0473 → 0.0473 ms/config — at best a wash on the bench, and the kernel itself ran 11.07 → 13.5 ms/call (slower).
 Reverted.__
@@ -281,7 +281,7 @@ Net: the 5× FMA- count reduction is more than offset by 3.5× higher long-score
 The original CHANGELOG note for Transform #1 ("does NOT help this forward kernel — it has only one fp32 accumulator, the dependency chain on `accumulator` was already broken into 4 chains by the i unroll, and the kernel runs at ~99% SM / ~7% FMA-pipe with the existing layout") was correct; this experiment confirmed it on the post-multi-warp baseline.
 The forward symcontract on H100 is L1-throughput-bound on linear stride access, not FMA-count-bound.
 
-`mace_tk_precompute_w3_sym_total` and the kernel + launcher remain available in-tree (commit `e12b4e4`) for future Transform #2 work.
+`mace_tk_precompute_w3_sym_total` and the kernel + launcher remain available in-tree (commit `3edf44c`) for future Transform #2 work.
 
 ### What the Post-Phase-1 NCU Now Flags
 
@@ -301,7 +301,7 @@ The CHANGELOG note on Transform #1 noted W3_sym_total was "staged but not yet wi
 
 ## 2026-04-26 — MACE-OFF NCU Profiling, TMA Pipelining Is Not the Right Next Lever
 
-End-to-end refine_batch throughput on H100 SXM5 (one card, MACE-OFF23-small, fp32 reference fallback for the medium model's non-96-channel kernels — i.e. the post-`ec662ae` honest baseline).
+End-to-end refine_batch throughput on H100 SXM5 (one card, MACE-OFF23-small, fp32 reference fallback for the medium model's non-96-channel kernels — i.e. the post-`f8990a9` honest baseline).
 Captured-graph + Phase K GPU-resident LBFGS + 20-step early-exit:
 
 | n_atoms | batch=1024 | batch=2048 | batch=4096 |
@@ -445,9 +445,9 @@ Approaches that would actually work:
 Option (2) is the practical right answer for this code base — the existing batch-staging plumbing in `cli/smallfield_mace_refine.cpp` already does shard-by-shard rebuilds and can be extended to do iter-by-iter rebuilds within a single relaxation.
 Option (1) is feasible if we want to keep the single-batch model but is a substantial refactor of every gated kernel.
 
-This finding is now in the kernel comments as a TODO note alongside the Phase K converged-flags infrastructure (commit `cc1d9ad`), which still provides the per-conformer fmax + flag tracking that re-batching would read at K-step boundaries.
+This finding is now in the kernel comments as a TODO note alongside the Phase K converged-flags infrastructure (commit `bb7c478`), which still provides the per-conformer fmax + flag tracking that re-batching would read at K-step boundaries.
 
-## 2026-04-26 — MACE-OFF Phase K — `cc1d9ad`, `3d47b84`
+## 2026-04-26 — MACE-OFF Phase K — `bb7c478`, `6b23159`
 
 GPU-resident LBFGS / GD-with-early-exit, eliminating the host-side relaxation loop in `smallfield::mace::context_t::refine_batch` (previously 20 host launches per relaxation, ~25 % of end-to-end wall time at the current kernel speed).
 
@@ -478,12 +478,12 @@ Findings from the experimental campaign:
 
 | Transform                                          |   Status    |                                                                                                                                                                                                                                                                                     Realised gain |
 | -------------------------------------------------- | :---------: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------: |
-| #1 X-commutativity partsym fold (commit `e12b4e4`) | __landed__  |                                                                                                                                                                                                                                                                                  -1.3 % ms/config |
+| #1 X-commutativity partsym fold (commit `3edf44c`) | __landed__  |                                                                                                                                                                                                                                                                                  -1.3 % ms/config |
 | #2 Two-stage decomposition with Stage 1 on TC      | not pursued |      NCU shows post-#1 kernel is memory-latency-bound (7 % FMA pipe, 99.97 % SM); TC compute-density win lands on a small share of remaining time.  Substantial implementation effort (new TK WGMMA kernel + Stage 2 quadratic-form launcher) with unclear net win at the current bottleneck mix. |
 | #3 bf16x2 packed FFMA on Stage 2                   | not pursued |                                                        precision risk on the order-3 accumulator (already at the fp32 noise floor at 10–15 meV/Å); needs a golden regression suite to gate, which would also surface the medium-model latent issue noted below before any precision-trade landed. |
 | #4 Extend TK kernels to 224 channels               | not pursued | Refactor across `mace_tk_per_irrep_linear_*`, `mace_tk_element_conditioned_residual_*`, `mace_tk_readout_*` to template the channel width, then dispatch by `arch.n_channels`.  Mechanical but extensive (~5–7 days).  Worth landing only if the production decision picks the OFF23-large model. |
 
-__Latent issue surfaced and fixed during this campaign__ (commits `ff59e9b` and `ec662ae`): six TK launchers were silently `return`-ing on `n_channels != 96` instead of signalling failure to the caller.
+__Latent issue surfaced and fixed during this campaign__ (commits `e6d718d` and `f8990a9`): six TK launchers were silently `return`-ing on `n_channels != 96` instead of signalling failure to the caller.
 The bf16 output buffers kept their prior content and the chain produced numerically meaningless energies under the TK build for MACE-OFF-medium (128 ch) and MACE-OFF-large (224 ch).
 All six are now `bool`-returning and the inference driver falls back to the fp32 reference path on channel-count mismatch.
 Affected:
@@ -500,7 +500,7 @@ Pre-fix medium bench numbers in earlier reports never measured a working pipelin
 Post-fix medium runs correctly at 0.6097 ms/config; closing that perf regression is Transform #4 (templating each TK kernel over channel width).
 Small model (96 ch) is unaffected — all TK paths still run, the bool-return wiring is no-op for it.
 
-### Transform #1 — X-Commutativity Partsym Fold, Commit `e12b4e4`
+### Transform #1 — X-Commutativity Partsym Fold, Commit `3edf44c`
 
 Backward kernel rewritten from a cubic-write structure (`dx[i]+=W3·X[j]·X[k]` plus two siblings) into a quadratic form whose two input axes are pre-symmetrised at engine init: ∂B/∂X[m] = Σ_{α≤β} W3_partsym_sym[m, α, β, c] · X[α]·X[β] where W3_partsym_sym absorbs the 3-permutation partsym sum AND the (α, β) symmetry of X·X.
 Inner loop now does 16 INDEPENDENT FMAs per (α, β) iteration into 16 dx_local accumulators, vs the old 3 FMAs.
@@ -518,7 +518,7 @@ Force RMS on the 5 reference goldens unchanged from the pre-transform binary (1.
 Also lands `mace_tk_precompute_w3_sym_total` (the canonical-triple W3 fold for the FORWARD) — staged but not yet wired, since the forward kernel's single accumulator is already saturated.
 Will be consumed by Transform #2.
 
-## 2026-04-26 — MACE-OFF Refinement Scaffolding — `71591bd`, `78550ce`
+## 2026-04-26 — MACE-OFF Refinement Scaffolding — `2c70142`, `bfe3a05`
 
 End-to-end MACE-OFF refinement now has a stable C++ / Python / CLI surface alongside the existing ETKDG + MMFF94 path.
 
@@ -540,18 +540,18 @@ Cumulative progression (each row = one commit):
 | Step                                                                               | ms/config |     Δ |
 | :--------------------------------------------------------------------------------- | --------: | ----: |
 | Initial fp32 reference adjoint chain                                               |     2.103 |     — |
-| TK D2/D3/D4 force-adjoint wiring (`d8473e8`)                                       |     0.334 | -84 % |
-| Chain numerical fixes — `apply_cutoff` + silu·n2m inversion (`fb66c99`)            |     0.305 |  -9 % |
-| __B5__ TK D1 per-irrep linear adjoint (`e5243f0`)                                  |     0.293 |  -4 % |
-| __B6__ bf16 radial-MLP hidden saves, skip backward rerun (`6289180`)               |     0.272 |  -7 % |
-| Drop over-unroll on symcontract adjoint — eliminate 30 KB/thread spill (`41b1c4e`) |     0.205 | -25 % |
-| `irrep_dim=1` fast path: linear-per-irrep fwd + bwd (`3ce44e9`)                    |     0.178 | -13 % |
-| ILP unroll i×4/j×16 on symcontract adjoint (`035ad56`)                             |     0.112 | -37 % |
-| `irrep_dim=1` fast path: skip-tp fwd + bwd (`28dc637`)                             |     0.106 |  -6 % |
-| ILP unroll on symcontract forward (`dfa64ad`)                                      |     0.101 |  -5 % |
-| __E1__ TK-WGMMA radial-MLP layer backward (`0e92952`)                              |     0.065 | -36 % |
-| Skip dead fp32 reference radial-MLP fwd under TK build (`535b667`)                 |     0.060 |  -8 % |
-| Extend TK layer-3 backward to MACE-OFF-medium / -large (`4e0b13c`)                 |     0.060 |     — |
+| TK D2/D3/D4 force-adjoint wiring (`fd17fd3`)                                       |     0.334 | -84 % |
+| Chain numerical fixes — `apply_cutoff` + silu·n2m inversion (`f3502a1`)            |     0.305 |  -9 % |
+| __B5__ TK D1 per-irrep linear adjoint (`f1ca72f`)                                  |     0.293 |  -4 % |
+| __B6__ bf16 radial-MLP hidden saves, skip backward rerun (`f5212e7`)               |     0.272 |  -7 % |
+| Drop over-unroll on symcontract adjoint — eliminate 30 KB/thread spill (`600b1a2`) |     0.205 | -25 % |
+| `irrep_dim=1` fast path: linear-per-irrep fwd + bwd (`7a17e47`)                    |     0.178 | -13 % |
+| ILP unroll i×4/j×16 on symcontract adjoint (`18452ec`)                             |     0.112 | -37 % |
+| `irrep_dim=1` fast path: skip-tp fwd + bwd (`5aa9594`)                             |     0.106 |  -6 % |
+| ILP unroll on symcontract forward (`0d8395a`)                                      |     0.101 |  -5 % |
+| __E1__ TK-WGMMA radial-MLP layer backward (`cf01b70`)                              |     0.065 | -36 % |
+| Skip dead fp32 reference radial-MLP fwd under TK build (`837f155`)                 |     0.060 |  -8 % |
+| Extend TK layer-3 backward to MACE-OFF-medium / -large (`9d39aaa`)                 |     0.060 |     — |
 
 Top kernels by NCU-measured share of E+F time, post-pass:
 
@@ -564,7 +564,7 @@ Top kernels by NCU-measured share of E+F time, post-pass:
 | Everything else (~30 kernels)                        | 18 % |
 
 __F1 not pursued__: the projected savings (50% off E+F) were premised on the symcontract backward being 140 M NCU units (28 % of E+F).
-After `41b1c4e` + `035ad56` it dropped to 39 M units, capturing those savings via different mechanism.
+After `600b1a2` + `18452ec` it dropped to 39 M units, capturing those savings via different mechanism.
 True fwd+bwd fusion is also structurally infeasible — B (forward output) and the upstream gradient (backward input) are needed at different points in the execution chain, so a fused kernel would have to run twice with different input modes.
 
 Saturating-batch sweep at this commit (energy + forces, captured replay):
@@ -576,7 +576,7 @@ Saturating-batch sweep at this commit (energy + forces, captured replay):
 
 Energy-only saturates at batch ≈ 256 (~0.024 ms/config small, ~0.032 medium); energy+forces saturates at batch ≈ 1024–2048 (slight slowdown past 4096 from L2 pressure on the W3_eff slab).
 
-## 2026-04-26 — MACE-OFF Native CUDA Module Bring-Up — `7f19819` … `6289180`
+## 2026-04-26 — MACE-OFF Native CUDA Module Bring-Up — `5472e01` … `f5212e7`
 
 Initial native MACE-OFF inference module covering the full forward + analytic- adjoint chain.
 Exists because the cueq + PyTorch reference path is host-pipeline-bound (only ~14.6 % of production wall time is the actual GPU model — the rest is `AtomicData.from_config` + DataLoader collate); a fully GPU-resident path can win end-to-end even at slower per-kernel speed.
@@ -600,18 +600,18 @@ Force-adjoint validation, per-atom force RMS vs `-torch.autograd.grad` on the 5 
 
 Principal bugs that landed in this phase (each with a 5–80× force-RMS reduction on its own):
 
-1. `dabbdd7` — symmetric-contraction-backward weight argument-order swap (was passing `(weights_max, weights_lo_1, weights_lo_0)` instead of `(weights_max, weights_lo_0, weights_lo_1)`).
-2. `d8473e8` — removed the duplicate `apply_cutoff` multiply on tp_weights (MACE-OFF's `RadialEmbeddingBlock` returns `radial * cutoff` already, so the second multiply double-counted `env(r)`).
-3. `fb66c99` — per-layer save of `tensor_product_weights` (was being overwritten by the next forward layer), per-layer rerun of the radial MLP forward, and several missing `cudaMemsetAsync(0)` before adjoint kernels with `+=` semantics.
+1. `c4ec4ab` — symmetric-contraction-backward weight argument-order swap (was passing `(weights_max, weights_lo_1, weights_lo_0)` instead of `(weights_max, weights_lo_0, weights_lo_1)`).
+2. `fd17fd3` — removed the duplicate `apply_cutoff` multiply on tp_weights (MACE-OFF's `RadialEmbeddingBlock` returns `radial * cutoff` already, so the second multiply double-counted `env(r)`).
+3. `f3502a1` — per-layer save of `tensor_product_weights` (was being overwritten by the next forward layer), per-layer rerun of the radial MLP forward, and several missing `cudaMemsetAsync(0)` before adjoint kernels with `+=` semantics.
 4. `silu·n2m(x) = N · x · sigmoid(x)` is __non-monotonic__ (min at x ≈ -1.278), so the Newton inversion `silu_n2m^{-1}(y)` could pick the wrong branch and flip the chain-rule derivative sign (caffeine's `mlp_h2` lands in the ambiguous region [-0.45, -0.467]).
    Fix: save pre-activations directly during the backward forward-rerun.
 
 Residual ~10–15 meV/Å gap to the 1 meV/Å plan target sits at the fp32 noise floor of 4 chained radial-MLP layers; reaching ≤ 1 meV/Å in fp32 likely needs an fp64 accumulator path.
 The chain is production-usable as-is — 0.01 eV/Å is well inside the convergence tolerance of every common LBFGS / FIRE optimiser (`fmax = 0.05 eV/Å`).
 
-- __Phase H__ — public C++ API `smallfield::mace::context_t` (commit `80f17a9`): RAII `weights_t::load(path)` + persistent context with `infer_energy`, `infer_energy_and_forces`, `refine_batch`.
+- __Phase H__ — public C++ API `smallfield::mace::context_t` (commit `4827ed8`): RAII `weights_t::load(path)` + persistent context with `infer_energy`, `infer_energy_and_forces`, `refine_batch`.
 
-## 2026-04-25 — RDKit 2025.09.6 Bump, Per-Molecule Preprocess Deadline and `preprocess_timeout` Status — `a7bb4a4`
+## 2026-04-25 — RDKit 2025.09.6 Bump, Per-Molecule Preprocess Deadline and `preprocess_timeout` Status — `064d05b`
 
 Under the multi-`parquet-shard` invocation wrapper, a single pathological drug-like `molecule` could stall the entire 4-role pipeline for 15–20 minutes.
 `cuda-gdb` on the stuck thread placed the hang inside `boost::detail::VF2SubState::MatchAll`, reachable from `RDKit::SubstructMatch` on the CSD-torsion fallback path.
@@ -639,7 +639,7 @@ RDKit 2024.03.6's `SubstructMatchParameters` exposed only `extraFinalCheck` — 
 All 13 ctest targets green on the 2025.09.6 build.
 Validated by encoding all 978 GDB13 shards + 4000+ Enamine REAL shards on the new build with zero correctness issues.
 
-## 2026-04-25 — Tight Per-Row Coordinate Parquet Output, Zstd Compression and Auto-Park CUDA-Error Guardrail — `a72350d`
+## 2026-04-25 — Tight Per-Row Coordinate Parquet Output, Zstd Compression and Auto-Park CUDA-Error Guardrail — `38bb917`
 
 Three independent CLI / writer changes that together drop output-shard size ~3× and make multi-shard runs self-recovering on a poisoned CUDA context:
 
@@ -662,12 +662,12 @@ Three independent CLI / writer changes that together drop output-shard size ~3×
 Per-shard size win measured on Enamine REAL shard 0 (3 M conformer rows): __1785 MB → 225 MB (12.6 %)__ via the bulk Python converter; __~656 MB__ for fresh-encoded drug-like shards including the writer-side compression.
 Combined the converter and the new writer reclaimed ~1.9 TB on the running disk while encoding continued without interruption.
 
-## 2026-04-21 — Event-Sync Finalize Reverted — `0115a20`
+## 2026-04-21 — Event-Sync Finalize Reverted — `1590fe2`
 
 Swapping the `cudaStreamSynchronize` in `finalize_gpu_pipeline` for a sync on the recorded end event surfaced `cudaErrorNotSupportedOnDeviceAddressSpace` on several hundred waves per shard under PubChem drug-like load.
 The stream drain is correct whether or not the end event was recorded, and costs about 5 ms per wave per device.
 
-## 2026-04-21 — Complexity-Aware Stripe and Partitioned CPU Budget — `0158fa4`
+## 2026-04-21 — Complexity-Aware Stripe and Partitioned CPU Budget — `877c76a`
 
 Two changes target throughput on drug-like `coprocessed-batches` where the dominant pathologies are the per-device wave straggler and concurrent-role CPU over-subscription.
 
@@ -688,9 +688,9 @@ Baseline measurements pre-change (PubChem shard 8, 8 GPUs, K=3, seed 42): `351 s
 Post-stripe-only single-shard: `349 s wall, 2 867 mol/s, 0 CUDA errors` — within noise.
 Post-multi-shard-invocation throughput: pending measurement on full PubChem tail.
 
-## 2026-04-20 — 3-Stream Chain Reverted — `d19fdad`
+## 2026-04-20 — 3-Stream Chain Reverted — `215c91c`
 
-The 3-stream chain from `abe4d03` was kept as an architectural improvement assuming the copy-engine overlap would show at production scale.
+The 3-stream chain from `fb257a9` was kept as an architectural improvement assuming the copy-engine overlap would show at production scale.
 Measured under PubChem drug-like K=3 it lost on both axes:
 
 - __Throughput.__
@@ -699,17 +699,17 @@ Measured under PubChem drug-like K=3 it lost on both axes:
   The overlap gain is a loss because kernel phases are short enough that the extra `cudaEvent` hand-off overhead dominates the saved copy/compute concurrency.
 - __Stability.__
   A second `illegal memory access` race surfaced on the 3-stream build at `cudaEventSynchronize(finalize)` on PubChem shard 50, +1:26 into the wave.
-  The per-wave `cudaFuncSetAttribute` fix (`e820d41`) closed the root cause; the 3-stream chain re-opens a separate race on the event hand-off that was not pinned down.
+  The per-wave `cudaFuncSetAttribute` fix (`50e1dad`) closed the root cause; the 3-stream chain re-opens a separate race on the event hand-off that was not pinned down.
 
-Reverted `abe4d03`'s `smallfield.cu` + `smallfield.hpp` changes (100 lines, 2 files).
+Reverted `fb257a9`'s `smallfield.cu` + `smallfield.hpp` changes (100 lines, 2 files).
 Per-device pinned pools, ctor pre-allocation, and the launch-config cache from the same refactor survive unchanged.
 
-## 2026-04-20 — Multi-GPU Illegal-Memory-Access Fix — `e820d41`
+## 2026-04-20 — Multi-GPU Illegal-Memory-Access Fix — `50e1dad`
 
 Dropped a per-wave `cudaFuncSetAttribute(embed_4d_power_iter_kernel, MaxDynSM, 67 KB)` from `build_metric_initial_coordinates_on_gpu` that was reached concurrently from every OMP per-device worker thread inside `launch_wave`.
 The call mutates driver-global per-kernel attribute state on a shared kernel symbol; at ≥ 2 GPUs the 8 worker threads raced on that state, producing a window during which `embed_4d_power_iter_kernel` launched with the 48 KB hardware-default dynamic shared instead of the 67 KB the kernel needs at bin 128.
 The out-of-bounds shared-memory access surfaced on a later kernel launch as `an illegal memory access was encountered`.
-The attribute is already set once per device in `context_t::context_t`; the per-wave re-assert was defensive overkill left over from `a134315`, where the ctor hoist landed but the per-wave copy was not removed.
+The attribute is already set once per device in `context_t::context_t`; the per-wave re-assert was defensive overkill left over from `b9f7ffc`, where the ctor hoist landed but the per-wave copy was not removed.
 
 Symptom matching:
 
@@ -726,7 +726,7 @@ Verification — 10 M USearch K=3, 8 GPUs, post-fix:
 | Pre-fix `CUDA_LAUNCH_BLOCKING=1` | 1 063 s |  9 404 |       28 211 |                 0 |
 | Post-fix non-blocking            |   662 s | 15 106 |       45 319 |                 0 |
 
-## 2026-04-20 — Multi-GPU Pipeline Refactor — `abe4d03` and `a134315`
+## 2026-04-20 — Multi-GPU Pipeline Refactor — `fb257a9` and `b9f7ffc`
 
 Four architectural changes to the per-wave GPU dispatch path; together they land the host-scheduling items from the roadmap without altering any kernel code.
 
@@ -748,7 +748,7 @@ Drive-by cleanup: dropped the dead `context_t::batch_ring` field, the unreferenc
 Scope: 2 files in `src/smallfield/api/`, ≈ 100 lines of pipeline wiring; preprocess adds the new per-device distribution helper; three renames in the preprocess headers.
 No kernel code changed.
 
-## 2026-04-19 — CSD Torsion Round 2 — `a78178c`
+## 2026-04-19 — CSD Torsion Round 2 — `9a4635f`
 
 Native pattern coverage 391/470 → __408/470__ (83.2 % → 86.8 %); throughput 23 371 → 23 735 mol/s (+1.55 % over round 1, +16.9 % cumulative).
 The diminishing-returns shape is expected: round 1 already removed the biggest VF2 hot-spots, leaving non-linear topology patterns that resist a strictly linear matcher.
@@ -767,7 +767,7 @@ Patterns whose required mask is not a subset of the molecule's mask are skipped 
 
 Validation: 40.8 M tier-1 (100 K ChEMBL) and 404.5 M tier-2 (1 M USearch) byte-equivalence checks against `RDKit::SubstructMatch`, zero disagreements; full ctest passes.
 
-## 2026-04-19 — CSD Torsion Round 1 — `ec43fc4`
+## 2026-04-19 — CSD Torsion Round 1 — `d2134df`
 
 Native pattern coverage 314/470 → __391/470__ (66.8 % → 83.2 %); wall 493 s → 428 s (-13.2 %); throughput 20 283 → 23 371 mol/s (+15.2 %); `boost::VF2SubState::match` self-time 10.38 % → 6.85 %.
 
@@ -790,24 +790,24 @@ Parser and matcher changes in `csd_torsion_native.hpp`:
 
 Validation: env-var-gated tiered byte-equivalence test in `test_csd_torsion_predicates.cpp` covering a 100 K ChEMBL sample and a 1 M USearch sample, zero disagreements on either tier.
 
-## 2026-04-16 — Kernel-Split-Era Optimizations Tried and Rejected — `9fb7aa2`, `1db76a4`
+## 2026-04-16 — Kernel-Split-Era Optimizations Tried and Rejected — `a4ad188`, `6eb7036`
 
 Found while splitting the monolithic pipeline kernel, and written up in the docs pass that followed it.
 
 - __Register cap on the monolithic kernel__ — `--maxrregcount 128` caused local-memory spills that cancelled the occupancy gain.
-  Only viable after the kernel split, which is what `9fb7aa2` landed.
+  Only viable after the kernel split, which is what `a4ad188` landed.
 - __`__launch_bounds__` bump from 32,4 to 32,6__ — inert, because nvcc already fit 8 blocks/SM from the shared-memory cap.
 - __Tensor cores, FP16 coordinates, larger chunks__ — rejected by ncu data.
   Math pipes idle at 0.2 %, and the grid already fills the device in production.
 - __Branchless `match_linear_pattern` lookup__ — no viable optimization target after profiling.
 
-## 2026-04-15 — Gradient Register Tile, Rejected — `78449f7`
+## 2026-04-15 — Gradient Register Tile, Rejected — `d017e83`
 
 Moved the FIRE gradient array from shared memory to per-lane registers to attack `long_scoreboard` stalls, alongside the int8 bounds quantization that did land.
 ncu showed the stalls came from positions and velocities reads, not gradient.
 Registers rose 116 → 146 with no occupancy win.
 
-## 2026-04-13 — Three Rejections from the Murcko and CIP Work — `9b32ee3`, `78984e3`
+## 2026-04-13 — Three Rejections from the Murcko and CIP Work — `547c379`, `29a0b19`
 
 - __Native CIP chirality ranker__ — two attempts reached 98.94 % and 99.71 % agreement with RDKit, short of the ≥ 99.95 % threshold.
   The second regressed P50 energy, −6.3 against −5.4 kcal/mol, and −2.8 % throughput.
@@ -816,7 +816,7 @@ Registers rose 116 → 146 with no occupancy win.
 - __`__noinline__` on `fire_minimize_`__ — increased register pressure to 207, dropping theoretical occupancy to 16.67 %.
   nvcc re-inlined when the hint was removed; the compiler default was already optimal.
 
-## 2026-04-12 — Managed Memory for the Wave Slice Pool, Rejected — `eb3d9c8`
+## 2026-04-12 — Managed Memory for the Wave Slice Pool, Rejected — `8b6332a`
 
 `cudaMallocManaged` plus `cudaMemPrefetchAsync` was considered for a truly unified pointer in place of the pinned-host-plus-explicit-copy design, while unifying the batch pool and the persistent pinned scratch.
 HMM overhead and prefetch bookkeeping ran 2× slower than pinned plus explicit at the batch sizes this project ships at.

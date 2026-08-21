@@ -8,8 +8,7 @@
  *  3. Deflated power iteration to extract the top-4 eigenvectors of the Gram matrix.
  *  4. Projection into 4D metric coordinates as the initial embedding for subsequent ETKDG refinement stages.
  *
- *  Molecules are grouped by atom count into fixed bins so each kernel launch operates on identically-sized
- *  matrices.
+ *  Molecules are grouped by atom count into fixed bins, so each launch works on identically-sized matrices.
  */
 
 #pragma once
@@ -46,10 +45,9 @@ constexpr std::uint32_t embed_reduction_slots_k = embed_block_size_k / warp_size
 /**
  *  @brief Dynamic shared bytes `embed_4d_power_iter_kernel` needs for a molecule of @p num_atoms atoms.
  *
- *  Sums the layout the kernel carves, term for term: the Gram matrix, the row means widened to hold the
- *  block reduction's staging slots, the grand mean, four eigenvector estimates, the mat-vec scratch, and
- *  four eigenvalues. Every block derives its own layout from its own atom count, so a launch covering
- *  several molecules sizes its request from the largest.
+ *  Sums the layout the kernel carves, term for term: the Gram matrix, the row means widened to hold the block
+ *  reduction's staging slots, the grand mean, four eigenvector estimates, the mat-vec scratch, and four
+ *  eigenvalues. Every block derives its layout from its own atom count, so a launch sizes from the largest.
  *
  *  @param[in] num_atoms Atoms the launch is sized against.
  *  @return Bytes of dynamic shared memory to request.
@@ -61,15 +59,10 @@ __host__ __device__ __forceinline__ std::size_t embed_shared_bytes(std::uint32_t
 }
 
 /**
- *  @brief Returns ((upper + lower) / 2)² for Gram-matrix double-centering.
+ *  @brief Squared midpoint distance ((upper + lower) / 2)² of two atoms, for Gram-matrix double-centering.
  *
- *  Computes the squared midpoint distance between two atoms from their upper and lower bounds.
- *  Returns zero when atom_i equals atom_j.
+ *  Zero when @p atom_i equals @p atom_j.
  *
- *  @param[in] bounds Square bounds matrix over the molecule's atoms.
- *  @param[in] atom_i First atom index.
- *  @param[in] atom_j Second atom index.
- *  @return Squared midpoint distance between atom_i and atom_j.
  *  @see embed_4d_power_iter_kernel
  */
 __device__ __forceinline__ float midpoint_distance_squared_(packed_matrix<float const> bounds, std::uint32_t atom_i,
@@ -84,16 +77,13 @@ __device__ __forceinline__ float midpoint_distance_squared_(packed_matrix<float 
 /**
  *  @brief Deterministic block-wide float sum.
  *
- *  Reduces inside each warp with butterfly shuffles, stages one partial per warp in
- *  @p warp_partials, then has every thread re-add the partials in warp order. The
- *  summation tree depends only on lane and warp index, so the result is bitwise
- *  identical on every run and in every thread — the property a shared-memory float
- *  `atomicAdd` cannot offer, since it commits contributions in whatever order the
- *  scheduler grants and float addition does not associate.
+ *  Reduces inside each warp with butterfly shuffles, stages one partial per warp in @p warp_partials, then has
+ *  every thread re-add the partials in warp order. The summation tree depends only on lane and warp index, so
+ *  the result is bitwise identical on every run and in every thread — a shared-memory float `atomicAdd` cannot
+ *  offer that, committing in whatever order the scheduler grants when float addition does not associate.
  *
- *  Both barriers live inside, so a caller may invoke this straight out of a loop that
- *  produced @p value and consume the return value immediately. Every thread of the
- *  block must reach the call.
+ *  Both barriers live inside, so a caller may invoke this straight out of the loop that produced @p value and
+ *  consume the return immediately. Every thread of the block must reach the call.
  *
  *  @param[in] value This thread's contribution to the sum.
  *  @param[inout] warp_partials Shared scratch of at least `embed_reduction_slots_k` floats.
@@ -115,11 +105,10 @@ __device__ __forceinline__ float embed_block_reduce_sum_(float value, float *war
 /**
  *  @brief Fused bounds-smooth → Gram → top-4 eigen → 4D embedding kernel.
  *
- *  One block of `embed_block_size_k` threads per molecule. Smooths the bounds with
- *  triangle inequalities, builds the double-centered Gram matrix, runs deflated power
- *  iteration to extract the four largest eigenvalues + eigenvectors, and writes the 4D
- *  embedding directly into `initial_coordinates` — one launch, no cusolver, no host
- *  workspace, no inter-kernel Gram-matrix global memory traffic.
+ *  One block of `embed_block_size_k` threads per molecule. Smooths the bounds with triangle inequalities,
+ *  builds the double-centered Gram matrix, runs deflated power iteration for the four largest eigenvalues and
+ *  eigenvectors, and writes the 4D embedding straight into `initial_coordinates` — one launch, no cusolver, no
+ *  host workspace, no inter-kernel Gram-matrix global memory traffic.
  *
  *  Every block-wide sum goes through `embed_block_reduce_sum_`, so the embedding is a
  *  pure function of the bounds matrix: bitwise equal across launches and across blocks,
@@ -139,11 +128,10 @@ __device__ __forceinline__ float embed_block_reduce_sum_(float value, float *war
  *  The carve below and `embed_shared_bytes` state that layout twice, once as pointers and once as a sum,
  *  and nothing compares them: a term added here without being added there overruns the request.
  *
- *  A molecule whose smoothed bounds cross — some pair's lower above its upper — has no embedding at all, so
- *  its block stops after persisting the bounds, leaves its coordinates zeroed, and records
- *  `bounds_infeasible_k` as that molecule's verdict. This kernel is the only stage that can tell an
- *  impossible bounds matrix from a merely hard one, and the verdict it writes is what
- *  `stamp_refused_molecules_kernel` later puts on the molecule's conformer slots.
+ *  A molecule whose smoothed bounds cross — some pair's lower above its upper — has no embedding at all, so its
+ *  block stops after persisting the bounds, leaves its coordinates zeroed, and records `bounds_infeasible_k`.
+ *  This kernel is the only stage that can tell an impossible bounds matrix from a merely hard one, and its
+ *  verdict is what `stamp_refused_molecules_kernel` later puts on the molecule's conformer slots.
  *
  *  @param[inout] bounds_matrices Flat per-molecule bounds matrices, smoothed in place.
  *  @param[in] molecule_metadata Per-molecule atom counts and bounds offsets.
@@ -167,17 +155,15 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
     if (num_atoms == 0) return;
 
     extern __shared__ float embed_shared_raw[];
-    // The row-mean region is at least one slot per warp so it can stage the block reductions
-    // once the Gram build that produced the row means is done with it.
+    // The row-mean region is at least one slot per warp, so it stages the block reductions after the Gram build.
     std::uint32_t const row_means_extent = max(num_atoms, embed_reduction_slots_k);
     float *shared_gram = embed_shared_raw; // N × N, reused for bounds smoothing
     float *row_means = shared_gram + num_atoms * num_atoms;
     float *warp_partials = row_means;                     // Live only after the Gram build
     float *grand_mean_ptr = row_means + row_means_extent; // 1
-    // The four eigenvector estimates are one contiguous 4 × N block, so each estimate is reached by pointer
-    // arithmetic on the loop counter. An array of four pointers indexed by that counter would be a
-    // runtime-indexed local array, which nvcc places on the stack rather than in registers, costing a
-    // per-thread spill for no gain over the multiply.
+    // The four eigenvector estimates are one contiguous 4 × N block, so each is reached by pointer arithmetic
+    // on the loop counter. An array of four pointers indexed by that counter would be a runtime-indexed local
+    // array, which nvcc places on the stack rather than in registers — a per-thread spill for no gain.
     float *eigenvectors = grand_mean_ptr + 1; // 4 × N
     float *gram_product = eigenvectors + 4 * num_atoms;
     float *lambda_ptr = gram_product + num_atoms; // 4
@@ -197,8 +183,7 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
 
     // Floyd-Warshall triangle smoothing on the N × N block. Each round says whether it moved a bound, which
     // this kernel has no use for: feasibility is the only verdict it acts on, and the scan below settles that
-    // in one pass over the finished matrix. The barrier belongs after the round rather than inside it —
-    // `triangle_smooth_pivot_` documents why its own reads and writes cannot collide.
+    // in one pass. The barrier belongs after the round, not inside — `triangle_smooth_pivot_` documents why.
     for (std::uint32_t pivot = 0; pivot < num_atoms; ++pivot) {
         [[maybe_unused]] smoothing_t const round_verdict = triangle_smooth_pivot_(shared_bounds, pivot, lane,
                                                                                   block_size);
@@ -209,13 +194,12 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
     for (std::uint32_t linear_index = lane; linear_index < total_entries; linear_index += block_size)
         global_bounds[linear_index] = shared_gram[linear_index];
 
-    // An impossible matrix has no metric embedding: `midpoint_distance_squared_` averages a lower bound that
-    // sits above its upper, so the Gram matrix built from it is not a distance matrix and its eigenvectors
-    // place the atoms nowhere in particular. The block stops here, leaving this molecule's coordinates at the
-    // zero `build_metric_initial_coordinates_on_gpu` memset — the same slot a molecule outside every bin
-    // already gets — while the bounds just persisted carry the crossed pair itself. `__syncthreads_or`
-    // answers every thread alike, so the whole block leaves together, and the verdict is recorded on the way
-    // out rather than discarded here.
+    // An impossible matrix has no metric embedding: `midpoint_distance_squared_` averages a lower bound above
+    // its upper, so the Gram matrix built from it is not a distance matrix and its eigenvectors place the atoms
+    // nowhere in particular. The block stops here, leaving the coordinates at the zero
+    // `build_metric_initial_coordinates_on_gpu` memset — the same slot a molecule outside every bin gets —
+    // while the bounds just persisted carry the crossed pair. `__syncthreads_or` answers every thread alike, so
+    // the whole block leaves together, with the verdict recorded on the way out.
     smoothing_t const feasibility = bounds_consistency_(shared_bounds, lane, block_size);
     if (__syncthreads_or(feasibility == smoothing_t::infeasible_k) != 0) {
         if (lane == 0) molecule_verdicts[molecule_index] = conformer_status_t::bounds_infeasible_k;
@@ -238,12 +222,11 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
     __syncthreads();
     float const grand_mean = grand_mean_ptr[0];
 
-    // Build the Gram matrix in place, overwriting the smoothed bounds. midpoint_distance_squared_ reads both
-    // the upper and the lower bound of a pair, so a cell must not be overwritten while another thread still
-    // needs it. Walking the upper triangle makes each unordered atom pair the property of exactly one thread:
-    // that thread reads both of the pair's cells and, since the double-centered Gram matrix is symmetric,
-    // writes the one value it computed into both. No cell is ever touched by two threads, so no staging across
-    // a barrier is needed and the kernel keeps every intermediate in registers.
+    // Build the Gram matrix in place, overwriting the smoothed bounds. `midpoint_distance_squared_` reads both
+    // bounds of a pair, so a cell must not be overwritten while another thread still needs it: walking the
+    // upper triangle makes each unordered pair the property of exactly one thread, which reads both its cells
+    // and, the double-centered Gram matrix being symmetric, writes its one value into both. No cell is touched
+    // by two threads, so nothing stages across a barrier and every intermediate stays in registers.
     for (std::uint32_t linear_index = lane; linear_index < total_entries; linear_index += block_size) {
         std::uint32_t const row = linear_index / num_atoms;
         std::uint32_t const column = linear_index % num_atoms;
@@ -255,15 +238,13 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
     }
     __syncthreads();
 
-    // Deflated power iteration for the top-4 eigenvectors. For each estimate in turn, iterate
-    // v_k ← (G - Σ_{j<k} λ_j v_j v_j^T) v_k / ‖·‖. With positive-semidefinite Gram matrices the top
-    // eigenvalues are all non-negative and power iteration converges.
+    // Deflated power iteration for the top-4 eigenvectors: for each estimate in turn, iterate
+    // v_k ← (G - Σ_{j<k} λ_j v_j v_j^T) v_k / ‖·‖. A PSD Gram matrix has non-negative top eigenvalues, so it converges.
     constexpr std::uint32_t max_power_iterations_k = 60;
     constexpr float convergence_tolerance_k = 1e-4f;
     for (std::uint32_t eigenvector_index = 0; eigenvector_index < 4; ++eigenvector_index) {
         float *current_eigenvector = eigenvectors + eigenvector_index * num_atoms;
-        // Initialize with a non-trivial vector orthogonal to the estimates already found, for a better
-        // deflation start: the matching basis vector plus a small spread.
+        // A non-trivial start orthogonal to the estimates already found: matching basis vector plus a spread.
         for (std::uint32_t atom = lane; atom < num_atoms; atom += block_size)
             current_eigenvector[atom] = (atom == eigenvector_index) ? 1.0f : 0.5f / static_cast<float>(num_atoms);
         __syncthreads();
@@ -288,9 +269,8 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
             }
             __syncthreads();
 
-            // Deflation: gram_product -= Σ_{j<k} λ_j (v_j · gram_product) v_j. Since G is symmetric PSD,
-            // removing projections onto the already-found eigenvectors lets power iteration converge onto
-            // the next-largest eigenvalue.
+            // Deflation: gram_product -= Σ_{j<k} λ_j (v_j · gram_product) v_j. G is symmetric PSD, so removing
+            // projections onto the found eigenvectors lets iteration converge onto the next-largest eigenvalue.
             for (std::uint32_t previous_index = 0; previous_index < eigenvector_index; ++previous_index) {
                 float const *previous_eigenvector = eigenvectors + previous_index * num_atoms;
                 float local_projection = 0.0f;
@@ -339,15 +319,13 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
 /**
  *  @brief Async-only metric prepass driver that takes a caller-owned scratch pool.
  *
- *  @p scratch must be pre-sized for the wave's molecule count and @p max_atoms_per_molecule by the caller,
- *  see `ensure_metric_scratch`. This function performs no device allocations and no CPU-side
- *  synchronization; all CUDA calls go on @p stream, so the caller can issue kernel launches against
- *  @p stream immediately afterward and the driver orders them correctly.
+ *  @p scratch must be pre-sized for the wave's molecule count and @p max_atoms_per_molecule by the caller, see
+ *  `ensure_metric_scratch`. No device allocations and no CPU-side synchronization: every CUDA call goes on
+ *  @p stream, so the caller can issue launches against it immediately afterward and they stay ordered.
  *
- *  Every molecule's coordinates start zeroed, and a molecule that reaches no bin, or whose smoothed bounds
- *  turn out to be impossible, keeps that zero rather than an embedding. The impossible one is also the only
- *  molecule this prepass names in @p device_molecule_verdicts, which the caller must have filled with
- *  `success_k` before this runs — a molecule that reaches no bin gets no verdict here either.
+ *  Every molecule's coordinates start zeroed, and one that reaches no bin, or whose smoothed bounds turn out
+ *  impossible, keeps that zero rather than an embedding. Only the impossible one is named in
+ *  @p device_molecule_verdicts — no bin means no verdict — which the caller must have primed with `success_k`.
  *
  *  @param[inout] device_bounds Flat per-molecule bounds matrices, smoothed in place.
  *  @param[in] device_metadata Per-molecule atom counts and bounds offsets, on the device.
@@ -392,11 +370,9 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
         bin_groups[bin].push_back(molecule_index);
     }
 
-    // The `cudaFuncAttributeMaxDynamicSharedMemorySize` attribute for
-    // `embed_4d_power_iter_kernel` is set once per device in
-    // `context_t::context_t` at construction and must not be re-asserted here:
-    // this function runs concurrently from OMP per-device worker threads, and
-    // the attribute mutates driver-global per-kernel state on the same symbol.
+    // `cudaFuncAttributeMaxDynamicSharedMemorySize` for `embed_4d_power_iter_kernel` is set once per device in
+    // `context_t::context_t` and must not be re-asserted here: this runs concurrently from OMP per-device
+    // worker threads, and the attribute mutates driver-global per-kernel state on the same symbol.
 
     for (std::size_t bin = 0; bin < smallfield::types::atom_limited_bin_count_k; ++bin) {
         auto const &group = bin_groups[bin];
@@ -414,7 +390,6 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
 
         std::uint32_t *const device_group_indices = scratch.group_indices.data();
 
-        // Shared memory for embed_4d_power_iter_kernel:
         std::size_t const shared_bytes = embed_shared_bytes(bin_n);
 
         if (!sink.check(cudaMemcpyAsync(device_group_indices, group.data(), group_size * sizeof(std::uint32_t),
@@ -422,17 +397,13 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
                         "cudaMemcpyAsync(bin group indices)"))
             return false;
 
-        // One kernel launch performs the smooth-and-build-gram + eigendecomposition + project
-        // chain entirely on-device: no host-side workspace, no global Gram/eigenvalue buffers.
         embed_4d_power_iter_kernel<<<static_cast<unsigned int>(group_size), embed_block_size_k, shared_bytes, stream>>>(
             device_bounds, device_metadata, device_group_indices, device_initial_coordinates, max_atoms_per_molecule,
             device_molecule_verdicts);
         if (!sink.check(cudaGetLastError(), "embed_4d_power_iter_kernel launch")) return false;
     }
 
-    // No final stream sync: the prepass is stream-ordered with whatever work the
-    // caller launches next on the same stream. Caller's `finalize_gpu_pipeline`
-    // syncs the stream once per wave, which is enough.
+    // No final stream sync: `finalize_gpu_pipeline` syncs the stream once per wave.
     return true;
 }
 

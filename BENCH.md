@@ -104,11 +104,11 @@ Sixteen host threads is this box's defining constraint: `compute_thread_budget_`
 
 __Pipeline, `smallfield_batch`, K=3, one GPU.__
 
-| Corpus                        |    End-to-End | Molecule Success | Measured |
-| :---------------------------- | ------------: | ---------------: | :------- |
-| REAL, 8M molecules, 8 shards  | 10,968 conf/s |          99.99 % | `dce04fc`, 2026-08-13 |
-| REAL, 8M molecules, 8 shards  |  9,291 conf/s |          99.99 % | `60feb403`, 2026-08-12 |
-| PubChem, first shard __only__ |  1,326 conf/s |                — | `60feb403`, 2026-08-12 |
+| Corpus                        |    End-to-End | Molecule Success | Measured               |
+| :---------------------------- | ------------: | ---------------: | :--------------------- |
+| REAL, 8M molecules, 8 shards  | 10,968 conf/s |          99.99 % | `0096e82`, 2026-08-13  |
+| REAL, 8M molecules, 8 shards  |  9,291 conf/s |          99.99 % | 2026-08-12             |
+| PubChem, first shard __only__ |  1,326 conf/s |                — | 2026-08-12             |
 
 The PubChem row is __one shard__, which is one `coprocessed-batch`, so all four roles run serially and nothing overlaps.
 It is the right number for "how long does a cold shard take" and the wrong one for a pipeline share; do not compare it against the REAL rows.
@@ -116,16 +116,16 @@ A number quoted from it as though it described the pipeline is what produced the
 
 ### Where The Host Time Goes
 
-`8M REAL, K=3, 8 shards, 1× H100`, at `dce04fc` on 2026-08-13, from the `role decomposition` block the run prints itself.
+`8M REAL, K=3, 8 shards, 1× H100`, at `0096e82` on 2026-08-13, from the `role decomposition` block the run prints itself.
 Spans sum to 3,738.8 s over 2,188 s of wall, so the roles overlap 1.71× — this is steady state, not ramp.
 
-| Span              |     Wall | Share of Summed | Per Molecule |    Molecules |
-| :---------------- | -------: | --------------: | -----------: | -----------: |
-| gpu-runner-role   | 2000.2 s |       __53.5 %__ |     250.0 µs |    8,000,000 |
-| rdkit-fallback    | 1077.7 s |       __28.8 %__ |  20,088.2 µs |       53,647 |
-| shape-descriptors |  404.1 s |         10.8 %  |      50.5 µs |    8,000,000 |
-| writer-role       |  255.4 s |          6.8 %  |      31.9 µs |    8,000,000 |
-| reader-role       |    1.4 s |          0.04 % |       0.2 µs |    8,000,000 |
+| Span              |     Wall | Share of Summed | Per Molecule | Molecules |
+| :---------------- | -------: | --------------: | -----------: | --------: |
+| gpu-runner-role   | 2000.2 s |      __53.5 %__ |     250.0 µs | 8,000,000 |
+| rdkit-fallback    | 1077.7 s |      __28.8 %__ |  20,088.2 µs |    53,647 |
+| shape-descriptors |  404.1 s |          10.8 % |      50.5 µs | 8,000,000 |
+| writer-role       |  255.4 s |           6.8 % |      31.9 µs | 8,000,000 |
+| reader-role       |    1.4 s |          0.04 % |       0.2 µs | 8,000,000 |
 
 __The fallback is 28.8 % on REAL, not 86 %.__
 That 86 % is PubChem's, and the two do not transfer: REAL dispatches 0.67 % of molecules against PubChem's 2.60 %, and recovers 98.9 % of them against 26 %.
@@ -146,12 +146,12 @@ That multiplier is against a 16-thread baseline and says as much about this host
 
 __Kernel resources__, from `cuobjdump --dump-resource-usage` on the `sm_90` build.
 
-| Kernel                             | Registers | Stack | Note       |
-| :--------------------------------- | --------: | ----: | :--------- |
-| `etkdg_pipeline_warp_kernel`       |        69 |     0 | no spills  |
-| `mmff_polish_warp_kernel`          |        64 |     0 | no spills  |
-| `validate_polished_stereo_kernel`  |        43 |     0 | no spills  |
-| `csd_torsion_match_kernel`         |       255 |   192 | __spills__ |
+| Kernel                            | Registers | Stack | Note       |
+| :-------------------------------- | --------: | ----: | :--------- |
+| `etkdg_pipeline_warp_kernel`      |        69 |     0 | no spills  |
+| `mmff_polish_warp_kernel`         |        64 |     0 | no spills  |
+| `validate_polished_stereo_kernel` |        43 |     0 | no spills  |
+| `csd_torsion_match_kernel`        |       255 |   192 | __spills__ |
 
 A 32-thread block occupies at most 32 of a multiprocessor's 64 warp slots, so 50 % is the ceiling this shape reaches at any register count.
 The polish kernel reaches it: at 64 registers nothing but the slot limit binds, and its shared memory is 3584 B at bin 64 against 228 KB per multiprocessor.
@@ -186,14 +186,14 @@ Measured by clearing the graph's stereo, re-perceiving it from the coordinates w
 
 First 400 molecules with a conformer from one shard of each corpus, 2026-08-13/14.
 
-| Corpus and Shard                              | Centres Inverted | Molecules Fully Right | Partial | Mirror |
-| :-------------------------------------------- | ---------------: | --------------------: | ------: | -----: |
-| REAL `0821000000-0822000000`, shipped          | 69 / 345 = __20.00 %__ |                  74 |      40 |      5 |
-| REAL `0821000000-0822000000`, at `dce04fc`     | 21 / 345 = __6.09 %__  |                 105 |      11 |      3 |
-| REAL __control__, RDKit ETKDGv3                |  0 / 345 = __0.00 %__  |                   — |       — |      — |
-| PubChem `0000000000-0001000000`, shipped       | 47 / 202 = __23.27 %__ |                  28 |      23 |      3 |
-| PubChem `0000000000-0001000000`, at `dce04fc`  | 10 / 182 = __5.49 %__  |                  41 |       8 |      0 |
-| PubChem __control__, RDKit ETKDGv3             |  0 / 193 = __0.00 %__  |                   — |       — |      — |
+| Corpus and Shard                                |       Centres Inverted | Molecules Fully Right | Partial | Mirror |
+| :---------------------------------------------- | ---------------------: | --------------------: | ------: | -----: |
+| REAL `0821000000-0822000000`, 2026-07 corpus    | 69 / 345 = __20.00 %__ |                    74 |      40 |      5 |
+| REAL `0821000000-0822000000`, at `0096e82`      |  21 / 345 = __6.09 %__ |                   105 |      11 |      3 |
+| REAL __control__, RDKit ETKDGv3                 |   0 / 345 = __0.00 %__ |                     — |       — |      — |
+| PubChem `0000000000-0001000000`, 2026-07 corpus | 47 / 202 = __23.27 %__ |                    28 |      23 |      3 |
+| PubChem `0000000000-0001000000`, at `0096e82`   |  10 / 182 = __5.49 %__ |                    41 |       8 |      0 |
+| PubChem __control__, RDKit ETKDGv3              |   0 / 193 = __0.00 %__ |                     — |       — |      — |
 
 Two corpora of very different shape move the same way and by the same magnitude — 20.0 → 6.1 % and 23.3 → 5.5 % — which is the strongest evidence available that this is a real change rather than a sampling artefact.
 Mirror-image failures reach zero on PubChem.
@@ -208,11 +208,11 @@ Comparing raw descriptors does not work: `AssignStereochemistryFrom3D` spells bo
 
 `PubChem 0000000000-0001000000`, same 400 molecules as above, of which 39 carry E/Z stereo at all.
 
-| Corpus and Shard | Stereo Bonds Wrong | All Wrong | Partial |
-| :--------------- | -----------------: | --------: | ------: |
-| shipped          |  25 / 48 = __52.08 %__ |         2 |       3 |
-| at `dce04fc`     |   3 / 40 = __7.50 %__  |         0 |       0 |
-| __control__      |   0 / 48 = __0.00 %__  |         — |       — |
+| Corpus and Shard |    Stereo Bonds Wrong | All Wrong | Partial |
+| :--------------- | --------------------: | --------: | ------: |
+| 2026-07 corpus   | 25 / 48 = __52.08 %__ |         2 |       3 |
+| at `0096e82`     |   3 / 40 = __7.50 %__ |         0 |       0 |
+| __control__      |   0 / 48 = __0.00 %__ |         — |       — |
 
 __The sample is small and the interval is wide.__
 Forty-eight bonds is what 400 drug-like molecules yield, because most carry no E/Z stereo at all.
@@ -222,14 +222,14 @@ The chiral figures above rest on 345 and 202 centres and are firm; this one want
 __Three E/Z Rates Are Quoted In This Project, And They Are Three Different Measurements.__
 They do not average and they do not convert into one another, so each is carried with the configuration and the sample it was taken on.
 
-| Rate | Configuration Scored | Sample | Recorded In |
-| :--- | :------------------- | :----- | :---------- |
-| __52.08 %__ | The shipped 3D corpus, produced before any post-polish stereo check existed | 25 of 48 declared bonds over 400 PubChem molecules | the table above |
+| Rate        | Configuration Scored                                                    | Sample                                                                                       | Recorded In                        |
+| :---------- | :---------------------------------------------------------------------- | :------------------------------------------------------------------------------------------- | :--------------------------------- |
+| __52.08 %__ | The 2026-07 3D corpus, produced without a post-polish stereo check      | 25 of 48 declared bonds over 400 PubChem molecules                                           | the table above                    |
 | __6.441 %__ | Current code with the chiral-volume target and no post-polish E/Z check | declared bonds of the 5,000 molecules scored out of one 20,000-molecule PubChem shard at K=3 | _Closing The Tetrahedral Residual_ |
-| __0.171 %__ | Current code as it ships, post-polish E/Z check included | 1 of 584 declared bonds, same 5,000 molecules | _Closing The Tetrahedral Residual_ |
+| __0.171 %__ | Current code as it ships, post-polish E/Z check included                | 1 of 584 declared bonds, same 5,000 molecules                                                | _Closing The Tetrahedral Residual_ |
 
 The first two differ by producing code and by sample, not by method — both score declared bonds against `AssignCIPLabels` on the geometry.
-The 52.08 % row is a property of stored data and cannot move without regenerating the corpus; the other two move with the pipeline.
+The 52.08 % row is a property of stored data and moves only when the corpus is regenerated; the other two move with the pipeline.
 
 `DEFECTS.md` carries a fourth figure, 279 of 4,921 bonds and 5.67 % on PubChem with 17 of 360 and 4.72 % on REAL, over a 20,000-molecule run at K=3 scoring every declared bond of every slot returned `success_k`.
 That measurement was taken without the post-polish E/Z check and therefore describes the 6.441 % configuration, which its agreement in magnitude confirms.
@@ -252,14 +252,14 @@ Measured in-tree by `bench/validate_stereo.py`, which runs the control every tim
 One 20,000-molecule PubChem shard through `smallfield_batch` at K=3, scored over 5,000 molecules selected by `input_row` at an even stride so every configuration covers the same molecules.
 `1× H100`, 8 physical cores, 2026-08-14.
 
-| Configuration                                 | Centres Inverted | E/Z Inverted | Fallback Molecules |    Wall |
-| :-------------------------------------------- | ---------------: | -----------: | -----------------: | ------: |
-| before                                         | __5.542 %__ _(600-molecule sample)_ | — |  171 |  60.1 s |
-| chiral volume target only                      |      __2.351 %__ |      6.441 % |                 66 |  57.2 s |
-| target + post-polish chirality check           |      __0.080 %__ |      6.441 % |                365 | 118.8 s |
-| __+ post-polish E/Z check__ — __shipped__      |      __0.044 %__ |  __0.171 %__ |                599 | 108.2 s |
-| target + torsion-stage repair                  |      __4.918 %__ |            — |              __0__ | __8.3 s__ |
-| target + repair + post-polish check            |      __0.000 %__ |            — |                449 | 111.3 s |
+| Configuration                             |                    Centres Inverted | E/Z Inverted | Fallback Molecules |      Wall |
+| :---------------------------------------- | ----------------------------------: | -----------: | -----------------: | --------: |
+| before                                    | __5.542 %__ _(600-molecule sample)_ |            — |                171 |    60.1 s |
+| chiral volume target only                 |                         __2.351 %__ |      6.441 % |                 66 |    57.2 s |
+| target + post-polish chirality check      |                         __0.080 %__ |      6.441 % |                365 |   118.8 s |
+| __+ post-polish E/Z check__ — __shipped__ |                         __0.044 %__ |  __0.171 %__ |                599 |   108.2 s |
+| target + torsion-stage repair             |                         __4.918 %__ |            — |              __0__ | __8.3 s__ |
+| target + repair + post-polish check       |                         __0.000 %__ |            — |                449 |   111.3 s |
 
 The E/Z column is the quantity `count_invalid_chiral_centers_` is structurally blind to: it counts tetrahedral centres, and no chiral descriptor is ever emitted for a double bond, so `stereo_failure_k` was unreachable for one until the shipped row.
 One bond in 584, from one in sixteen.
@@ -289,9 +289,9 @@ The control reads 0.000 % on every row.
 
 | Configuration                            | Declared Centres | Centres Inverted | Fallback Molecules | Energy p90 | Energy Max |
 | :--------------------------------------- | ---------------: | ---------------: | -----------------: | ---------: | ---------: |
-| post-polish check only — __was shipped__  |            4,607 |      __0.065 %__ |                362 |  __130.6__ |  __6,462__ |
-| + MMFF chiral restraint                   |            4,924 |      __0.772 %__ |            __153__ |      132.9 |      6,463 |
-| __+ centre-based read__ — __shipped__     |            4,766 |      __0.021 %__ |                257 |  __131.2__ |      6,463 |
+| post-polish check only — __was shipped__ |            4,607 |      __0.065 %__ |                362 |  __130.6__ |  __6,462__ |
+| + MMFF chiral restraint                  |            4,924 |      __0.772 %__ |            __153__ |      132.9 |      6,463 |
+| __+ centre-based read__ — __shipped__    |            4,766 |      __0.021 %__ |                257 |  __131.2__ |      6,463 |
 
 __The restraint alone makes the shipped stereochemistry worse, and not because it fails.__
 Its 38 offenders hold a signed volume of 4.86 to 6.33 cubic angstrom, median 4.93, against the restraint's floor of 5 — parked exactly where it stops pushing — and 17 of 17 that a control embedding could resolve carry the __correct__ sign.
@@ -324,8 +324,8 @@ One cross product serves both, each term's derivative with respect to its own ap
 __The two floors cannot be one number.__
 Over 7,649 declared centres of 8,000 shipped GPU rows of a REAL slice, `|V|` reads:
 
-| Expression   | p0.5 | p1 | p5 | p50 | p90 |
-| :----------- | ---: | ---: | ---: | ---: | ---: |
+| Expression   | p0.5 |   p1 |   p5 |      p50 |  p90 |
+| :----------- | ---: | ---: | ---: | -------: | ---: |
 | pivot-based  | 6.07 | 6.11 | 6.34 | __8.38__ | 8.71 |
 | centre-based | 1.53 | 2.08 | 2.25 | __2.57__ | 2.91 |
 
@@ -336,23 +336,23 @@ A three-coordinate centre is stored as its own fourth neighbour, so the two expr
 __The result, on a 100,000-molecule stride sample of REAL shard 0 at K=3, `1× H100`, Release `sm_90`, 2026-08-16.__
 The baseline column reproduces the full-shard rate to within 0.03 points.
 
-| Measurement                                | pivot volume only | __both volumes__ |
-| :----------------------------------------- | ----------------: | ---------------: |
-| `polish_inverted_center`, share of molecules | __1.586 %__ | __0.000 %__ |
-| `stereo_failure`                             | 416 | 453 |
-| `polish_inverted_bond`                       | 7 | 9 |
-| fallback molecules, all causes               | 2,009 | __462__ |
-| `rdkit-fallback` wall                        | 41.7 s | __6.7 s__ |
-| `gpu-runner-role` wall                       | 16.1 s | 15.0 s |
-| __end to end__                               | __1,653 mol/s__ | __3,919 mol/s__ |
-| conformer energy p90                         | 100.9 | 103.3 |
-| conformer energy max                         | 1,518 | 2,420 |
+| Measurement                                  | pivot volume only | __both volumes__ |
+| :------------------------------------------- | ----------------: | ---------------: |
+| `polish_inverted_center`, share of molecules |       __1.586 %__ |      __0.000 %__ |
+| `stereo_failure`                             |               416 |              453 |
+| `polish_inverted_bond`                       |                 7 |                9 |
+| fallback molecules, all causes               |             2,009 |          __462__ |
+| `rdkit-fallback` wall                        |            41.7 s |        __6.7 s__ |
+| `gpu-runner-role` wall                       |            16.1 s |           15.0 s |
+| __end to end__                               |   __1,653 mol/s__ |  __3,919 mol/s__ |
+| conformer energy p90                         |             100.9 |            103.3 |
+| conformer energy max                         |             1,518 |            2,420 |
 
 The `stereo_failure` and `polish_inverted_bond` rises are bookkeeping, not regression: a cause is tallied once per molecule, so a molecule refused for both reasons was counted under the centre cause and is now counted under the other one.
 
 __Geometry is almost untouched, and the tail that moves is the tail that was being refused.__
 Paired by input row over 299,921 slots both configurations ship, 81.3 % are bit-identical — the flat bottom never binds — and of the 18.7 % that move the median is +0.04 and the p90 +1.99 kcal/mol.
-The p99 of +538 is the slots that were previously RDKit's geometry rather than ours, which is the cost of shipping them instead of refusing them.
+The p99 of +538 is the slots the baseline hands to RDKit's geometry rather than ours, which is the cost of shipping them instead of refusing them.
 
 __Fidelity is held, not traded.__
 On the REAL slice itself `bench/validate_stereo.py` reads 0.000 % of declared centres inverted both before and after — 8,810 declared centres against 8,586 — on a control of 0.000 %.
@@ -368,13 +368,13 @@ The pivot path lost the three cross products it used to sum and gained a shared 
 
 Doubling the two four-dimensional stages — distance geometry 100 → 200 iterations, fourth-dimension crush 50 → 100 — on the same 20,000-molecule PubChem shard.
 
-| Measurement                                   |   before |    after |    delta |
-| :-------------------------------------------- | -------: | -------: | -------: |
-| `stereo_failure`, `bench_conformer_backends`   |  1.830 % |  1.240 % | __−32 %__ |
-| GPU arm, same harness                          | 3,649 ms | 4,225 ms | __+15.8 %__ |
-| fallback dispatches, full CLI at K=3           |      599 |      401 | __−33 %__ |
-| `gpu-runner` wall, full CLI                    |    5.6 s |    7.2 s |  +29 % |
-| __end-to-end wall, full CLI__                  | __108.2 s__ | __106.3 s__ | __−1.8 %__ |
+| Measurement                                  |      before |       after |       delta |
+| :------------------------------------------- | ----------: | ----------: | ----------: |
+| `stereo_failure`, `bench_conformer_backends` |     1.830 % |     1.240 % |   __−32 %__ |
+| GPU arm, same harness                        |    3,649 ms |    4,225 ms | __+15.8 %__ |
+| fallback dispatches, full CLI at K=3         |         599 |         401 |   __−33 %__ |
+| `gpu-runner` wall, full CLI                  |       5.6 s |       7.2 s |       +29 % |
+| __end-to-end wall, full CLI__                | __108.2 s__ | __106.3 s__ |  __−1.8 %__ |
 
 __The stage is not the rounding error it is often called.__
 The ETKDG kernel's 3.8 % of wall is measured on REAL at K=3 with the CPU fallback folded in; against a GPU-only arm the same two stages are roughly 16 %.

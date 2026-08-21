@@ -53,13 +53,13 @@ def test_clean_shard_passes():
     assert within_budget(report_of())
 
 
-def test_shipped_corpus_chiral_rate_fails():
-    """22.878 % of declared centers, which is what the shipped corpus scores and what exited 0."""
+def test_chiral_rate_above_limit_fails():
+    """22.878 % of declared centers, well past the 12 % ceiling, must not pass."""
     assert not within_budget(report_of(chiral_declared=695, chiral_inverted=159))
 
 
-def test_shipped_corpus_ez_rate_fails():
-    """47.771 % of declared bonds, same corpus, same previously-passing run."""
+def test_ez_rate_above_limit_fails():
+    """47.771 % of declared bonds, well past the 1 % ceiling, must not pass."""
     assert not within_budget(report_of(ez_declared=157, ez_inverted=75))
 
 

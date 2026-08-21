@@ -2,23 +2,16 @@
  *  @file bench/bench_kernel_replay.cu
  *  @brief Replays one captured atom-limited bin through the two ETKDG warp kernels, linking only CUDA.
  *
- *  Every NVIDIA profiler currently dies with a SIGSEGV at the first CUDA call inside a SmallField binary:
- *  the injection library and `dlopen` recurse until the stack is gone, 321k frames in, while a program
- *  that links the CUDA runtime alone profiles cleanly on the same box. The difference is the conda-forge
- *  stack — RDKit, boost, Arrow, `{fmt}`, and conda's own `libstdc++` and `libgcc_s`. So this binary links
- *  none of it, and that is the whole reason it exists.
- *
- *  That is also why it prints through `std::printf` rather than `fmt::println` as every other `bench/`
- *  binary does: `{fmt}` is one of the libraries under suspicion. The house grammar is unchanged — a verb
- *  at column zero, ASCII keys, `key=value` throughout.
- *
- *  `SMALLFIELD_CAPTURE_DIR=<dir> SMALLFIELD_CAPTURE_BIN=48 bench_profile --smi <corpus> --conformers 3`
- *  writes the snapshot this reads; `src/smallfield/api/wave_capture.hpp` is the writer and defines the
- *  manifest keys.
- *
- *  That is also why `bench/CMakeLists.txt` builds it as its own target rather than through
- *  `define_smallfield_target`: it links `smallfield_settings` for the flags the shipped kernels compile under
- *  and `CUDA::cudart` for the runtime, and nothing else.
+ *  Every NVIDIA profiler currently dies with a SIGSEGV at the first CUDA call inside a SmallField binary — the
+ *  injection library and `dlopen` recurse until the stack is gone, 321k frames in — while a program that links the
+ *  CUDA runtime alone profiles cleanly on the same box. The difference is the conda-forge stack: RDKit, boost,
+ *  Arrow, `{fmt}`, and conda's own `libstdc++` and `libgcc_s`. This binary links none of it, which is the whole
+ *  reason it exists, why it prints through `std::printf` rather than `fmt::println` as every other `bench/` binary
+ *  does, and why `bench/CMakeLists.txt` builds it as its own target rather than through `define_smallfield_target`
+ *  — `smallfield_settings` for the flags the shipped kernels compile under, `CUDA::cudart` for the runtime, nothing
+ *  else. The house grammar is unchanged: a verb at column zero, ASCII keys, `key=value` throughout.
+ *  `SMALLFIELD_CAPTURE_DIR=<dir> SMALLFIELD_CAPTURE_BIN=48 bench_profile --smi <corpus> --conformers 3` writes the
+ *  snapshot this reads; `src/smallfield/api/wave_capture.hpp` is the writer and defines the manifest keys.
  */
 
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
@@ -43,24 +36,16 @@ static constexpr char const *executable_name_k = "bench_kernel_replay";
 /** Warp size, spelled once, matching the block size both kernels are launched at. */
 static constexpr std::uint32_t warp_size_k = 32;
 
-/**
- *  @brief The byte a status slot carries before either kernel has written it.
- *
- *  Zero is `conformer_status_t::success_k`, so a slot memset to zero and never reached counts as a
- *  conformer the replay produced -- which is the one measurement separating a representative capture
- *  from one whose every slot the polish kernel skipped.
- */
+/** The byte a status slot carries before either kernel has written it. Zero is `conformer_status_t::success_k`, so a
+ *  slot memset to zero and never reached would count as a conformer the replay produced -- the one measurement
+ *  separating a representative capture from one the polish kernel skipped. */
 static constexpr std::uint8_t unwritten_status_k = 0xFF;
 
 #pragma region Capture Manifest
 
-/**
- *  @brief Every scalar `wave_capture.hpp` wrote, in the order the manifest lists it.
- *
- *  The byte offsets are into `batch.bin`; `embedding_offset_floats` is into `embedding.bin`. Both blobs
- *  are uploaded whole and the offsets applied on the device pointer, so a kernel argument here is the
- *  same address arithmetic the pipeline performed, against the same bytes.
- */
+/** Every scalar `wave_capture.hpp` wrote, in the order the manifest lists it. Byte offsets are into `batch.bin`,
+ *  `embedding_offset_floats` into `embedding.bin`; both blobs upload whole with the offsets applied on the device
+ *  pointer, so a kernel argument here is the pipeline's own address arithmetic. */
 struct capture_manifest_t {
     std::uint64_t bin_size = 0;
     std::uint64_t conformer_count = 0;
@@ -226,14 +211,9 @@ static void launch_etkdg_(capture_manifest_t const &manifest, replay_device_t co
         gpu_max_atoms, gpu_max_atoms, manifest.random_seed);
 }
 
-/**
- *  @brief The shape this build's polish kernel launches under, derived rather than replayed.
- *
- *  Taking the grid and the shared size from the manifest would launch every variant under the shape of
- *  the build that captured the snapshot, so a candidate that changes either would be measured against
- *  the wrong occupancy without saying so. Both come from the compiled kernel here, and `main` prints
- *  them beside the captured pair so a divergence is visible rather than assumed.
- */
+/** The shape this build's polish kernel launches under, derived rather than replayed. Taking grid and shared size
+ *  from the manifest would measure every variant under the capturing build's occupancy without saying so; both come
+ *  from the compiled kernel, and `main` prints them beside the captured pair. */
 struct polish_launch_shape_t {
     std::uint32_t grid = 0;
     std::uint32_t shared_bytes = 0;
@@ -280,13 +260,9 @@ static void launch_mmff_(capture_manifest_t const &manifest, replay_device_t con
         static_cast<std::uint32_t>(manifest.bin_max_atoms), device.diagnostics);
 }
 
-/**
- *  @brief Upload both blobs and allocate the three output arrays this bin writes.
- *
- *  The outputs start zeroed on every repeat, which is what makes the pair self-consistent: the polish
- *  kernel reads the coordinates and the statuses its sibling has just written, exactly as it does in the
- *  pipeline, so nothing has to be captured mid-flight.
- */
+/** Upload both blobs and allocate the three output arrays this bin writes. Outputs start zeroed on every repeat,
+ *  which is what makes the pair self-consistent: the polish kernel reads what its sibling has just written, exactly
+ *  as in the pipeline, so nothing has to be captured mid-flight. */
 static bool upload_(capture_manifest_t const &manifest, std::vector<char> const &batch,
                     std::vector<char> const &embedding, replay_device_t &device) {
     std::uint64_t const slot_count = manifest.bin_size * manifest.conformer_count;
@@ -340,12 +316,8 @@ static void print_quantiles_(char const *name, std::vector<float> &samples) {
                 static_cast<double>(samples.back()));
 }
 
-/**
- *  @brief Print how the polish kernel's conformer slots divided across its four exits.
- *
- *  The four exits are what the mean energy cannot separate: three of them ship a geometry MMFF94
- *  never improved, and the energy array is written on every one of them.
- */
+/** Print how the polish kernel's conformer slots divided across its four exits, which the mean energy cannot
+ *  separate: three ship a geometry MMFF94 never improved, and all four write energies. */
 static void report_polish_diagnostics_(std::vector<float> const &diagnostics, std::vector<float> const &energies,
                                        std::uint64_t slot_count) {
     std::uint64_t path_counts[sfc::polish_path_count_k] = {};
@@ -400,9 +372,8 @@ static void report_polish_diagnostics_(std::vector<float> const &diagnostics, st
         std::printf(" %s=%llu", decade_labels_k[bucket], static_cast<unsigned long long>(rms_counts[bucket]));
     std::printf("\n");
 
-    // A mean over conformer energies is dominated by whichever slot kept a van der Waals clash, whose
-    // r^-12 term runs to millions, so the quantiles are what a comparison between two minimizers can
-    // actually be read off.
+    // A mean over conformer energies is dominated by whichever slot kept a van der Waals clash, whose r^-12 term runs
+    // to millions, so two minimizers can only be compared on the quantiles.
     std::printf("QUANTILE");
     print_quantiles_("energy", final_energies);
     print_quantiles_("rms", final_gradients);
@@ -475,9 +446,8 @@ int main(int argc, char **argv) {
                 static_cast<unsigned long long>(manifest.shared_bytes_mmff),                         //
                 static_cast<unsigned long long>(manifest.gpu_max_atoms));
 
-    // What this build's polish kernel actually launches under, beside what the capture recorded. A variant
-    // that changes shared memory or occupancy moves these apart, and measuring it under the captured shape
-    // would report the wrong number without saying so.
+    // What this build's polish kernel launches under, beside what the capture recorded: a variant that changes
+    // shared memory or occupancy moves these apart, and the captured shape would report the wrong number silently.
     polish_launch_shape_t const shape = polish_launch_shape_(manifest);
     std::printf("SHAPE polish_grid=%llu polish_shared=%llu captured_grid=%llu captured_shared=%llu\n", //
                 static_cast<unsigned long long>(shape.grid),                                           //
@@ -524,9 +494,8 @@ int main(int argc, char **argv) {
     cudaEventDestroy(between);
     cudaEventDestroy(after);
 
-    // A snapshot of unrepresentative inputs replays at the right speed for the wrong reason: the ETKDG
-    // kernel would burn every stereo attempt and the polish kernel would skip every slot. Counting the
-    // slots that ended `success_k` and the energies the polish wrote is what separates the two.
+    // A snapshot of unrepresentative inputs replays at the right speed for the wrong reason — ETKDG burning every
+    // stereo attempt, the polish skipping every slot — which the `success_k` count and the written energies separate.
     std::vector<std::uint8_t> status(slot_count, unwritten_status_k);
     std::vector<float> energies(slot_count);
     cudaMemcpy(status.data(), device.status, slot_count, cudaMemcpyDeviceToHost);

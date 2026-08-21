@@ -16,11 +16,9 @@ namespace smallfield::tests {
 /**
  *  @brief Mirror a prepared batch onto the device and run the warp BFS over it.
  *
- *  Reserves one device pool the whole slice spans, uploads the same prefix the production launch path
- *  uploads, fills the device-only hop-count region with `smallfield::cuda::launch_bond_distance_bfs`,
- *  and copies that region back. A pool it cannot reserve leaves @p bond_distance_out untouched and says
- *  so on `stderr` rather than launching on a null pointer.
- *
+ *  Reserves one device pool the whole slice spans, uploads the prefix the production launch path uploads,
+ *  fills the device-only hop-count region with `smallfield::cuda::launch_bond_distance_bfs` and copies it
+ *  back. A pool it cannot reserve leaves @p bond_distance_out untouched and says so on `stderr`.
  *  @param[in] host_uploaded The batch's uploaded prefix, straight off its pinned host view.
  *  @param[in] shape Region extents the device mirror is carved with.
  *  @param[out] bond_distance_out Receives one hop count per element of the slice's hop-count region.

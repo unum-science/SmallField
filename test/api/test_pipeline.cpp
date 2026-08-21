@@ -1,9 +1,7 @@
 /**
  *  @file test/api/test_pipeline.cpp
- *  @brief Test the end-to-end ETKDG pipeline using the SmallField library API.
- *
- *  Tests: SMILES → context_t::generate_conformers → RDKit cross-validation, plus the wave-sizing
- *  arithmetic, the per-wave timing bookkeeping, and the reentrancy that lets two contexts run at once.
+ *  @brief End-to-end ETKDG over the SmallField library API: SMILES → `context_t::generate_conformers` →
+ *  RDKit cross-validation, plus wave-sizing arithmetic, per-wave timing, and two-context reentrancy.
  */
 
 #include <cmath>   // `std::isfinite`, `std::fabs`, `std::sqrt`
@@ -41,10 +39,8 @@ static constexpr std::size_t max_reported_mismatches_k = 20;
 
 namespace smallfield::api {
 
-/*  Wave-sizing arithmetic defined in `src/smallfield/api/smallfield.cu`. Declared here rather than
- *  in the public header because none of it is API: the three functions are lifted out of a
- *  `cudaMemGetInfo` probe precisely so their edge cases can be asserted without a GPU whose free
- *  VRAM a test could dictate. */
+/** Wave-sizing arithmetic from `src/smallfield/api/smallfield.cu`, not API and so out of the public header:
+ *  lifted from a `cudaMemGetInfo` probe so its edge cases assert without a GPU whose free VRAM a test dictates. */
 std::size_t wave_budget_bytes(std::size_t free_probe_count, std::size_t smallest_free_per_slot,
                               std::size_t smallest_total_per_slot) noexcept;
 std::uint32_t divide_rounding_up(std::uint32_t numerator, std::uint32_t denominator) noexcept;
@@ -60,10 +56,8 @@ using api::conformer_status_t;
 
 /**
  *  @brief The tightest-slot budget must survive a total probe failure.
- *
- *  With no free-VRAM reading at all the sizer used to fall through to zero and then to its
- *  hardcoded 50'000 default, because the only assignment to the total-VRAM census sat inside the
- *  branch that a successful free reading guards.
+ *  With no free-VRAM reading the sizer must still budget from the total-VRAM census — recorded outside
+ *  the branch a successful free reading guards — not fall to zero and its hardcoded 50'000 default.
  */
 static void check_wave_budget_arithmetic(diagnostic_reporter_t &reporter) {
     constexpr std::size_t gigabyte_k = 1024ull * 1024ull * 1024ull;
@@ -76,8 +70,7 @@ static void check_wave_budget_arithmetic(diagnostic_reporter_t &reporter) {
         std::size_t expected_budget_bytes;
     };
     constexpr std::array<budget_case_t, 5> cases {{
-        // At least one device answered: 75 % of the tightest free slot, headroom for peak allocation,
-        // and that tightest slot binds however many devices answered.
+        // A device answered: 75 % of the tightest free slot leaves peak-allocation headroom, at any count.
         {.free_probe_count = 1,
          .free_per_slot_bytes = 8 * gigabyte_k,
          .total_per_slot_bytes = 80 * gigabyte_k,
@@ -86,8 +79,7 @@ static void check_wave_budget_arithmetic(diagnostic_reporter_t &reporter) {
          .free_per_slot_bytes = 8 * gigabyte_k,
          .total_per_slot_bytes = 80 * gigabyte_k,
          .expected_budget_bytes = 6 * gigabyte_k},
-        // No device answered: half of the tightest total slot, which is the degraded estimate — not
-        // zero, and not the free reading, which is meaningless in this arm and may not leak into it.
+        // No device answered: half the tightest total slot — not zero, and never the meaningless free one.
         {.free_probe_count = 0,
          .free_per_slot_bytes = 0,
          .total_per_slot_bytes = 80 * gigabyte_k,
@@ -113,10 +105,8 @@ static void check_wave_budget_arithmetic(diagnostic_reporter_t &reporter) {
 
 /**
  *  @brief The per-device reservation must reach its answer by arithmetic, not by two wraps.
- *
- *  Checks the quotient as well as the reservation: the zero-device case used to underflow to
- *  `0xFFFFFFFF`, divide by one, and wrap back to zero, landing on the right final number for
- *  entirely the wrong reason.
+ *  The quotient is checked too: a zero-device case underflowing to `0xFFFFFFFF`, dividing by one and
+ *  wrapping back to zero lands on the right final number for the wrong reason, and only that exposes it.
  */
 static void check_per_device_reservation(diagnostic_reporter_t &reporter) {
     /** One wave spread over one device count, with both numbers the split owes it. */
@@ -164,16 +154,13 @@ struct wave_row_t {
 };
 
 /**
- *  @brief Parse the verbose wave table out of captured logger output; ignores every other line.
+ *  @brief Parse the verbose wave table out of captured @p log_text, ignoring every other line; one entry
+ *  per parsed row, in the order the table printed them.
  *
- *  The scan is a contract with `print_wave_timeline_` in `src/smallfield/api/smallfield.cu`, and both
- *  halves of it are load-bearing: every logger line opens with a `[wall | +elapsed] ` prefix that the
- *  payload starts after, and the row itself is two counts, four millisecond columns, then a literal
- *  ` / ` before the per-wave maximum. Change either there and every row silently stops parsing, which
- *  reads here as a timeline with no waves in it rather than as a failure.
- *
- *  @param[in] log_text Captured logger output, however many lines of it.
- *  @return One entry per parsed row, in the order the table printed them.
+ *  A contract with `print_wave_timeline_` in `src/smallfield/api/smallfield.cu`: a logger line opens with a
+ *  `[wall | +elapsed] ` prefix the payload starts after, and a row is two counts, four millisecond columns,
+ *  then a literal ` / ` before the per-wave maximum. Change either and rows stop parsing silently — an
+ *  empty timeline, not a failure.
  */
 static std::vector<wave_row_t> parse_wave_rows(std::string const &log_text) {
     std::vector<wave_row_t> rows;
@@ -204,12 +191,8 @@ struct conformer_outputs_t {
     std::vector<conformer_status_t> status;
     std::vector<std::uint8_t> num_atoms;
 
-    /**
-     *  @brief Size every array for @p num_molecules molecules addressed through @p layout.
-     *
-     *  @param[in] num_molecules Molecules the batch will carry.
-     *  @param[in] layout Slot addressing the pool and the readers of it agree on.
-     */
+    /** Size every array for @p num_molecules molecules addressed through @p layout, the slot
+     *  addressing the pool and its readers agree on. */
     void reset_for(std::uint32_t num_molecules, api::conformer_slot_layout_t const &layout) {
         std::size_t const slots = static_cast<std::size_t>(num_molecules) * layout.num_conformers;
         coordinates.assign(slots * layout.slot_stride(), __half {});
@@ -221,18 +204,11 @@ struct conformer_outputs_t {
 };
 
 /**
- *  @brief Generate one batch with the verbose timeline captured into @p log_text.
+ *  @brief Generate one batch of @p smiles under @p config, capped at @p max_atoms, into the already-sized
+ *  @p outputs, with the verbose timeline captured into @p log_text and the batch-level status returned.
  *
- *  The logger writes to a `FILE *`, so the capture is a `std::tmpfile` rather than a string stream;
- *  the context's own stream and verbosity are restored before returning.
- *
- *  @param[inout] context Context whose logger is redirected for the duration of the call.
- *  @param[in] smiles Molecules to generate for.
- *  @param[in] config Pipeline configuration, wave size included.
- *  @param[in] max_atoms Atom-count cap the slots are sized against.
- *  @param[out] outputs Coordinate, energy, status and atom-count arrays, already sized.
- *  @param[out] log_text Cleared, then filled with everything the logger emitted.
- *  @return The batch-level status `generate_conformers` answered with.
+ *  @p context has its logger redirected for the duration of the call. The logger writes to a `FILE *`, so
+ *  capture is a `std::tmpfile`; stream and verbosity are restored before returning.
  */
 static conformer_status_t generate_capturing_timeline_(api::context_t &context,
                                                        custd::span<std::string_view const> smiles,
@@ -262,10 +238,9 @@ static conformer_status_t generate_capturing_timeline_(api::context_t &context,
 /**
  *  @brief A wave whose molecules preprocess rejected wholesale must report no GPU time.
  *
- *  Three waves of two, with the two element-gate rejects last — the input is sorted by descending
- *  SMILES length, so the shortest strings land in the final wave. The pipelined path hands the
- *  same two timing vectors round a 2-slot ring, so wave 2 reads the slot wave 0 wrote; a launch
- *  that returns before resetting that slot republishes wave 0's numbers as wave 2's.
+ *  Three waves of two with the element-gate rejects last, since input sorts by descending SMILES length.
+ *  The pipelined path rings the same two timing vectors over 2 slots, so wave 2 reads the slot wave 0
+ *  wrote, and a launch returning before it resets that slot republishes wave 0's numbers.
  */
 static void check_empty_wave_timings(diagnostic_reporter_t &reporter) {
     std::vector<std::string_view> const smiles = {
@@ -276,8 +251,7 @@ static void check_empty_wave_timings(diagnostic_reporter_t &reporter) {
         "[Fe]",                  // 4 — no MMFF94 atom type, rejected by the element gate
         "[La]",                  // 4 — likewise
     };
-    /* The two rejects are the last two entries above and the status loop below walks exactly them.
-     * These bounds are a property of this fixed corpus, not a cap on how much of it is examined. */
+    // Bounds of the two rejects above, a property of this fixed corpus rather than a cap on the sweep.
     constexpr std::uint32_t first_rejected_molecule_k = 4, past_last_rejected_molecule_k = 6;
 
     constexpr std::uint32_t num_conformers_k = 2;
@@ -299,8 +273,7 @@ static void check_empty_wave_timings(diagnostic_reporter_t &reporter) {
 
     std::vector<wave_row_t> const rows = parse_wave_rows(log_text);
     sf_verify_(rows.size() == 3, "expected three wave rows in the verbose timeline");
-    // Waves 0 and 1 carry real molecules, and their GPU time is what keeps the empty-wave comparison
-    // below from passing on a timeline where nothing ever recorded a non-zero millisecond.
+    // Real GPU time in waves 0 and 1 keeps the empty-wave comparison below from passing vacuously.
     sf_verify_(rows[0].gpu_max_ms > 0.f, "wave 0 must record real GPU time, or the check below is vacuous");
     sf_verify_(rows[1].gpu_max_ms > 0.f, "wave 1 must record real GPU time");
 
@@ -327,16 +300,9 @@ static void check_empty_wave_timings(diagnostic_reporter_t &reporter) {
 
 #pragma region Concurrent Contexts
 
-/**
- *  @brief Bytes that differ between two runs of one slice, over every array `generate_conformers` fills.
- *
- *  Raw storage rather than numbers: a half-precision coordinate that came out of a corrupted batch is
- *  still a finite number, and an approximate comparison is exactly what would let one through.
- *
- *  @param[in] first One run's outputs.
- *  @param[in] second The other run's outputs, sized for the same slice and layout.
- *  @return Differing bytes summed over the four arrays.
- */
+/** Bytes differing between runs @p first and @p second of one slice, summed over the four arrays
+ *  `generate_conformers` fills and sized for the same slice and layout. Raw storage, not numbers: a
+ *  corrupted coordinate is still finite, so an approximate compare passes it. */
 static std::size_t differing_bytes_(conformer_outputs_t const &first, conformer_outputs_t const &second) noexcept {
     auto const count_over = [](void const *left, void const *right, std::size_t bytes) {
         auto const *left_bytes = static_cast<std::uint8_t const *>(left);
@@ -354,15 +320,12 @@ static std::size_t differing_bytes_(conformer_outputs_t const &first, conformer_
 /**
  *  @brief Two contexts generating on two threads must answer what the same two slices answer alone.
  *
- *  This check could not be written while `prepare_per_device_batches_into` kept its per-worker
- *  contributions and its partition buffers in file-scope statics: the two threads shared one set of
- *  buffers, each cleared what the other was mid-way through filling, and each packed some share of the
- *  other's molecules into its own pinned pools. Nothing warned — the corruption reads as ordinary
- *  geometry. The scratch is caller-owned now, and byte equality against the serial baseline is the
- *  whole measurable effect of that change.
- *
- *  Both baselines run on their own fresh context, so the only difference between the two phases is
- *  that the second pair overlaps in time.
+ *  `prepare_per_device_batches_into` keeps its per-worker contributions and partition buffers caller-owned:
+ *  in file-scope statics the two threads share one set, each clearing what the other is mid-way through
+ *  filling and packing some of the other's molecules into its own pinned pools, and nothing warns because
+ *  the corruption reads as ordinary geometry. Byte equality against the serial baseline is the whole
+ *  measurable effect. Both baselines run on their own fresh context, so the only difference between the
+ *  two phases is that the second pair overlaps in time.
  */
 static void check_concurrent_contexts(diagnostic_reporter_t &reporter) {
     constexpr std::uint32_t num_conformers_k = 2;
@@ -397,8 +360,7 @@ static void check_concurrent_contexts(diagnostic_reporter_t &reporter) {
         generate(second_slice, context, second_alone);
     }
 
-    // Both contexts are built on this thread and only driven from the two below, so the wave sizer
-    // sees the same VRAM census it would see either way and neither construction races the other.
+    // Both contexts are built here and driven from the threads below: same VRAM census, no construction race.
     {
         api::context_t first_context(custd::span<int const>(&device_id, 1));
         api::context_t second_context(custd::span<int const>(&device_id, 1));
@@ -432,20 +394,16 @@ static void check_concurrent_contexts(diagnostic_reporter_t &reporter) {
 static constexpr double energy_agreement_kcal_k = 0.012;
 
 /**
- *  @brief Below this an atom pair is closer than any real bond, so the geometry that carries it is not one.
+ *  @brief Below this an atom pair is closer than any real bond, so the geometry carrying it is not one.
  *
- *  The shortest bond MMFF94 parameterises is around 0.95 Å, and a returned conformer holding a pair
- *  under half that cannot be the geometry its own energy was evaluated at. Counted rather than gated:
- *  the divergent MMFF94 energies a clash produces are read off the same conformers.
+ *  MMFF94's shortest parameterised bond is around 0.95 Å, so a conformer with a pair under half that
+ *  is not the geometry its own energy came from. Counted, not gated: those divergent energies come off it.
  */
 static constexpr double clash_distance_angstrom_k = 0.5;
 
 /**
- *  @brief Distance between the two closest atoms of an interleaved `(atom, 3)` block.
- *
- *  @param[in] interleaved Coordinates of @p num_atoms atoms, atom-major.
+ *  @brief Smallest interatomic distance in angstroms over an atom-major interleaved `(atom, 3)` block.
  *  @param[in] num_atoms Atoms the block carries; fewer than two has no pair and answers infinity.
- *  @return The smallest interatomic distance in angstroms.
  */
 static double closest_atom_pair_(float const *interleaved, std::uint32_t num_atoms) noexcept {
     double closest = std::numeric_limits<double>::infinity();
@@ -461,7 +419,10 @@ static double closest_atom_pair_(float const *interleaved, std::uint32_t num_ato
     return closest;
 }
 
-/** What one cross-validation pass counted, threaded by reference so the pass owns no module state. */
+/** What one cross-validation pass counted, threaded by reference so the pass owns no module state.
+ *  `energies_nonphysical` is gated at zero — `finalize_gpu_pipeline` demotes any successful slot whose
+ *  energy no consumer can rank by. The `reference_energies_*` pair is RDKit's energy at our coordinates,
+ *  which is the reference rather than our own output. */
 struct cross_validation_tally_t {
     std::uint32_t molecules_compared = 0;
     std::uint32_t molecules_unparsed = 0;
@@ -469,10 +430,7 @@ struct cross_validation_tally_t {
     std::uint32_t molecules_rejected = 0;
     std::uint32_t conformers_attempted = 0;
     std::uint32_t conformers_succeeded = 0;
-    /** Successful slots whose own energy is not a number a consumer can rank by. Gated at zero:
-     *  `finalize_gpu_pipeline` demotes such a slot, so one surviving as `success_k` is a defect. */
     std::uint32_t energies_nonphysical = 0;
-    /** RDKit's energy at our coordinates, which is the reference rather than our own output. */
     std::uint32_t reference_energies_finite = 0;
     std::uint32_t reference_energies_reasonable = 0;
     std::uint32_t energies_diverged = 0;
@@ -485,21 +443,15 @@ struct cross_validation_tally_t {
 };
 
 /**
- *  @brief Generate conformers for @p corpus and read every successful one back through RDKit.
+ *  @brief Generate conformers for @p corpus — built-ins plus whatever corpus was named — and read every
+ *  successful one back through RDKit, counting into @p tally. @p checks owns the atom-count comparison
+ *  section and @p energies narrates the reference energy beside ours.
  *
- *  Two quantities are gated and two are narrated. The post-preprocess atom count must equal RDKit's
- *  own count with hydrogens added, which is what makes the gather address this molecule's atoms
- *  rather than a neighbouring slot's padding; and no slot the pipeline calls a success may carry an
- *  energy that is not a finite number, which is what the status byte promises. RDKit's
- *  MMFF94 energy at our own coordinates is then printed beside ours — the two implementations agree
- *  to about 0.01 kcal/mol — and the returned geometry is measured for atom pairs closer than any
- *  bond, which is what a divergent energy usually turns out to be. Those two are counted and
- *  reported rather than gated.
- *
- *  @param[in] corpus Molecules to generate for, built-ins plus whatever corpus was named.
- *  @param[inout] checks Reporter that owns the atom-count comparison section.
- *  @param[inout] energies Reporter that narrates the reference energy beside ours.
- *  @param[out] tally Counts the summary is printed from.
+ *  Two gates: the post-preprocess atom count must equal RDKit's own with hydrogens added, which is what
+ *  makes the gather address this molecule's atoms rather than a neighbouring slot's padding; and no slot
+ *  called a success may carry a non-finite energy, which is what the status byte promises. Two narrated
+ *  and counted rather than gated: RDKit's MMFF94 energy at our own coordinates, the two agreeing to about
+ *  0.01 kcal/mol, and atom pairs closer than any bond, which is what a divergent energy usually is.
  */
 static void check_generation_against_rdkit(custd::span<std::string_view const> corpus, diagnostic_reporter_t &checks,
                                            diagnostic_reporter_t &energies, cross_validation_tally_t &tally) {
@@ -533,15 +485,13 @@ static void check_generation_against_rdkit(custd::span<std::string_view const> c
             continue;
         }
         if (RDKit::MolOps::getMolFrags(*rdkit_molecule, fragment_mapping) != 1) {
-            // Preprocess keeps only the largest fragment, so the two atom counts describe different
-            // molecules and the coordinates cannot be read back into this one.
+            // Preprocess keeps the largest fragment only: a different molecule, so nothing reads back.
             ++tally.molecules_multi_fragment;
             continue;
         }
 
         if (outputs.num_atoms[molecule] == 0) {
-            // Preprocess refused the molecule — too many atoms, or an element MMFF94 cannot type — and
-            // says so in every one of its conformer statuses. There is no geometry to read back.
+            // Preprocess refused it — too many atoms, or an untypeable element — in every conformer status.
             fmt::println("  no geometry molecule={} status={} smiles={}", molecule,
                          static_cast<unsigned>(outputs.status[static_cast<std::size_t>(molecule) * num_conformers_k]),
                          corpus[molecule]);
@@ -577,9 +527,8 @@ static void check_generation_against_rdkit(custd::span<std::string_view const> c
                 tally.closest_molecule = molecule;
             }
 
-            // Our own energy, through the predicate the producer decided this slot's status with. A
-            // non-finite one is invisible to the divergence count below — `fabs(NaN) > tolerance` is
-            // false — so it needs its own tally or it is not counted at all.
+            // Our own energy, through the predicate the producer set this status with. A non-finite one
+            // is invisible below — `fabs(NaN) > tolerance` is false — so it needs this tally of its own.
             if (!types::energy_is_physical(outputs.energies[slot])) ++tally.energies_nonphysical;
 
             set_coords_interleaved(*rdkit_molecule, interleaved.data());

@@ -121,7 +121,7 @@ __Mechanism:__ Promote the 2-slot `batch_pool_t` ring in `generate_conformers` t
 __Evidence:__ 10M USearch, K=1, 8× Blackwell, 2026-04-19 — the ring idles the GPU 20–30 ms per wave transition, and `finalize_gpu_pipeline` blocks 5–10 ms in `cudaStreamSynchronize` before the next `launch_wave` can start; _stale_, predates device preprocessing.
 __Gain:__ 4–6 % from the depth-3 ring plus 1–2 % from async finalize.
 __Effort:__ Medium — the ring state machine needs careful invariants so slot `i % 3` is not overwritten while wave `i - 3` is still in flight.
-__Risk:__ Medium — a 3-stream split landed in `abe4d03` and was reverted in `d19fdad` for an illegal-memory-access race at the `cudaEventSynchronize(finalize)` hand-off under PubChem drug-like load, together with a ~13 % throughput regression at 10M K=3.
+__Risk:__ Medium — a 3-stream split landed in `fb257a9` and was reverted in `215c91c` for an illegal-memory-access race at the `cudaEventSynchronize(finalize)` hand-off under PubChem drug-like load, together with a ~13 % throughput regression at 10M K=3.
 __Gate:__ Re-validate at drug-like scale, not on USearch fragment-like, where the race window is smaller and kernel phases are long enough to flatter copy/compute overlap.
 
 ### OpenMP Load Imbalance at the Preprocess Barrier

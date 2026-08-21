@@ -42,12 +42,9 @@ std::string_view extract_probe_reason(extract_probe_t outcome) noexcept {
     }
 }
 
-/**
- *  @brief Whether the launch just enqueued was accepted and then ran to completion.
- *
- *  A refusal to enqueue reports through `cudaGetLastError` and nowhere else, and a fault inside the kernel
- *  reports at the drain; both leave the outputs as the allocation found them, so neither may be discarded.
- */
+/** Whether the launch just enqueued was accepted and then ran to completion. A refusal to enqueue reports through
+ *  `cudaGetLastError` and nowhere else, a fault inside the kernel reports at the drain, and both leave the outputs
+ *  as the allocation found them, so neither may be discarded. */
 [[nodiscard]] static bool launch_completed_() noexcept {
     return cudaGetLastError() == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess;
 }
@@ -77,12 +74,8 @@ struct extract_arena_t {
     device_array<sft::mmff94_atom_interaction_t> packed_interactions;
     device_array<sft::etkdg_molecule_metadata_t> metadata;
 
-    /**
-     *  @brief Reserve every fixed-stride array for @p num_molecules molecules over @p total_atoms atoms.
-     *
-     *  Each term array is sized at the per-molecule maximum stride, which is what the staging outputs
-     *  mirror on the host side.
-     */
+    /** Reserve every fixed-stride array for @p num_molecules molecules over @p total_atoms atoms. Each term array
+     *  is sized at the per-molecule maximum stride, which the staging outputs mirror on the host side. */
     [[nodiscard]] bool resize_for(std::uint32_t num_molecules, std::size_t total_atoms) noexcept {
         bool reserved = true;
         auto reserve_ = [&](auto &array, std::size_t count) {
@@ -107,13 +100,10 @@ struct extract_arena_t {
         return reserved;
     }
 
-    /**
-     *  @brief Reserve the compacted arrays once the downloaded counts say what the batch actually holds.
-     *
-     *  Separate from `resize_for` because these extents are what the extractor found rather than a
-     *  property of the batch: nothing on the host knows them until the per-molecule counts come back.
-     *  One slot past each total keeps a batch whose every count is zero from asking for an empty array.
-     */
+    /** Reserve the compacted arrays once the downloaded counts say what the batch actually holds. Separate from
+     *  `resize_for` because these extents are what the extractor found rather than a property of the batch, and
+     *  nothing on the host knows them until the counts come back; one slot past each total keeps a batch whose
+     *  every count is zero from asking for an empty array. */
     [[nodiscard]] bool resize_packed_for(sfmmff::mmff94_packed_offsets_t const &totals) noexcept {
         bool reserved = true;
         auto reserve_ = [&](auto &array, std::size_t count) {
@@ -174,16 +164,16 @@ extract_probe_t launch_mmff94_gpu_extract_pipeline(
     bool copied = sft::download_from(out_interactions, device_interactions, nullptr);
     copied &= sft::download_from(out_atom_offsets, device_atom_offsets, nullptr);
 
-    // Compaction: bring the per-molecule counts home and lay the batch out here, so the offsets the
-    // compaction is judged against are the harness's own arithmetic rather than a second device pass.
+    // Compaction: bring the counts home and lay the batch out here, so the offsets compaction is judged against
+    // are the harness's own arithmetic rather than a second device pass.
     custd::span<sfmmff::mmff94_per_mol_counts_t const> const device_counts = arena.counts_per_molecule.view();
     copied &= sft::download_from(out_counts, device_counts, nullptr);
     // The counts size every allocation below, so the host waits for them rather than reading a copy in flight.
     if (cudaStreamSynchronize(nullptr) != cudaSuccess) return extract_probe_t::launch_failed_k;
     if (!copied) return extract_probe_t::transfer_failed_k;
 
-    // Exclusive scan: molecule `m` is based at the sum of the counts of molecules `0 .. m - 1`, so the
-    // first molecule sits at zero and the running sum after the last one is the batch total.
+    // Exclusive scan: molecule `m` is based at the sum over `0 .. m - 1`, so the first sits at zero and the
+    // running sum after the last is the batch total.
     std::vector<sfmmff::mmff94_packed_offsets_t> per_mol_offsets(num_mols);
     sfmmff::mmff94_packed_offsets_t packed_totals {};
     for (std::uint32_t molecule = 0; molecule < num_mols; ++molecule) {

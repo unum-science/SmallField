@@ -1,7 +1,7 @@
 /**
  *  @file cli/rdkit_fallback.cpp
- *  @brief Runs RDKit ETKDG embedding and MMFF minimization, in an OpenMP-parallel loop, over the
- *  conformer slots the GPU pipeline could not fill.
+ *  @brief Runs RDKit ETKDG embedding and MMFF minimization in an OpenMP-parallel loop, over the conformer
+ *         slots the GPU pipeline could not fill.
  */
 
 #include <cstddef> // `std::size_t`
@@ -33,9 +33,9 @@ namespace sfapi = smallfield::api;
 
 namespace smallfield::cli {
 
-/** Single-threaded warm-up that forces every RDKit lazy-init singleton the fallback OMP loop touches to
- *  populate its caches before the pool of ~188 fallback threads starts racing on first access. See matching
- *  `warm_up_rdkit_globals_once_` in `etkdg_prepare_batch.hpp`. */
+/** Single-threaded warm-up forcing every RDKit lazy-init singleton the fallback OMP loop touches to populate
+ *  its caches before ~188 fallback threads race on first access. Matches `warm_up_rdkit_globals_once_` in
+ *  `etkdg_prepare_batch.hpp`. */
 static void warm_up_rdkit_globals_for_fallback_() {
     [[maybe_unused]] static bool const warmed = [] {
         try {
@@ -44,8 +44,7 @@ static void warm_up_rdkit_globals_for_fallback_() {
                 RDKit::MolOps::addHs(*warm);
                 RDKit::MolOps::assignStereochemistry(*warm, /*cleanIt=*/true, /*force=*/true,
                                                      /*flagPossibleStereoCenters=*/true);
-                // Constructing the properties is the warm-up: it loads RDKit's lazy MMFF parameter
-                // singletons before the parallel region opens on them.
+                // Constructing the properties loads RDKit's lazy MMFF parameter singletons.
                 RDKit::MMFF::MMFFMolProperties props(*warm);
             }
         }
@@ -59,10 +58,8 @@ static void warm_up_rdkit_globals_for_fallback_() {
 #pragma region One Molecule
 
 /**
- *  @brief Folds one stage's host time into a per-molecule tally when it leaves scope.
- *
- *  The tally is a worker thread's own local, so nothing here is atomic; `rdkit_fallback` folds the finished
- *  tally into the shared report once per molecule.
+ *  @brief Folds one stage's host time into a per-molecule tally when it leaves scope. The tally is a worker
+ *         thread's own local, so nothing here is atomic; `rdkit_fallback` folds it into the shared report once.
  */
 class scoped_stage_span_t {
     std::uint64_t &nanoseconds_;
@@ -102,21 +99,19 @@ static std::uint32_t unfilled_slots_of_(custd::span<sfapi::conformer_status_t co
  *  @brief A molecule the fallback admitted, together with the MMFF typing it was admitted by.
  *
  *  The two travel together because they are one fact: MMFF typing is a function of the graph alone, so the
- *  typing that decided admission is the typing every conformer of this molecule minimizes under. Splitting
- *  them is what makes a second typing pass look free.
+ *  typing that decided admission is the one every conformer minimizes under, and splitting them makes a second
+ *  typing pass look free. `mmff_properties` is engaged on exactly the paths `molecule` is non-null, so
+ *  `constructForceField` never re-derives it.
  */
 struct admitted_molecule_t {
     std::unique_ptr<RDKit::RWMol> molecule;
-    /** Engaged on exactly the paths `molecule` is non-null, so `constructForceField` never re-derives it. */
     std::optional<RDKit::MMFF::MMFFMolProperties> mmff_properties;
 };
 
 /**
- *  @brief Parse one SMILES the way the GPU path does and confirm MMFF can type the result.
- *
- *  Typing is checked up front because `constructForceField` would throw below and every conformer would
- *  fail anyway, so a molecule MMFF cannot type costs one typing check instead of K embeddings.
- *
+ *  @brief Parse one SMILES the way the GPU path does and confirm MMFF can type the result. Typing is checked up
+ *         front because `constructForceField` would throw below and every conformer fail anyway, so a molecule
+ *         MMFF cannot type costs one typing check instead of K embeddings.
  *  @param[out] admitted Receives the molecule and its typing on `success_k`, untouched on every refusal.
  *  @param[inout] tally Receives this molecule's parse and typing time.
  *  @return `success_k`, or the status every slot of this molecule takes.
@@ -125,8 +120,7 @@ static sfapi::conformer_status_t admit_molecule_(std::string_view smiles, std::u
                                                  admitted_molecule_t &admitted, fallback_stage_nanoseconds_t &tally) {
     if (smiles.empty()) return sfapi::conformer_status_t::invalid_smiles_k;
 
-    // Same parse contract as the GPU path, counterion removal included, so a molecule recovered here
-    // carries the atom count and geometry the rest of the pipeline expects.
+    // Same parse contract as the GPU path, counterion removal included, so the atom count and geometry match.
     smallfield::parse_result_t parsed;
     {
         scoped_stage_span_t const timed {tally, fallback_stage_t::parse_k};
@@ -137,14 +131,11 @@ static sfapi::conformer_status_t admit_molecule_(std::string_view smiles, std::u
     if (parsed.status != sfapi::conformer_status_t::success_k) return parsed.status;
 
     {
-        // Constructing the typing rewrites the molecule moved out below: it kekulizes and re-marks
-        // aromaticity by MMFF's own pi-electron count, so the molecule the caller receives is the one MMFF
-        // typed rather than the one the parser produced.
-        //
-        // The `try` is what keeps that rewrite from ending the process: the constructor kekulizes, and a
-        // ring RDKit's aromaticity model marks but cannot kekulize — a silacyclopropene the SMILES writes
-        // aromatic, say — leaves by `KekulizeException` rather than by `isValid`. Escaping here would
-        // escape the `omp parallel for` below, and an exception leaving a parallel region is a
+        // Constructing the typing rewrites the molecule moved out below: it kekulizes and re-marks aromaticity
+        // by MMFF's own pi-electron count, so the caller receives the MMFF-typed molecule, not the parser's.
+        // The `try` keeps that rewrite from ending the process -- a ring RDKit's aromaticity model marks but
+        // cannot kekulize, a silacyclopropene the SMILES writes aromatic say, leaves by `KekulizeException`
+        // rather than by `isValid`, and an exception escaping the `omp parallel for` below is a
         // `std::terminate` that takes the whole run's unwritten shards with it.
         scoped_stage_span_t const timed {tally, fallback_stage_t::type_k};
         try {
@@ -167,11 +158,9 @@ static sfapi::conformer_status_t admit_molecule_(std::string_view smiles, std::u
 /**
  *  @brief MMFF-minimize one embedded conformer in place and read back its energy.
  *
- *  @p mmff_properties is the typing admission already computed. The overload that omits it types the
- *  molecule again per conformer, and typing is a function of the graph rather than of the coordinates, so
- *  a molecule with K unfilled slots would pay K+1 aromaticity perceptions, ring builds and charge passes
- *  for one answer.
- *
+ *  @p mmff_properties is the typing admission already computed. The overload omitting it retypes per
+ *  conformer, and typing is a function of the graph rather than the coordinates, so a molecule with K unfilled
+ *  slots would pay K+1 aromaticity perceptions, ring builds and charge passes for one answer.
  *  @param[out] energy_kcal_per_mol Minimized MMFF94 energy, untouched unless the field converged.
  *  @param[inout] tally Receives this conformer's field-construction and minimization time.
  */
@@ -199,10 +188,9 @@ static bool minimize_conformer_(RDKit::RWMol &molecule, RDKit::MMFF::MMFFMolProp
 /**
  *  @brief Write one RDKit conformer into its structure-of-arrays slot, zeroing the padding atoms first.
  *
- *  The three components are written out rather than gathered through `scatter_interleaved_into_slot`,
- *  because RDKit's `RDGeom::Point3D` derives from a polymorphic base and indexes by axis through a virtual
- *  `operator[]`, so reaching that entry point costs a staged interleaved copy per conformer inside the
- *  fallback's parallel region.
+ *  The three components are written out rather than gathered through `scatter_interleaved_into_slot`, because
+ *  RDKit's `RDGeom::Point3D` derives from a polymorphic base and indexes by axis through a virtual
+ *  `operator[]`, so reaching it costs a staged interleaved copy per conformer inside the parallel region.
  */
 static void write_conformer_into_slot_(RDKit::RWMol const &molecule, int conformer_id,
                                        sfapi::conformer_slot_layout_t const &layout, __half *slot) {
@@ -221,9 +209,8 @@ static void write_conformer_into_slot_(RDKit::RWMol const &molecule, int conform
 /**
  *  @brief Embed fresh conformers for one molecule and lay them into the slots the GPU left unfilled.
  *
- *  Only as many conformers are embedded as there are unfilled slots, since `EmbedMultipleConfs` is the
- *  dominant CPU cost here. Slots the GPU did fill keep their coordinates, energy and status untouched.
- *
+ *  Only as many conformers are embedded as there are unfilled slots, `EmbedMultipleConfs` being the dominant
+ *  CPU cost here; slots the GPU did fill keep their coordinates, energy and status untouched.
  *  @param[inout] tally Receives this molecule's embedding, minimization and slot-writing time.
  *  @return Slots this molecule recovered.
  */
@@ -234,15 +221,14 @@ static std::uint32_t recover_molecule_(admitted_molecule_t &admitted, std::uint6
     RDKit::RWMol &molecule = *admitted.molecule;
     RDKit::DGeomHelpers::EmbedParameters embed_params = RDKit::DGeomHelpers::ETKDGv3;
     embed_params.randomSeed = static_cast<int>(random_seed);
-    // The knee, measured on 40,000 REAL molecules with 1,345 dispatched. Distance-geometry embedding is
-    // 65 % of this role's CPU and 81 % of it for the stereo refusals, and the bill is concentrated in
-    // molecules that never recover at all: three of 666 returned zero conformers and burned 16 % of the
-    // whole embed budget, the worst of them 16.2 seconds. A ceiling gives up on exactly those an order
-    // of magnitude sooner. At 25 the residual population's embed falls 279 ms to 99 ms, total 393 ms to
-    // 153 ms, and the paired best MMFF94 energy is unchanged to three decimals on every molecule that
-    // recovered — one slot of 1,284 is lost and no molecule is. At 10 the knee is past: 4.3 % of slots
-    // go. `bench_conformer_backends` has run its RDKit arm at 10 all along, so the shipped path and the
-    // benchmark disagreed about this number and the 200 was never measured.
+    // The knee, measured on 40,000 REAL molecules with 1,345 dispatched. Distance-geometry embedding is 65 % of
+    // this role's CPU and 81 % of it for the stereo refusals, concentrated in molecules that never recover:
+    // three of 666 returned zero conformers and burned 16 % of the whole embed budget, the worst 16.2 seconds,
+    // and a ceiling gives up on exactly those an order of magnitude sooner. At 25 the residual embed falls
+    // 279 ms to 99 ms and the total 393 ms to 153 ms, the paired best MMFF94 energy unchanged to three decimals
+    // on every molecule that recovered, one slot of 1,284 lost and no molecule; at 10 the knee is past and
+    // 4.3 % of slots go. `bench_conformer_backends` has run its RDKit arm at 10 all along, so the shipped path
+    // and the benchmark disagreed about this number and the 200 was never measured.
     embed_params.maxIterations = 25;
 
     std::vector<int> conformer_ids;
@@ -252,7 +238,8 @@ static std::uint32_t recover_molecule_(admitted_molecule_t &admitted, std::uint6
             conformer_ids = RDKit::DGeomHelpers::EmbedMultipleConfs(
                 molecule, static_cast<unsigned int>(unfilled_slots_of_(status)), embed_params);
         }
-        catch (...) { /* an embedding RDKit refused leaves every slot as the GPU left it */
+        catch (...) {
+            // An embedding RDKit refused leaves every slot as the GPU left it.
         }
     }
 
@@ -266,8 +253,7 @@ static std::uint32_t recover_molecule_(admitted_molecule_t &admitted, std::uint6
         float energy_kcal_per_mol = 0.0f;
         if (!minimize_conformer_(molecule, *admitted.mmff_properties, conformer_id, energy_kcal_per_mol, tally))
             continue;
-        // A slot is a success only if its energy is one. The slot keeps whatever the GPU left it with,
-        // which is the honest answer: this producer has nothing to publish for it.
+        // A slot is a success only if its energy is: it keeps what the GPU left, nothing being publishable.
         if (!types::energy_is_physical(energy_kcal_per_mol)) continue;
 
         {
@@ -284,7 +270,6 @@ static std::uint32_t recover_molecule_(admitted_molecule_t &admitted, std::uint6
 
 /**
  *  @brief One dispatched molecule's whole attempt: admit it, embed into its unfilled slots, minimize each.
- *
  *  @param[inout] tally Receives every stage this molecule spent host time in.
  *  @return Slots recovered, zero both when admission refused the molecule and when nothing embedded.
  */
@@ -310,8 +295,8 @@ static std::uint32_t attempt_molecule_(rdkit_fallback_inputs_t const &inputs, rd
         tally);
     if (recovered == 0) return 0;
 
-    // Only a molecule that produced a conformer gets an atom count: a non-zero count over all-zero
-    // coordinates defeats the `num_atoms == 0` guard the descriptor pass downstream skips on.
+    // Only a molecule that produced a conformer gets an atom count, or a non-zero count over all-zero
+    // coordinates would defeat the `num_atoms == 0` guard the descriptor pass skips on.
     outputs.num_atoms_per_molecule[molecule_index] = static_cast<std::uint8_t>(admitted.molecule->getNumAtoms());
     return recovered;
 }

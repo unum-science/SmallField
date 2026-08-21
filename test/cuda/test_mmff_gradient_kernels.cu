@@ -29,15 +29,15 @@ __global__ void mmff_energy_eval_kernel(
 
     std::uint32_t const lane = threadIdx.x;
 
-    // The pair loop reads the folded table, and the polish kernel folds while it stages, so the
-    // harness stages the same way rather than folding on the host under different rounding.
+    // The pair loop reads the folded table and the polish kernel folds while staging, so the harness does
+    // too rather than folding on the host under different rounding.
     extern __shared__ sft::mmff94_atom_vdw_folded_t shared_atom_vdw[];
     for (std::uint32_t atom = lane; atom < num_atoms; atom += sfc::warp_size_k)
         shared_atom_vdw[atom] = sfc::fold_atom_vdw_params_(atom_vdw[atom]);
     __syncwarp(sfc::full_mask_k);
 
-    // No chiral centers: the reference this harness compares against is RDKit's MMFF94, which carries
-    // no chiral term, so the restraint must be absent on both sides for the gradients to agree.
+    // No chiral centers: RDKit's MMFF94 carries no chiral term, so the restraint must be absent on both
+    // sides for the gradients to agree.
     sfc::mmff94_energy_functor_t const functor {.atom_vdw_params = shared_atom_vdw,
                                                 .atom_charge = atom_charge,
                                                 .bond_distance = bond_distance,
@@ -60,9 +60,8 @@ __global__ void mmff_energy_eval_kernel(
  *  @brief Floats the three minimizer arrays occupy before the folded van der Waals table starts.
  *
  *  `mmff94_atom_vdw_folded_t` is sixteen bytes and eight-byte aligned, and `9 * num_atoms` floats is a
- *  multiple of eight bytes only for an even atom count -- the polish kernel carves at the bin's atom cap,
- *  which is even, while this harness carves at the molecule's own count and would otherwise hand the pair
- *  sweep a misaligned load on every odd molecule.
+ *  multiple of eight bytes only for an even atom count. The polish kernel carves at the bin's atom cap,
+ *  which is even; this harness carves at the molecule's own count and would otherwise misalign odd ones.
  */
 constexpr std::uint32_t minimizer_array_floats_(std::uint32_t num_atoms) { return (9u * num_atoms + 3u) & ~3u; }
 
@@ -92,8 +91,8 @@ __global__ void mmff_minimize_kernel(float *positions_inout, sft::mmff94_atom_vd
         shared_float[element] = positions_inout[element];
     __syncwarp(sfc::full_mask_k);
 
-    // No chiral centers: the reference this harness compares against is RDKit's MMFF94, which carries
-    // no chiral term, so the restraint must be absent on both sides for the gradients to agree.
+    // No chiral centers: RDKit's MMFF94 carries no chiral term, so the restraint must be absent on both
+    // sides for the gradients to agree.
     sfc::mmff94_energy_functor_t const functor {.atom_vdw_params = shared_atom_vdw,
                                                 .atom_charge = atom_charge,
                                                 .bond_distance = bond_distance,
@@ -177,8 +176,8 @@ struct gradient_arena_t {
         auto reserve_ = [&](auto &array, std::size_t count) {
             reserved &= array.try_reserve(count) != sft::reserve_outcome_t::failed_k;
         };
-        // A term array may be empty beside a non-zero atom count -- the synthetic single-term fixtures build
-        // exactly that -- and the functor is handed every pointer regardless, so each term keeps one slot.
+        // A term array may be empty beside a non-zero atom count, as the single-term fixtures build, and the
+        // functor is handed every pointer regardless, so each term keeps one slot.
         auto reserve_term_ = [&](auto &array, std::size_t count) { reserve_(array, count == 0 ? 1 : count); };
 
         std::size_t const num_elements = std::size_t {3} * num_atoms;
@@ -195,12 +194,10 @@ struct gradient_arena_t {
         reserve_term_(oops, terms.oops.size());
         reserve_term_(stretchbends, terms.stretchbends.size());
         reserve_term_(interactions, terms.interactions.size());
-        // Indexed per atom, not per term, so the one-slot floor above is the wrong shape for it: a
-        // molecule whose MMFF setup failed arrives with the offsets cleared and `num_atoms` intact, and
-        // every atom above zero then reads past a single element. The fault is sticky, so every later
-        // allocation fails and the run ends having compared almost nothing — which is how this passed
-        // without a sanitizer. Production never reaches it, because the polish kernel skips a molecule
-        // with no terms; this harness has no such guard and must size by what it indexes by.
+        // Indexed per atom, not per term, so the one-slot floor above is the wrong shape: a molecule whose
+        // MMFF setup failed arrives with offsets cleared and `num_atoms` intact, and every atom above zero
+        // reads past a single element, faulting stickily so every later allocation fails too. The polish
+        // kernel skips a molecule with no terms; this harness has no such guard and sizes by its indexing.
         reserve_(atom_offsets, std::max<std::size_t>(terms.atom_offsets.size(), num_atoms));
         return reserved;
     }
@@ -245,9 +242,8 @@ mmff_energy_probe_t gpu_mmff_energy(custd::span<float const> host_positions, std
         arena.bond_distance.data(), arena.bonds.data(), arena.angles.data(), arena.torsions.data(), arena.oops.data(),
         arena.stretchbends.data(), arena.interactions.data(), arena.atom_offsets.data(), num_atoms,
         arena.energy.data());
-    // A launch the driver refuses to enqueue reports here and nowhere else. The kernel never runs, so the
-    // drain below has nothing to fail on, and the gradient still holds whatever the allocation found --
-    // which a caller differencing it against its own energies would read as a wrong analytic gradient.
+    // A refused enqueue reports here and nowhere else: the kernel never runs, the drain has nothing to fail
+    // on, and the gradient still holds whatever the allocation found.
     if (cudaGetLastError() != cudaSuccess) return mmff_energy_probe_t::launch_failed_k;
 
     custd::span<float const> const device_gradient = arena.gradient.view();
@@ -269,8 +265,7 @@ mmff_energy_probe_t gpu_mmff_minimize(custd::span<float> host_positions, std::ui
     if (!arena.upload(custd::span<float const> {host_positions.data(), host_positions.size()}, terms))
         return mmff_energy_probe_t::transfer_failed_k;
 
-    // The three minimizer arrays, then the folded per-atom table behind them, which is the carve
-    // `mmff_minimize_kernel` performs.
+    // The three minimizer arrays, then the folded per-atom table behind them: `mmff_minimize_kernel`'s carve.
     std::uint32_t const shared_bytes = minimizer_array_floats_(num_atoms) * static_cast<std::uint32_t>(sizeof(float)) +
                                        num_atoms * static_cast<std::uint32_t>(sizeof(sft::mmff94_atom_vdw_folded_t));
     mmff_minimize_kernel<<<1, sfc::warp_size_k, shared_bytes>>>(
@@ -307,8 +302,8 @@ struct chiral_restraint_arena_t {
         reserve_(positions, num_components);
         reserve_(gradient, num_components);
         reserve_(energy, 1);
-        // A molecule with no declared center is a legal fixture and stages nothing, but the kernel is
-        // handed the pointer either way, so the array keeps one slot rather than a null.
+        // A molecule with no declared center is a legal fixture, but the kernel is handed the pointer
+        // either way, so the array keeps one slot rather than a null.
         reserve_(centers, num_centers == 0 ? 1 : num_centers);
         return reserved;
     }

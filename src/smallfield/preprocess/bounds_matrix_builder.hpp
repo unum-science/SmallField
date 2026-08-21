@@ -737,9 +737,9 @@ inline void build_bounds_matrix(molecule_descriptor_t const &descriptor, packed_
     // A 1-3 write must never land on a pair an earlier, lower-order sweep already answered. Two neighbours
     // of a center are themselves bonded in every three-membered ring, and the law of cosines below would
     // replace an exact bond length with a 109.47°-derived distance — cyclopropane's C-C going from 1.51 Å
-    // to 2.51 Å, with triangle smoothing finding that perfectly consistent. RDKit carried the same defect
-    // for years; see `c5de9f884357` (#9184) and `bb18fd56f294` (#9412), which introduced the visited-bound
-    // discipline upstream. The hop matrix already distinguishes the orders, so it is the guard here.
+    // to 2.51 Å, with triangle smoothing finding that perfectly consistent. RDKit hits the same class of
+    // bug; see `c5de9f884357` (#9184) and `bb18fd56f294` (#9412) for the visited-bound discipline upstream.
+    // The hop matrix already distinguishes the orders, so it is the guard here.
     for (std::uint32_t center = 0; center < num_atoms; ++center) {
         std::uint32_t const nbegin = descriptor.neighbor_offset[center];
         std::uint32_t const nend = descriptor.neighbor_offset[center + 1];

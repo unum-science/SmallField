@@ -12,11 +12,10 @@
  *  Both lower-bound candidates are taken at their maximum, so a pair pushed apart through one leg of the
  *  triangle keeps that separation when the other leg would have asked for less.
  *
- *  One pivot round is `triangle_smooth_pivot_`, which every cooperating thread calls over its own stride of
- *  the matrix; `triangle_smooth_warp_` drives a whole matrix inside one warp for the smoothing-only test,
- *  and `embed_4d_power_iter_kernel` drives the same round across a block for production. The verdict is
- *  `smoothing_t`, so a matrix no set of coordinates can satisfy is named where it is discovered rather than
- *  embedded and left to surface as a stereo failure three stages later.
+ *  `triangle_smooth_pivot_` is one round over a thread's own stride of the matrix; `triangle_smooth_warp_`
+ *  drives a whole matrix inside one warp for the smoothing-only test, `embed_4d_power_iter_kernel` the same
+ *  round across a block for production. The `smoothing_t` verdict names a matrix no coordinates can satisfy
+ *  where it is discovered, rather than embedding it and letting it surface as a stereo failure later.
  *
  *  Convention: bounds[row * N + column] with row < column = upper, row > column = lower, diagonal = 0.
  */
@@ -30,15 +29,13 @@
 namespace smallfield::cuda {
 
 /*  The verdict and its slack sit outside the `__CUDACC__` guard below, as `warp_size_k` does in
- *  `warp_primitives.cuh`, because a host translation unit that reads what the device decided has to be able
- *  to name the same values the kernel wrote. */
+ *  `warp_primitives.cuh`: host code reading what the device decided must name the values the kernel wrote. */
 
 /**
  *  @brief What one smoothing pass did to a bounds matrix.
  *
- *  A `bool` cannot carry this: it folds "there was nothing left to tighten" together with "the matrix is
- *  impossible", and those are the two answers a caller acts on differently. The three are ordered by
- *  severity, so combining the verdicts of two threads is taking the larger of the two.
+ *  A `bool` would fold "nothing left to tighten" together with "the matrix is impossible", the two answers a
+ *  caller acts on differently. The three are ordered by severity, so combining two verdicts takes the larger.
  */
 enum class smoothing_t : std::uint8_t {
     /** Every triangle inequality already held, and no bound moved. */
@@ -61,10 +58,9 @@ constexpr std::string_view smoothing_name(smoothing_t verdict) noexcept {
 /**
  *  @brief Slack a crossed pair is allowed before it counts as impossible, in angstrom.
  *
- *  A pair whose bounds meet exactly — a rigid triangle, a fixed bond — can cross by the rounding a float
- *  sweep leaves behind, and calling that impossible would refuse molecules that embed perfectly well.
- *  `test_triangle_smooth` prints the largest crossing its corpus produced, so the margin between that and
- *  this number is read rather than assumed.
+ *  A pair whose bounds meet exactly — a rigid triangle, a fixed bond — crosses by the rounding a float sweep
+ *  leaves behind, and refusing those would refuse molecules that embed perfectly well. `test_triangle_smooth`
+ *  prints the largest crossing its corpus produced, so the margin against this number is read, not assumed.
  */
 constexpr float bounds_crossing_tolerance_k = 1e-4f;
 
@@ -88,14 +84,13 @@ __device__ __forceinline__ smoothing_t worse_smoothing_(smoothing_t first, smoot
 /**
  *  @brief One Floyd-Warshall pivot round over the cells this thread owns.
  *
- *  @b No barrier is needed inside a round, and that is a property of which cells it touches rather than an
- *  accepted race. Every cell it reads is incident to @p pivot — `u_row_pivot`, `u_pivot_column`,
- *  `l_row_pivot`, `l_pivot_column` — and every cell it writes is skipped by the `row == pivot ||
- *  column == pivot` guard, so the round's read set and its write set are disjoint and no thread can observe
- *  a cell another thread is tightening. The only cell a thread both reads and writes is its own, which no
- *  other thread visits because the strided walk hands each linear index to exactly one thread. The barrier
- *  that does matter is the one @b after the round, which the caller supplies at its own granularity: the
- *  next pivot reads cells this round wrote.
+ *  @b No barrier is needed inside a round, a property of which cells it touches rather than an accepted race.
+ *  Every cell read is incident to @p pivot — `u_row_pivot`, `u_pivot_column`, `l_row_pivot`, `l_pivot_column`
+ *  — and every cell written is skipped by the `row == pivot || column == pivot` guard, so read set and write
+ *  set are disjoint and no thread observes a cell another is tightening. The only cell a thread both reads
+ *  and writes is its own, which the strided walk hands to exactly one thread. The barrier that does matter is
+ *  the one @b after the round, supplied by the caller at its own granularity: the next pivot reads cells this
+ *  round wrote.
  *
  *  @param[inout] bounds Square bounds matrix over one molecule's atoms.
  *  @param[in] pivot Atom this round routes both bounds through.
@@ -119,8 +114,7 @@ __device__ __forceinline__ smoothing_t triangle_smooth_pivot_(packed_matrix<floa
         float const current = bounds(row, column);
 
         // Above the diagonal the cell is the pair's upper bound, below it the lower one, so the branch picks
-        // which of the two inequalities applies rather than which cell to touch. The lower bounds stay
-        // inside the branch that consults them, where they cost no register on the other path.
+        // which inequality applies, not which cell; the lower bounds cost no register on the other path.
         if (row < column) {
             float const candidate = upper_row_pivot + upper_pivot_column;
             if (candidate < current) {
@@ -144,9 +138,8 @@ __device__ __forceinline__ smoothing_t triangle_smooth_pivot_(packed_matrix<floa
 /**
  *  @brief Whether every pair this thread owns still admits a distance.
  *
- *  Scanning once after the sweep is exactly as strong as testing inside every pivot round and costs one pass
- *  rather than N: smoothing only raises a lower bound and only lowers an upper one, so a pair that crosses
- *  at any point in the sweep is still crossed when the sweep ends.
+ *  One scan after the sweep is as strong as testing inside every pivot round and costs one pass rather than N:
+ *  smoothing only raises lower bounds and lowers upper ones, so a pair that ever crosses is still crossed.
  *
  *  @param[in] bounds Square bounds matrix over one molecule's atoms.
  *  @param[in] first_cell Linear index of this thread's first cell.
@@ -185,8 +178,7 @@ __device__ __forceinline__ smoothing_t triangle_smooth_warp_(packed_matrix<float
         __syncwarp(full_mask_k);
     }
     verdict = worse_smoothing_(verdict, bounds_consistency_(bounds, lane, warp_size_k));
-    // `sm_80` is the floor of `SMALLFIELD_CUDA_ARCH`, so the warp-wide maximum is one `REDUX` rather than
-    // the five-step shuffle ladder the float reductions in `warp_primitives.cuh` are built from.
+    // `sm_80` floors `SMALLFIELD_CUDA_ARCH`, so the warp maximum is one `REDUX`, not a five-step shuffle ladder.
     return static_cast<smoothing_t>(__reduce_max_sync(full_mask_k, static_cast<unsigned int>(verdict)));
 }
 

@@ -11,10 +11,9 @@ from typing import Optional
 def parent_with_hydrogens(smiles: str):
     """The molecule the pipeline actually embedded: largest fragment, then explicit hydrogens.
 
-    `generate_conformers` embeds only the parent fragment, so a validator that parses the whole
-    SMILES describes a different molecule — one with more atoms than the slot holds, whose extra
-    indices read slot padding at the origin. That mismatch manufactured a fictitious defect class
-    in this project once already.
+    `generate_conformers` embeds only the parent fragment, so a validator parsing the whole SMILES describes a
+    different molecule — more atoms than the slot holds, the extra indices reading slot padding at the origin — and
+    the defects it then reports are its own rather than the pipeline's.
     """
     from rdkit import Chem
     from rdkit.Chem.MolStandardize import rdMolStandardize

@@ -2,14 +2,12 @@
  *  @file src/smallfield/api/wave_capture.hpp
  *  @brief One-shot snapshot of everything the two warp kernels read for a single atom-limited bin.
  *
- *  Every NVIDIA profiler crashes a binary that links the conda stack, so a kernel measurement has to
- *  happen in a process that links nothing but the CUDA runtime. This writes the launch of one bin to
- *  disk — the batch pool, the metric embedding, the byte offset of each pointer argument inside them,
- *  and the launch geometry — and `bench/bench_kernel_replay.cu` reads it back and launches the same two
- *  kernels with the same arguments.
- *
- *  The capture is off unless `SMALLFIELD_CAPTURE_DIR` names a writable directory, and it fires for the
- *  first bin whose atom cap equals `SMALLFIELD_CAPTURE_BIN`, once per process.
+ *  Every NVIDIA profiler crashes a binary that links the conda stack, so a kernel measurement has to happen
+ *  in a process linking nothing but the CUDA runtime. This writes one bin's launch to disk — the batch pool,
+ *  the metric embedding, the byte offset of each pointer argument inside them, and the launch geometry — and
+ *  `bench/bench_kernel_replay.cu` reads it back and launches the same two kernels with the same arguments.
+ *  The capture is off unless `SMALLFIELD_CAPTURE_DIR` names a writable directory, and it fires for the first
+ *  bin whose atom cap equals `SMALLFIELD_CAPTURE_BIN`, once per process.
  */
 #pragma once
 
@@ -108,10 +106,9 @@ inline void report_captured_bin_timing(cudaStream_t stream) {
 /**
  *  @brief Write one bin's launch to `SMALLFIELD_CAPTURE_DIR`, once per process.
  *
- *  Called from the enqueue loop immediately before the two launches, so the pointer arithmetic here and
- *  the pointer arithmetic in the launch read the same locals. The stream is synchronized first, because
- *  the preprocess kernels that fill the batch pool are still in flight at that point.
- *
+ *  Called from the enqueue loop immediately before the two launches, so the pointer arithmetic here and in
+ *  the launch read the same locals. The stream is synchronized first, the preprocess kernels that fill the
+ *  batch pool being still in flight at that point.
  *  @param[in] device_view Device mirror of the batch pool, carved out of @p batch_pool.
  *  @param[in] batch_pool The batch mirror itself, whose base anchors every recorded offset.
  *  @param[in] metric_embedding The whole wave's four-dimensional embedding region.
@@ -123,10 +120,9 @@ inline capture_outcome_t capture_bin_launch(wave_slice_view_t const &device_view
                                             custd::span<float const> metric_embedding,
                                             wave_capture_scalars_t const &scalars, cudaStream_t stream) {
     if (scalars.bin_max_atoms != capture_bin_atom_cap()) return capture_outcome_t::skipped_k;
-    // The enqueue loop runs one thread per device, so this latch is read and written concurrently. An
-    // exchange is what makes "once per process" true rather than aspirational: two devices passing it
-    // would both write `manifest.txt`, and the timing events below - created lazily by whoever arrives
-    // first - would be recorded onto a stream belonging to the other one.
+    // One thread per device runs this, so the exchange is what makes "once per process" true: two devices
+    // passing it would both write `manifest.txt`, and the lazily created timing events below would be
+    // recorded onto a stream belonging to the other one.
     static std::atomic<bool> captured {false};
     if (captured.exchange(true, std::memory_order_relaxed)) return capture_outcome_t::skipped_k;
 
@@ -138,7 +134,7 @@ inline capture_outcome_t capture_bin_launch(wave_slice_view_t const &device_view
         return static_cast<std::size_t>(reinterpret_cast<char const *>(pointer) - batch_base);
     };
 
-    // The nine bin-relative pointers the two launches build, spelled here exactly as they are spelled there.
+    // The bin-relative pointers the two launches build, spelled here exactly as they are spelled there.
     auto const *const metadata = device_view.molecule_metadata.data() + scalars.bin_start;
     auto const *const input_indices = device_view.input_indices.data() + scalars.bin_start;
     std::size_t const embedding_offset = static_cast<std::size_t>(scalars.bin_start) * scalars.gpu_max_atoms *

@@ -175,11 +175,10 @@ struct wave_slice_view {
     template <typename element_>
     using element_of = pool_element_t<byte_type_, element_>;
 
-    /*  What the host produces and ships across PCIe: the descriptors the device kernels read, the
-     *  bounds matrix, the chiral centres, the distance constraints, the per-molecule bases each kernel
-     *  writes at, and the typing patch carrying the host's answer for the molecules the device typer
-     *  rejects. `carve_uploaded_` is where all of them are placed.
-     */
+    // What the host produces and ships across PCIe: the descriptors the device kernels read, the bounds
+    // matrix, the chiral centres, the distance constraints, the per-molecule bases each kernel writes
+    // at, and the typing patch carrying the host's answer for the molecules the device typer rejects.
+    // `carve_uploaded_` is where all of them are placed.
     custd::span<element_of<float>> bounds_matrices {};
     custd::span<element_of<chiral_center_descriptor_t>> chiral_centers {};
     custd::span<element_of<distance_constraint_t>> distance_constraints {};
@@ -192,10 +191,9 @@ struct wave_slice_view {
     custd::span<element_of<etkdg_molecule_metadata_t>> molecule_metadata {};
     custd::span<element_of<std::uint32_t>> input_indices {};
 
-    /*  What the device preprocessing kernels produce, and nothing else: the ETK torsions and their
-     *  per-atom CSR, every MMFF term array and its CSR, the per-atom types and charges, and the
-     *  hop-count matrix. `carve_device_only_` is where all of them are placed.
-     */
+    // What the device preprocessing kernels produce, and nothing else: the ETK torsions and their
+    // per-atom CSR, every MMFF term array and its CSR, the per-atom types and charges, and the
+    // hop-count matrix. `carve_device_only_` is where all of them are placed.
     custd::span<element_of<etk_torsion_descriptor_t>> etk_torsions {};
     custd::span<element_of<std::uint32_t>> torsion_counts {};
     custd::span<element_of<etk_atom_interaction_t>> etk_interactions {};

@@ -12,11 +12,9 @@
 
 namespace smallfield::cuda {
 
-/*  These two sit outside the `__CUDACC__` guard below, unlike everything else here, because they are
- *  hardware facts rather than device code. A host translation unit that sizes a launch or a stride
- *  against the warp width has to be able to name the same constant the kernel does — and this header
- *  is where it is named once, so putting it behind a guard `g++` never takes would push every host
- *  caller back to a bare `32`. */
+/*  These two sit outside the `__CUDACC__` guard, unlike everything else here, because they are hardware facts
+ *  rather than device code: a host translation unit sizing a launch or a stride has to name the same constant
+ *  the kernel does, and a guard `g++` never takes would push it back to a bare `32`. */
 
 /** Threads a warp carries on every architecture this project targets. */
 constexpr std::uint32_t warp_size_k = 32;
@@ -27,9 +25,8 @@ constexpr unsigned int full_mask_k = 0xFFFFFFFF;
 /**
  *  @brief `|sin φ|` below which a torsion's chain-rule factor takes its L'Hopital limit instead.
  *
- *  Both torsion terms divide their first derivative by `sin φ`, and both numerator and denominator go to
- *  zero at φ = 0 and φ = pi. One threshold rather than two because the two kernels once carried 1e-6 and
- *  1e-8 for the same quantity, and only the looser one had the limit written behind it.
+ *  Both torsion terms divide their first derivative by `sin φ`, and numerator and denominator both vanish at
+ *  φ = 0 and φ = pi. One threshold serves both kernels, so the limit behind it is written once.
  */
 constexpr float torsion_planarity_threshold_k = 1e-6f;
 
@@ -92,14 +89,12 @@ __device__ __forceinline__ void accumulate_gradient_(float3 *gradient, float3 co
 /**
  *  @brief Partial derivative of cos(θ) with respect to the @p this_atom position.
  *
- *  For an angle θ formed at a center j by neighbors @p this_atom and @p other_atom, where
- *  `this_unit` and `other_unit` are the corresponding bond unit vectors *from* j and
- *  `inverse_distance_this` is 1 / |r_this - r_j|:
+ *  For angle θ at center j between neighbors @p this_atom and @p other_atom, with `this_unit`/`other_unit` the
+ *  bond unit vectors *from* j and `inverse_distance_this` = 1 / |r_this - r_j|:
  *
  *      ∂cosθ/∂r_this = (other_unit − cosθ · this_unit) / |r_this - r_j|
  *
- *  Used by mmff_angle_contribution_ and mmff_stretchbend_contribution_; the
- *  center-atom gradient is just `-(grad_first + grad_third)` from this formula.
+ *  The center-atom gradient is `-(grad_first + grad_third)`. Used by the angle and stretch-bend terms.
  */
 __device__ __forceinline__ float3 angle_cosine_gradient_(float3 const &this_unit, float3 const &other_unit,
                                                          float cos_theta, float inverse_distance_this) {

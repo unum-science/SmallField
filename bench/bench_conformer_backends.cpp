@@ -3,8 +3,7 @@
  *  @brief RDKit CPU against SmallField GPU over one SMILES corpus, swept across batch sizes, with the
  *  SmallField geometries cross-validated by RDKit's own MMFF94.
  *
- *  Exit code `1` is reserved for the quality gate failing, so a throughput regression and a correctness
- *  regression do not read alike.
+ *  Exit code `1` is the quality gate failing, so throughput and correctness regressions do not read alike.
  */
 
 #include <cmath>   // `std::isfinite`, `std::fabs`
@@ -47,39 +46,22 @@ static constexpr char const *executable_name_k = "bench_conformer_backends";
 static constexpr std::uint32_t max_conformers_per_molecule_k = 1024;
 static constexpr std::uint32_t max_quality_samples_k = 10'000'000;
 
-/**
- *  @brief Fewest heavy-bin samples the gate will render a verdict on.
- *
- *  Drug-like corpora put around 2 % of their molecules in the 100-128 atom bin — 97 of 4,788 on the corpus
- *  behind `BENCH.md` — so `--quality-samples 512` reaches the gate with about ten. A P95 over ten values is
- *  its second-largest element, and a verdict on that is the silent-validator shape this project has removed
- *  twice already. Clearing this floor takes roughly 1,500 quality samples.
- */
+/** Fewest heavy-bin samples the gate will render a verdict on; ~1,500 quality samples clear it. Drug-like corpora
+ *  put ~2 % of molecules in the 100-128 atom bin — 97 of 4,788 on the corpus behind `BENCH.md` — so
+ *  `--quality-samples 512` reaches the gate with about ten, whose P95 is just their second-largest element. */
 static constexpr std::size_t min_heavy_bin_samples_k = 30;
 
-/**
- *  @brief Below this an atom pair is closer than any bond MMFF94 parameterises, so the geometry is not one.
- *
- *  A geometry check rather than an energy one, and that is why it is here: the defect it catches first is a
- *  readback that addressed the wrong atoms, which every energy statistic can only report as a large number.
- */
+/** Below this an atom pair is closer than any bond MMFF94 parameterises, so the geometry is not one. A geometry
+ *  check, not an energy one: it catches a readback of the wrong atoms, which energy alone only inflates. */
 static constexpr double clash_distance_angstrom_k = 0.5;
 
-/**
- *  @brief Atom stride of every conformer slot in the coordinate pool.
- *
- *  The generator is handed this and the cross-validator reads back with it, so both must name the same
- *  constant: reading a pool at the wrong stride silently returns a neighbouring conformer's coordinates.
- */
+/** Atom stride of every conformer slot in the coordinate pool. Generator and cross-validator must share it: a wrong
+ *  stride silently reads a neighbour conformer's coordinates. */
 static constexpr std::uint32_t coordinate_stride_atoms_k = smallfield::types::max_atoms_per_molecule_k;
 
-/**
- *  @brief What a conformer slot carries before `generate_conformers` has written it.
- *
- *  A value-initialized `conformer_status_t` is `success_k`, so a slot the pipeline never reached would be
- *  counted as a conformer it produced and drawn into the RDKit cross-validation sample, which then scores
- *  uninitialized coordinates and decides this binary's exit code on them.
- */
+/** What a conformer slot carries before `generate_conformers` has written it. A value-initialized
+ *  `conformer_status_t` is `success_k`, so a slot the pipeline never reached would be drawn into the RDKit
+ *  cross-validation sample, scored on uninitialized coordinates, and decide this binary's exit code. */
 static constexpr sfapi::conformer_status_t unwritten_status_k = sfapi::conformer_status_t::invalid_smiles_k;
 
 #pragma region Statistics
@@ -94,12 +76,8 @@ static double percentile(custd::span<double const> sorted_values, double percent
     return sorted_values[lower_index] * (1.0 - fraction) + sorted_values[upper_index] * fraction;
 }
 
-/**
- *  @brief Upper bounds of the reported bins; bin `bin` covers atom counts in `(lower, bounds[bin]]`.
- *
- *  The last bound is the library's own atom cap rather than a number of its own, because a table stopping
- *  short of it drops every molecule above the shortfall out of the breakdown with nothing said.
- */
+/** Upper bounds of the reported bins; bin `bin` covers atom counts in `(lower, bounds[bin]]`. The last bound is the
+ *  library's atom cap; stopping short drops every heavier molecule from the breakdown silently. */
 static constexpr std::uint32_t atom_count_bin_bounds_k[] = {20, 40, 60, 80, 100, 128, coordinate_stride_atoms_k};
 static constexpr std::size_t num_atom_count_bins_k = std::size(atom_count_bin_bounds_k);
 static_assert(atom_count_bin_bounds_k[num_atom_count_bins_k - 1] == coordinate_stride_atoms_k,
@@ -110,14 +88,9 @@ static constexpr std::uint32_t atom_count_bin_lower_bound_(std::size_t bin) {
     return bin == 0 ? 0u : atom_count_bin_bounds_k[bin - 1];
 }
 
-/**
- *  @brief The bin the gate renders its verdict on, and the thresholds it renders it against.
- *
- *  100-128 atoms, which is where the distance-geometry embedding and the MMFF relaxation are both under the
- *  most strain and where a regression shows first. The bin above it is reported but not gated: no threshold
- *  has been calibrated against a 129-192 atom sample, and a gate on an uncalibrated threshold is a coin toss
- *  dressed as a check.
- */
+/** The bin the gate renders its verdict on, and the thresholds it renders it against: 100-128 atoms, where the
+ *  embedding and the MMFF relaxation are both under the most strain and a regression shows first. The bin above is
+ *  reported but not gated, no threshold being calibrated against a 129-192 atom sample. */
 static constexpr std::size_t gate_bin_k = 5;
 static_assert(atom_count_bin_bounds_k[gate_bin_k - 1] == 100 && atom_count_bin_bounds_k[gate_bin_k] == 128,
               "the gate's thresholds were measured on the 100-128 atom bin");
@@ -212,14 +185,13 @@ static void bench_smallfield_gpu(std::vector<std::string> const &smiles, std::ui
     generation_config.num_conformers = num_conformers;
     generation_config.max_stereo_attempts = max_stereo_attempts;
 
-    // `std::size_t` throughout: at 10 M molecules and three conformers the coordinate buffer passes
-    // `UINT32_MAX` elements, and a 32-bit offset would wrap into another molecule's coordinates.
+    // `std::size_t` throughout: ten million molecules at three conformers each passes `UINT32_MAX`
+    // elements, and a 32-bit offset wraps.
     std::size_t const total_conformers = static_cast<std::size_t>(num_smiles) * num_conformers;
     coords_out.resize(total_conformers * coordinate_stride_atoms_k * 3);
     energies_out.resize(total_conformers);
     status_out.assign(total_conformers, unwritten_status_k);
-    // Zero is what `generate_conformers` writes for a molecule preprocess refused, so a molecule it never
-    // reached at all reads back as one it refused rather than as a stale count from the previous rung.
+    // Zero is what `generate_conformers` writes for a refused molecule, so an unreached one reads refused, not stale.
     num_atoms_out.assign(num_smiles, std::uint8_t {0});
 
     int const device_id = 0;
@@ -256,8 +228,7 @@ static void bench_smallfield_multi_gpu(std::vector<std::string> const &smiles, s
     std::vector<float> energies(total_conformers);
     std::vector<sfapi::conformer_status_t> status(total_conformers, unwritten_status_k);
 
-    // An empty device span is every visible GPU, so a scaling sweep controlling the count through
-    // `CUDA_VISIBLE_DEVICES` reaches this path with one device and still runs.
+    // An empty device span is every visible GPU, so a `CUDA_VISIBLE_DEVICES`-controlled sweep still runs at one.
     sfapi::context_t gpu_context;
 
     if (gpu_context.device_ids.empty()) {
@@ -283,58 +254,44 @@ static void bench_smallfield_multi_gpu(std::vector<std::string> const &smiles, s
 
 #pragma region Quality Gate
 
-/** Verdict of the 100-128 atom quality gate, including the case where too few samples reached it. */
+/** Verdict of the 100-128 atom quality gate; `not_evaluated_k` is too few samples for a percentile to mean anything. */
 enum class gate_verdict_t {
     passed_k,
     failed_k,
-    /** Too few conformers reached the heavy bin for a percentile to mean anything. */
     not_evaluated_k,
 };
 
-/** One conformer drawn for cross-validation: where it came from, and what both engines scored it. */
+/** One conformer drawn for cross-validation: where it came from, and what both engines scored it. `num_atoms` is
+ *  SmallField's own post-preprocess count, naming the fragment the pipeline embedded; each field's initializer is
+ *  its "unwritten" sentinel, so no validity flag can disagree with the data; and `scored()` demands both sides
+ *  finite, one NaN inside the `std::sort` below being an undefined ordering over the whole sample. */
 struct sampled_conformer_t {
     std::uint32_t molecule_index = 0;
     std::uint32_t conformer_index = 0;
-    /** SmallField's own post-preprocess count, so it describes the fragment the pipeline embedded.
-     *  Zero @b is the answer "no geometry was read back for this slot", so no validity flag can disagree. */
     std::uint32_t num_atoms = 0;
-    /** Infinite until a geometry is read back; the smallest interatomic distance once one is. */
     double closest_atom_pair = std::numeric_limits<double>::infinity();
-    /** Non-finite @b is the answer "RDKit never scored this geometry", so no validity flag can disagree. */
     double rdkit_energy = std::numeric_limits<double>::quiet_NaN();
     double smallfield_energy = 0.0;
 
     [[nodiscard]] bool gathered() const noexcept { return num_atoms != 0; }
-    /** Both sides, because `paired_delta` is what every statistic below sorts and one NaN inside a
-     *  `std::sort` is an undefined ordering over the whole sample rather than one missing element. */
     [[nodiscard]] bool scored() const noexcept {
         return std::isfinite(rdkit_energy) && std::isfinite(smallfield_energy);
     }
     [[nodiscard]] bool clashing() const noexcept { return closest_atom_pair < clash_distance_angstrom_k; }
-    /** SmallField minus RDKit on the same geometry, which is the quantity that measures agreement. */
     [[nodiscard]] double paired_delta() const noexcept { return smallfield_energy - rdkit_energy; }
 };
 
-/**
- *  @brief Conformers the cross-validation drew but could not compare, and why.
- *
- *  A `compared=` count that shrinks says nothing about which reason moved, and the atom-count mismatch is a
- *  property of the corpus rather than of the geometry, so it must not read as a regression.
- */
+/** Conformers the cross-validation drew but could not compare, and why — a shrinking `compared=` says nothing about
+ *  which reason moved. `unparsed` is a corpus row the reference parser refuses; `atom_count_mismatch` is a re-parse
+ *  keeping every fragment where `generate_conformers` embedded only the largest, so the two counts describe
+ *  different molecules — a corpus property, which must not read as a regression. */
 struct sample_skips_t {
-    /** The corpus row does not parse under the reference parser. */
     std::size_t unparsed = 0;
-    /** The re-parse keeps every fragment where `generate_conformers` embedded only the largest, so the two
-     *  atom counts describe different molecules and the slot cannot be read back into this one. */
     std::size_t atom_count_mismatch = 0;
 };
 
-/**
- *  @brief Draw up to @p max_samples successful conformer slots into @p sample, which is cleared first.
- *
- *  A shuffle rather than a prefix, because slot order follows corpus order and a corpus is ordered by
- *  deposition, so a prefix samples one neighbourhood of it.
- */
+/** Draw up to @p max_samples successful conformer slots into @p sample, which is cleared first. A shuffle, not a
+ *  prefix: slot order follows the corpus's deposition order, so a prefix samples one neighbourhood. */
 static void fill_success_sample_into_(custd::span<sfapi::conformer_status_t const> status,
                                       sfapi::conformer_slot_layout_t const &slot_layout, std::uint32_t max_samples,
                                       std::vector<sampled_conformer_t> &sample) {
@@ -354,14 +311,10 @@ static void fill_success_sample_into_(custd::span<sfapi::conformer_status_t cons
 /**
  *  @brief Score every drawn conformer with RDKit's own MMFF94, on SmallField's coordinates, in place.
  *
- *  `generate_conformers` embeds only a molecule's largest fragment, so `num_atoms_per_molecule` — not the
- *  corpus string, and not the reference molecule re-derived from it — is what says how many atoms the slot
- *  holds. Reading a salt form at the re-parsed count gathers the counterion's atoms out of slot padding,
- *  which puts them at the origin on top of the parent's, and RDKit's van der Waals term then answers with a
- *  number nine orders of magnitude past any conformer energy. Where the two counts disagree the reference
- *  molecule is a different molecule, so the sample is skipped rather than repaired.
- *
- *  @return What could not be compared and why, so a shrinking `compared=` names its own cause.
+ *  `generate_conformers` embeds only a molecule's largest fragment, so `num_atoms_per_molecule`, not the corpus
+ *  string nor the reference molecule re-derived from it, says how many atoms the slot holds. At the re-parsed count a
+ *  salt form gathers the counterion's atoms out of slot padding onto the parent's at the origin, and RDKit's van der
+ *  Waals term answers nine orders of magnitude past any conformer energy — a different molecule, so it is skipped.
  */
 static sample_skips_t score_sample_with_rdkit_(std::vector<std::string> const &smiles,
                                                std::vector<__half> const &coords, std::vector<float> const &energies,
@@ -383,9 +336,8 @@ static sample_skips_t score_sample_with_rdkit_(std::vector<std::string> const &s
                 ++mismatched;
                 continue;
             }
-            // The coordinates written below are SmallField's, so the conformer only has to exist at the
-            // right size. Embedding one to obtain the slot spends an ETKDG run per sample and drops the
-            // molecules ETKDG refuses, which are disproportionately the large ones this gate judges.
+            // The coordinates written below are SmallField's, so the conformer need only exist at the right size;
+            // embedding one costs an ETKDG run per sample and drops the large molecules ETKDG refuses — the gated ones.
             sftest::attach_empty_conformer(*rdkit_molecule);
 
             std::size_t const coordinate_offset = slot_layout.slot_offset(drawn.molecule_index, drawn.conformer_index);
@@ -399,8 +351,7 @@ static sample_skips_t score_sample_with_rdkit_(std::vector<std::string> const &s
             drawn.closest_atom_pair = sftest::closest_atom_pair(geometry);
             drawn.smallfield_energy = static_cast<double>(
                 energies[slot_layout.flat_slot(drawn.molecule_index, drawn.conformer_index)]);
-            // Written after the geometry it describes: a non-zero count is what marks the slot read back,
-            // so it must not be set before the fields a reader will pair it with.
+            // Written after the geometry it describes: a non-zero count is what marks the slot read back.
             drawn.num_atoms = num_atoms;
             // Written last, for the same reason: a finite energy is what marks the sample scored.
             drawn.rdkit_energy = sftest::rdkit_mmff94_energy(*rdkit_molecule);
@@ -412,13 +363,9 @@ static sample_skips_t score_sample_with_rdkit_(std::vector<std::string> const &s
     return {.unparsed = unparsed, .atom_count_mismatch = mismatched};
 }
 
-/**
- *  @brief Report the paired delta and both marginal distributions over every scored sample.
- *
- *  Both columns describe the same geometry, since RDKit is evaluated on SmallField's own coordinates, so
- *  the per-conformer difference is what measures agreement. Independently sorted marginals do not: a
- *  uniform offset, a heavy negative tail, and partial cancellation all shift them alike.
- */
+/** Report the paired delta and both marginal distributions over every scored sample. RDKit is evaluated on
+ *  SmallField's own coordinates, so the per-conformer difference measures agreement, while independently sorted
+ *  marginals do not: a uniform offset, a heavy negative tail and partial cancellation shift them alike. */
 static void report_energy_distributions_(custd::span<sampled_conformer_t const> sample, sample_skips_t const &skips,
                                          std::vector<double> &scratch) {
     if (sample.empty()) return; // the counts the gate declines on are printed by `judge_heavy_bin_`
@@ -428,9 +375,8 @@ static void report_energy_distributions_(custd::span<sampled_conformer_t const> 
         ++num_gathered;
         if (drawn.clashing()) ++num_clashing;
     }
-    // Three denominators, printed apart. A drawn conformer the harness could not read back is an instrument
-    // limit, a read-back one RDKit refused to type is a corpus property, and a clash is a defect in the
-    // geometry itself; one combined percentage would move for any of the three and name none of them.
+    // Three denominators, printed apart: a draw the harness could not read back is an instrument limit, a read-back
+    // one RDKit refused to type is a corpus property, a clash is a geometry defect; one percentage names none.
     auto const percent_of_gathered_ = [&](std::size_t part) {
         return num_gathered == 0 ? 0.0 : 100.0 * static_cast<double>(part) / static_cast<double>(num_gathered);
     };
@@ -470,26 +416,20 @@ static void report_energy_distributions_(custd::span<sampled_conformer_t const> 
     report_marginal_("SmallField", [](sampled_conformer_t const &drawn) { return drawn.smallfield_energy; });
 }
 
-/** One atom-count bin: every geometry read back into it, and the energies RDKit scored on those. */
+/** One atom-count bin. `gathered` counts slots read back at our own atom count — the clash rate's denominator, and
+ *  not `rdkit_energies.size()`, since a geometry RDKit declines to type still has a closest pair. */
 struct bin_sample_t {
-    /** Conformers whose slot was read back at our own atom count, which the clash rate is measured over.
-     *  It is not `rdkit_energies.size()`: a geometry RDKit declines to type still has a closest pair. */
     std::size_t gathered = 0;
     std::size_t clashing = 0;
     std::vector<double> rdkit_energies;
     std::vector<double> paired_deltas;
 };
 
-/**
- *  @brief Bucket every read-back sample by atom count once, then print the breakdown.
- *
- *  The atom count is SmallField's own, so a salt form bins by the fragment that was embedded rather than by
- *  the string it came from. Binning by the re-parsed count migrates every counterion-carrying molecule one
- *  bin up, which loads the heaviest bin with exactly the rows the harness cannot read back.
- *
- *  `delta_min` is reported and never gated: it is one order statistic, so its expected magnitude grows with
- *  the sample and a threshold on it would answer a question about `--quality-samples`.
- */
+/** Bucket every read-back sample by atom count once, then print the breakdown. The atom count is SmallField's own,
+ *  so a salt form bins by the embedded fragment; the re-parsed count would migrate every counterion-carrying
+ *  molecule one bin up, loading the heaviest bin with the rows the harness cannot read back. `delta_min` is reported
+ *  and never gated — one order statistic whose expected magnitude grows with the sample, so a threshold on it would
+ *  answer a question about `--quality-samples`. */
 static void report_atom_count_bins_(custd::span<sampled_conformer_t const> sample,
                                     std::array<bin_sample_t, num_atom_count_bins_k> &bins) {
     for (bin_sample_t &bin : bins) bin = {};
@@ -522,27 +462,20 @@ static void report_atom_count_bins_(custd::span<sampled_conformer_t const> sampl
 }
 
 /*
- *  The four numbers the heavy-bin verdict is rendered against. Each is a rate or a percentile and none is an
- *  extremum, because an extremum's expected magnitude grows with the sample: a gate on `delta_min` tightens
- *  every time `--quality-samples` rises and so answers a question about the flag rather than about the
- *  conformers. The three energy bounds were measured on the 100-128 atom bin; the clash bound is the one
- *  threshold that needs no calibration, since a pair under half the shortest MMFF94 bond is not a geometry
- *  at any molecule size and the only question is how often the run is allowed to produce one.
+ *  The four numbers the heavy-bin verdict is rendered against — each a rate or a percentile, never an extremum,
+ *  whose expected magnitude would grow with `--quality-samples` and answer a question about the flag. The three
+ *  energy bounds were measured on the 100-128 atom bin; the clash bound needs no calibration, since a pair under
+ *  half the shortest MMFF94 bond is not a geometry at any size and only its frequency is in question.
  */
 static constexpr double max_heavy_bin_clash_percent_k = 1.0;
 static constexpr double max_heavy_bin_energy_p50_k = 180.0;
 static constexpr double max_heavy_bin_energy_p95_k = 300.0;
 static constexpr double max_heavy_bin_delta_p50_k = 10.0;
 
-/**
- *  @brief Render the verdict on the heavy bin, or decline to when too few samples reached it.
- *
- *  The clash rate is read first and reads no energy at all, so a geometry defect names itself instead of
- *  arriving as an unexplained energy; the absolute bounds catch a blown-up geometry the clash check misses;
- *  and the paired median catches a force-field divergence that leaves the absolute energies plausible. The
- *  deciding numbers print at `{}`, shortest round-trip, so a value that only just cleared its threshold can
- *  never render as one that just missed it, and `failed_threshold` names which of them decided.
- */
+/** Render the verdict on the heavy bin, or decline to when too few samples reached it. The clash rate is read first
+ *  and reads no energy, so a geometry defect names itself; the absolute bounds catch a blown-up geometry it misses,
+ *  the paired median a force-field divergence leaving absolute energies plausible. Deciding numbers print at `{}`,
+ *  shortest round-trip, so a near-pass never renders as a near-miss. */
 static gate_verdict_t judge_heavy_bin_(bin_sample_t const &heavy_bin) {
     std::uint32_t const lower = atom_count_bin_lower_bound_(gate_bin_k);
     std::uint32_t const upper = atom_count_bin_bounds_k[gate_bin_k];
@@ -563,8 +496,7 @@ static gate_verdict_t judge_heavy_bin_(bin_sample_t const &heavy_bin) {
     else if (heavy_p95 >= max_heavy_bin_energy_p95_k) failed_threshold = "P95";
     else if (std::fabs(heavy_delta_p50) >= max_heavy_bin_delta_p50_k) failed_threshold = "delta_P50";
 
-    // One line for both verdicts, so `failed_threshold=` is present whichever way the gate went and a
-    // recorded PASS and a recorded FAIL carry the same fields.
+    // One line for both verdicts, so a recorded PASS and FAIL carry the same fields, `failed_threshold=` included.
     fmt::println("{} heavy_bin_gate atoms={}-{} gathered={} compared={} " //
                  "clash_percent={:.3f} P50={} P95={} delta_P50={} "       //
                  "failed_threshold={}",                                   //
@@ -588,8 +520,7 @@ static gate_verdict_t cross_validate(std::vector<std::string> const &smiles, std
     sample_skips_t const skips = score_sample_with_rdkit_(smiles, coords, energies, num_atoms_per_molecule, slot_layout,
                                                           sample);
 
-    // An empty or wholly unscored sample is not short-circuited here: the bins are then empty and
-    // `judge_heavy_bin_` prints the one `NOTE` that names the shortfall, with the counts it actually saw.
+    // An empty or unscored sample is not short-circuited: `judge_heavy_bin_` prints the `NOTE` naming the shortfall.
     std::vector<double> scratch;
     scratch.reserve(sample.size());
     report_energy_distributions_(sample, skips, scratch);
@@ -611,14 +542,13 @@ enum class bench_scope_t {
     multi_gpu_only_k,
 };
 
-/** Everything this driver takes from the command line. */
+/** Everything this driver takes from the command line: `smiles_path` from `--smi` or `SMALLFIELD_TEST_CORPUS` with
+ *  no default, `max_stereo_attempts` per molecule matched by the GPU config, `quality_samples` a ceiling on the
+ *  conformers drawn for the RDKit cross-validation. */
 struct backend_bench_arguments_t {
-    /** From `--smi` or from `SMALLFIELD_TEST_CORPUS`; there is no default. */
     std::string_view smiles_path;
     std::uint32_t num_conformers = 3;
-    /** Embedding attempts RDKit is allowed per molecule, matched by the GPU config. */
     std::uint32_t max_stereo_attempts = 10;
-    /** Ceiling on conformers drawn for the RDKit cross-validation. */
     std::uint32_t quality_samples = 10000;
     bench_scope_t scope = bench_scope_t::cpu_and_single_gpu_k;
 };
@@ -655,16 +585,11 @@ static arguments_parse_t parse_arguments_(int argc, char **argv, backend_bench_a
 
 #pragma endregion Command Line
 
-/**
- *  @brief Run both systems at every batch size the corpus supports, returning the quality gate's verdict.
- *
- *  The sweep is deliberately non-short-circuiting: a gate that fails on one rung still leaves the remaining
- *  rungs' throughput to report, and the verdict keeps the failure.
- */
+/** Run both systems at every batch size the corpus supports, returning the quality gate's verdict. Deliberately
+ *  non-short-circuiting: a rung that fails the gate still leaves later rungs' throughput to report. */
 static gate_verdict_t run_scaling_sweep_(std::vector<std::string> const &all_smiles,
                                          backend_bench_arguments_t const &arguments) {
-    // Rungs the corpus can fill, strictly increasing, with the whole corpus always last — which is what
-    // guarantees a corpus of any size runs at least one rung and reaches the gate.
+    // Rungs the corpus can fill, increasing, whole corpus last — so a corpus of any size runs a rung and is gated.
     std::vector<std::uint32_t> batch_sizes;
     for (std::uint32_t rung : {100u, 500u, 1000u, 2000u, 5000u})
         if (rung < all_smiles.size()) batch_sizes.push_back(rung);
@@ -681,14 +606,12 @@ static gate_verdict_t run_scaling_sweep_(std::vector<std::string> const &all_smi
         std::vector<__half> coords;
         std::vector<float> energies;
         std::vector<sfapi::conformer_status_t> status;
-        // The post-preprocess atom counts, without which the cross-validation cannot tell which fragment of
-        // a salt form the coordinates below describe.
+        // Post-preprocess atom counts; without them the cross-validation cannot tell which salt fragment these are.
         std::vector<std::uint8_t> num_atoms_per_molecule;
         bench_smallfield_gpu(smiles, arguments.num_conformers, arguments.max_stereo_attempts, coords, energies, status,
                              num_atoms_per_molecule);
 
-        // Multi-GPU runs in a fresh process under `--multi-gpu-only`, so no state bleeds from the 1-GPU run
-        // into the 8-GPU one on the largest batches.
+        // Multi-GPU runs in a fresh process under `--multi-gpu-only`, so no 1-GPU state bleeds into the 8-GPU run.
         if (batch_size == batch_sizes.back())
             fmt::println("\nSystem B: SmallField multi-GPU skipped in mixed mode. "       //
                          "Re-run with --multi-gpu-only for isolated multi-GPU numbers."); //

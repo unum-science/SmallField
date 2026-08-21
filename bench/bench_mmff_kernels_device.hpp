@@ -35,8 +35,7 @@ char const *describe_trio_launch(trio_launch_t status);
 /**
  *  @brief Time the MMFF94 kernel trio over one batch of descriptors.
  *
- *  @param[in] atom_offsets Where each molecule's atoms start in the shared atom arena, walked by the same
- *      molecule index as @p descriptors.
+ *  @param[in] atom_offsets Where each molecule's atoms start in the shared arena, walked by @p descriptors' index.
  *  @param[out] timings Left untouched on every refusal.
  */
 trio_launch_t launch_mmff94_kernel_trio_benchmark(parameters::mmff94_tables_host_t const &tables_host,

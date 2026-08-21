@@ -49,8 +49,8 @@ constexpr std::size_t max_shared_bytes_k = static_cast<std::size_t>(max_smoothed
                                            sizeof(float);
 
 smoothing_t gpu_triangle_smooth(packed_matrix<float> bounds) {
-    // Past 48 KB a kernel has to ask for its dynamic shared memory, and a 128-atom matrix is 64 KB. The
-    // attribute is per-kernel driver state, so it is raised once for the process.
+    // Past 48 KB a kernel must ask for its dynamic shared memory and a 128-atom matrix is 64 KB; the
+    // attribute is per-kernel driver state, raised once for the process.
     [[maybe_unused]] static bool const shared_limit_raised = [] {
         cudaFuncSetAttribute(triangle_smooth_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              static_cast<int>(max_shared_bytes_k));
@@ -60,8 +60,8 @@ smoothing_t gpu_triangle_smooth(packed_matrix<float> bounds) {
     std::uint32_t const num_atoms = static_cast<std::uint32_t>(bounds.extent(0));
     std::size_t const cell_count = static_cast<std::size_t>(num_atoms) * num_atoms;
 
-    // The verdict starts at the mildest value, so a launch that never ran leaves the caller a matrix its own
-    // comparisons reject rather than a verdict that looks decided.
+    // The verdict starts mildest, so a launch that never ran leaves a matrix the caller's own comparisons
+    // reject rather than a verdict that looks decided.
     smoothing_t verdict = smoothing_t::consistent_k;
     cudaStream_t stream = nullptr;
     if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) return verdict;
@@ -84,11 +84,10 @@ smoothing_t gpu_triangle_smooth(packed_matrix<float> bounds) {
             triangle_smooth_kernel<<<1, warp_size_k, cell_count * sizeof(float), stream>>>(
                 device_bounds.data(), num_atoms, device_verdict.data());
 
-            // A refused enqueue reports here and nowhere else: the drain below sees an empty stream and
-            // returns success, and the download then hands back the matrix exactly as it was uploaded
-            // under the `consistent_k` the caller pre-set. This suite reads that as a smoothing that
-            // found nothing to tighten and compares it against RDKit, so the enqueue status is what
-            // separates a measured divergence from a shared-memory request the device would not take.
+            // A refused enqueue reports here and nowhere else: the drain sees an empty stream and returns
+            // success, and the download hands back the matrix as uploaded under the caller's pre-set
+            // `consistent_k`, which reads as a smoothing that found nothing to tighten. The enqueue status
+            // is what separates a measured divergence from a shared-memory request the device refused.
             cudaError_t const enqueued = cudaGetLastError();
             if (enqueued != cudaSuccess)
                 std::fprintf(stderr, "triangle_smooth_kernel: refused at %u atoms: %s\n", num_atoms,

@@ -2,18 +2,16 @@
  *  @file test/preprocess/test_chirality.cpp
  *  @brief Police the device chirality check against conformers RDKit embedded from the same tags.
  *
- *  `validate_chirality_` answers one question per molecule: does every extracted chiral center realize the
- *  signed tetrahedral volume its target demands? Two comparisons per molecule police that answer, and the
- *  second is what keeps the first honest. An RDKit conformer embedded from the same tetrahedral tags must
- *  satisfy the targets `extract_chiral_centers` derived from them, so the upright verdict is `1`; inverting
- *  every target sign leaves the same geometry describing the opposite handedness, so the inverted verdict
- *  must be `0`. A kernel that answered `1` unconditionally passes the first and fails the second.
+ *  `validate_chirality_` answers one question per molecule: does every extracted chiral center realize the signed
+ *  tetrahedral volume its target demands? Two comparisons police that answer, the second keeping the first honest.
+ *  An RDKit conformer embedded from the same tetrahedral tags must satisfy the targets `extract_chiral_centers`
+ *  derived from them, so the upright verdict is `1`; inverting every target sign leaves the same geometry describing
+ *  the opposite handedness, so the inverted verdict must be `0`. A kernel answering `1` unconditionally passes the
+ *  first and fails the second.
  *
- *  Coverage comes from a curated set of stereocenter-bearing drug molecules and an optional SMILES corpus
- *  named by `argv[1]` or by `SMALLFIELD_TEST_CORPUS`, capped by `argv[2]` or `SMALLFIELD_TEST_MAX_MOLS`.
- *  A named corpus that does not open is a failure, never an empty run.
- *
- *  Compiled with g++, C++20. CUDA kernels in test_chirality_kernels.cu.
+ *  Coverage: a curated set of stereocenter-bearing drug molecules plus an optional SMILES corpus named by `argv[1]`
+ *  or `SMALLFIELD_TEST_CORPUS`, capped by `argv[2]` or `SMALLFIELD_TEST_MAX_MOLS`; a named corpus that does not open
+ *  is a failure, never an empty run. Compiled with g++, C++20. CUDA kernels in test_chirality_kernels.cu.
  */
 
 #include <cstddef> // `std::size_t`
@@ -46,29 +44,23 @@ static constexpr std::size_t max_printed_lines_k = 10;
 
 #pragma region Molecule Walk
 
-/** Buffers one molecule's check reuses, declared above the walk so a growth phase happens once. */
+/** Buffers one molecule's check reuses, declared above the walk so a growth phase happens once. `atom_major` holds
+ *  RDKit's conformer as one xyz triple per atom, `axis_major` the same coordinates as the three contiguous axis
+ *  planes the device check reads. */
 struct chirality_scratch_t {
-    /** RDKit's conformer, one xyz triple per atom. */
     std::vector<float> atom_major;
-    /** The same coordinates as three contiguous axis planes, which is what the device check reads. */
     std::vector<float> axis_major;
     std::vector<sft::chiral_center_descriptor_t> targets;
     std::vector<sft::chiral_center_descriptor_t> inverted_targets;
     sft::molecule_descriptor_t descriptor;
 };
 
-/**
- *  @brief Census of what the walk reached, and of what it had to decline.
- *
- *  Only what the reporter does not already hold: it owns every comparison and every mismatch, and
- *  `summarize` prints those, so counting them a second time here would be two schemes for one fact.
- *  The decline reasons stay apart because the walk already distinguishes them, and a corpus that
- *  declines every molecule reads very differently depending on which counter holds them.
- */
+/** Census of what the walk reached and declined: `molecules` those whose targets reached the device, `centers` the
+ *  chiral centers they carried. Only what the reporter does not already hold, since it owns every comparison and
+ *  mismatch. The decline reasons stay apart because the walk distinguishes them, and a corpus that declines every
+ *  molecule reads very differently depending on which counter holds them. */
 struct chirality_tally_t {
-    /** Molecules whose targets reached the device. */
     std::uint64_t molecules = 0;
-    /** Chiral centers those molecules carried. */
     std::uint64_t centers = 0;
     std::uint64_t unparsed = 0;
     std::uint64_t unembedded = 0;
@@ -82,38 +74,27 @@ static std::uint64_t declined_(chirality_tally_t const &tally) {
     return tally.unparsed + tally.unembedded + tally.oversized + tally.achiral + tally.device_refused;
 }
 
-/** How far one molecule got, so the walk can bucket it without the check counting anything itself. */
+/** How far one molecule got, so the walk can bucket it without the check counting anything itself. `compared_k` both
+ *  verdicts reached the device; `unparsed_k` RDKit refused the SMILES; `unembedded_k` ETKDG produced no conformer to
+ *  read coordinates from; `oversized_k` past the descriptor's fixed atom or bond extents; `achiral_k` no tetrahedral
+ *  center survived `assignStereochemistry`; `device_refused_k` the staging was refused, so neither was computed. */
 enum class molecule_outcome_t {
-    /** Both verdicts were compared against the device. */
     compared_k,
-    /** RDKit refused the SMILES. */
     unparsed_k,
-    /** ETKDG produced no conformer to read coordinates from. */
     unembedded_k,
-    /** The molecule sits past the descriptor's fixed atom or bond extents. */
     oversized_k,
-    /** No tetrahedral center survived `assignStereochemistry`. */
     achiral_k,
-    /** The device refused the staging, so neither verdict was ever computed. */
     device_refused_k,
 };
 
-/**
- *  @brief Run one molecule's extracted chiral targets, and their inversion, through the device check.
- *
- *  @param[in] smiles Molecule to check, parsed and embedded here.
- *  @param[inout] scratch Buffers reused across molecules.
- *  @param[inout] reporter Receives the two verdict comparisons.
- *  @param[out] num_centers Chiral centers compared, zero unless the outcome is `compared_k`.
- *  @return How far the molecule got.
- */
+/** Run one molecule's extracted chiral targets, and their inversion, through the device check, reporting how far it
+ *  got. @p num_centers takes the chiral centers compared, zero unless the outcome is `compared_k`. */
 static molecule_outcome_t check_molecule_(std::string const &smiles, chirality_scratch_t &scratch,
                                           sftest::diagnostic_reporter_t &reporter, std::uint32_t &num_centers) {
 
     num_centers = 0;
 
-    // `SmilesToMol` throws on some malformed corpus input rather than returning null, so the parse is
-    // guarded rather than merely null-checked.
+    // `SmilesToMol` throws on some malformed input instead of returning null, so the parse is guarded.
     std::unique_ptr<RDKit::RWMol> molecule;
     try {
         molecule = sftest::mol_from_smiles(smiles);
@@ -123,14 +104,14 @@ static molecule_outcome_t check_molecule_(std::string const &smiles, chirality_s
     }
     if (!molecule) return molecule_outcome_t::unparsed_k;
     if (!sftest::embed_molecule(*molecule)) return molecule_outcome_t::unembedded_k;
-    // `build_descriptor` refuses a molecule past its fixed atom and bond extents, and leaves its output
-    // stale rather than empty when it does, so the refusal is read before the extraction trusts it.
+    // `build_descriptor` refuses a molecule past its fixed atom and bond extents and leaves its output stale
+    // rather than empty, so the refusal is read before the extraction trusts it.
     if (sft::build_descriptor(*molecule, scratch.descriptor) != sft::conformer_status_t::success_k)
         return molecule_outcome_t::oversized_k;
 
     sfp::extract_chiral_centers(*molecule, scratch.descriptor, scratch.targets);
-    // An achiral molecule satisfies the upright and the inverted targets alike — the warp ballot over zero
-    // centers is true either way — so it would report two agreements it never tested.
+    // An achiral molecule satisfies upright and inverted targets alike, the warp ballot over zero centers
+    // being true either way, so it would report two agreements it never tested.
     if (scratch.targets.empty()) return molecule_outcome_t::achiral_k;
 
     std::uint32_t const num_atoms = molecule->getNumAtoms();
@@ -188,11 +169,8 @@ static void report_(std::string_view heading, chirality_tally_t const &tally) {
                  fmt::group_digits(tally.achiral), fmt::group_digits(tally.device_refused));
 }
 
-/**
- *  @brief Drug molecules whose stereocenters survive `assignStereochemistry`, built once at start-up.
- *
- *  Glucose carries four centers, so the set also exercises a molecule whose warp ballot spans several lanes.
- */
+/** Drug molecules whose stereocenters survive `assignStereochemistry`, built once at start-up. Glucose carries four
+ *  centers, so the set also exercises a molecule whose warp ballot spans several lanes. */
 static std::vector<std::string> curated_chiral_smiles_() {
     return {
         "CC(C)Cc1ccc(cc1)[C@@H](C)C(=O)O",        // (S)-ibuprofen
@@ -226,8 +204,8 @@ int main(int argc, char **argv) {
     sf_verify_(curated.centers > curated.molecules, "the curated set must include a multi-center molecule");
 
     if (selection.knob == sftest::corpus_knob_t::named_k) {
-        // Naming a corpus is a request to validate against it, so an empty result is a failure and not an
-        // empty corpus: it would otherwise run zero comparisons and satisfy `mismatches == 0` vacuously.
+        // Naming a corpus is a request to validate against it, so an empty result is a failure: it would
+        // run zero comparisons and satisfy `mismatches == 0` vacuously.
         std::vector<std::string> corpus;
         auto const outcome = sftest::load_smiles_into(selection.path, selection.max_molecules, corpus);
         if (outcome != sftest::smiles_load_t::loaded_k)
@@ -237,8 +215,8 @@ int main(int argc, char **argv) {
         chirality_tally_t corpus_tally;
         walk_(corpus, scratch, reporter, corpus_tally);
         report_("corpus", corpus_tally);
-        // The same reasoning one level down: every molecule may have been declined, and `summarize` is what
-        // separates a section of zero comparisons from a section of zero mismatches.
+        // The same reasoning one level down: every molecule may have been declined, and `summarize` separates
+        // zero comparisons from zero mismatches.
         reporter.summarize("corpus");
     }
 

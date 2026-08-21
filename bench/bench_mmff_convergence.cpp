@@ -1,21 +1,16 @@
 /**
  *  @file bench/bench_mmff_convergence.cpp
- *  @brief Separate an algorithmic stall from an unreachable threshold from too small a budget, for the
- *         Barzilai-Borwein MMFF94 polish.
+ *  @brief Separate an algorithmic stall from an unreachable threshold from too small a budget, in the MMFF94 polish.
  *
- *  Production telemetry reports the polish exhausting its whole budget on essentially every slot at an RMS
- *  gradient three decades above the threshold it is held to. Three explanations fit that one number, and one
- *  measurement set separates them: sweeping the budget says whether the residual is a plateau or a decline,
- *  and re-evaluating our own final geometry through RDKit's double-precision MMFF94 says whether our `float`
- *  gradient is measuring the geometry or its own rounding.
- *
- *  Every molecule starts from RDKit's own ETKDGv3 embedding, rounded once to `float` and written back into
- *  the conformer, so our minimizer and RDKit's start from bit-identical coordinates.
- *
- *  The two convergence tests are @b not the same quantity and are never presented as one. Ours is an absolute
- *  root mean square over all `3N` gradient components; RDKit's `ForceField::minimize` tests a scaled residual
- *  against `forceTol`, so its default of `1e-4` is not comparable to ours of `5e-5` and only the gradient
- *  norms measured at the same geometry are.
+ *  Production telemetry reports the Barzilai-Borwein polish exhausting its whole budget on essentially every slot at
+ *  an RMS gradient three decades above its threshold. Three explanations fit that number and one measurement set
+ *  separates them: sweeping the budget says whether the residual is a plateau or a decline, and re-evaluating our
+ *  final geometry through RDKit's double-precision MMFF94 says whether our `float` gradient measures the geometry or
+ *  its own rounding. Every molecule starts from RDKit's own ETKDGv3 embedding, rounded once to `float` and written
+ *  back into the conformer, so our minimizer and RDKit's start from bit-identical coordinates. The two convergence
+ *  tests are @b not the same quantity and are never presented as one: ours is an absolute root mean square over all
+ *  `3N` gradient components, RDKit's `ForceField::minimize` tests a scaled residual against `forceTol`, so its
+ *  default of `1e-4` is not comparable to ours of `5e-5` and only gradient norms at the same geometry are.
  */
 
 #include <cmath>   // `std::sqrt`, `std::fabs`, `std::isfinite`, `std::log10`
@@ -61,13 +56,9 @@ static constexpr std::array<std::int32_t, 5> iteration_caps_k = {200, 800, 3200,
 /** Index into `iteration_caps_k` of the production cap, which the precision probe and the energy gap use. */
 static constexpr std::size_t production_cap_index_k = 1;
 
-/**
- *  @brief Threshold handed to the sweep, low enough that no cap converges out from under the measurement.
- *
- *  The question is where the residual gradient lands, so a run that stopped early would answer with the
- *  threshold rather than with the minimizer. Production's `5e-5` is reported separately, as the bar each
- *  measured residual is compared against.
- */
+/** Threshold handed to the sweep, low enough that no cap converges out from under the measurement. The question is
+ *  where the residual lands, so a run stopping early would answer with the threshold rather than the minimizer;
+ *  production's `5e-5` is reported separately, as the bar each measured residual is compared against. */
 static constexpr float sweep_gradient_threshold_k = 1.0e-12f;
 
 /** Production's own bar, quoted beside every residual so the comparison is visible rather than remembered. */
@@ -86,55 +77,45 @@ static constexpr double rdkit_force_tolerance_k = 1.0e-4;
 
 #pragma region Records
 
-/** Everything one molecule contributed, so the four tables are assembled from one pass rather than four. */
+/** Everything one molecule contributed, so the four tables are assembled from one pass rather than four. Arrays are
+ *  indexed by `iteration_caps_k`, and every gradient is an absolute RMS over all `3N` components in kcal per mol per
+ *  angstrom — ours in `float`, RDKit's in double. The names say which geometry each was measured at:
+ *  `_start` is the untouched ETKDGv3 embedding, where the two definitions are gated against each other before
+ *  anything moves; `_at_ours` is our relaxed geometry, which is the precision probe; `_at_rdkit_minimum` is the
+ *  geometry RDKit's own minimizer stopped on, the floor any threshold of ours has to clear. `final_step` is the last
+ *  Barzilai-Borwein step, saying whether a clamp is binding, `iterations` equals its cap unless the run converged,
+ *  and `rdkit_rounds` counts `rdkit_iterations_per_round_k` blocks spent before RDKit stopped asking for more.
+ */
 struct molecule_record_t {
     std::uint32_t num_atoms = 0;
-    /** Our absolute RMS gradient at each cap, in kcal per mol per angstrom. */
     std::array<float, iteration_caps_k.size()> rms_gradient {};
-    /** Our own `float` MMFF94 energy at each cap. */
     std::array<float, iteration_caps_k.size()> energy {};
-    /** The last Barzilai-Borwein step applied at each cap, which says whether a clamp is what is binding. */
     std::array<float, iteration_caps_k.size()> final_step {};
-    /** Iterations the minimizer reported at each cap, which equals the cap unless it converged. */
     std::array<std::int32_t, iteration_caps_k.size()> iterations {};
-    /** Caps at which the minimizer reported convergence rather than exhaustion. */
     std::array<sfc::fire_status_t, iteration_caps_k.size()> status {};
-    /** Our absolute RMS gradient at the untouched ETKDGv3 start, from a single measured evaluation. */
     float rms_gradient_start = 0.0f;
-    /** RDKit's double-precision RMS gradient at that same start, which gates the two definitions against each
-     *  other before either geometry has moved. */
     double rdkit_rms_gradient_start = 0.0;
-    /** RDKit's double-precision RMS gradient at @b our relaxed geometry: the precision probe. */
     double rdkit_rms_gradient_at_ours = 0.0;
-    /** RDKit's double-precision energy at our relaxed geometry. */
     double rdkit_energy_at_ours = 0.0;
-    /** Energy RDKit reached from the same start under its own minimizer. */
     double rdkit_final_energy = 0.0;
-    /** RDKit's double-precision RMS gradient at the geometry its own minimizer stopped on. */
     double rdkit_final_rms_gradient = 0.0;
-    /** Our `float` evaluator's RMS gradient at @b RDKit's converged geometry: the floor a `float` MMFF94
-     *  gradient can report on a genuinely relaxed structure, which is what any threshold has to clear. */
     float our_rms_gradient_at_rdkit_minimum = 0.0f;
-    /** Rounds of `rdkit_iterations_per_round_k` RDKit spent before it stopped asking for more. */
     unsigned int rdkit_rounds = 0;
-    /** Whether RDKit's minimizer reported convergence within `rdkit_max_rounds_k`. */
     bool rdkit_converged = false;
 };
 
-/** What the sweep stepped past, threaded by reference so the run owns no module state. */
+/** What the sweep stepped past, threaded by reference so the run owns no module state. A molecule counts as
+ *  `unprepared` when preprocessing refuses the SMILES, `unembedded` when ETKDGv3 yields no conformer, `unaligned`
+ *  when RDKit's atom count differs from preprocessing's so the orders cannot be matched, `unreferenced` when RDKit
+ *  cannot build MMFF94 properties, and `refused` when the device refuses a launch; `first_refusal` names the step,
+ *  which the counts alone cannot. */
 struct sweep_tally_t {
     std::uint32_t measured = 0;
-    /** Preprocessing refused the SMILES, so there are no device terms. */
     std::uint32_t unprepared = 0;
-    /** ETKDGv3 produced no conformer, so there is no well-posed start. */
     std::uint32_t unembedded = 0;
-    /** RDKit's atom count differs from preprocessing's, so the two atom orders cannot be aligned. */
     std::uint32_t unaligned = 0;
-    /** RDKit cannot build MMFF94 properties, so there is no double-precision reference. */
     std::uint32_t unreferenced = 0;
-    /** The device refused a launch, so nothing was measured. */
     std::uint32_t refused = 0;
-    /** Which step the first refusal came from, which is the one thing the count cannot carry. */
     sftest::mmff_energy_probe_t first_refusal = sftest::mmff_energy_probe_t::completed_k;
 };
 
@@ -194,12 +175,9 @@ static double rdkit_rms_gradient_(ForceFields::ForceField &force_field, std::vec
     return std::sqrt(sum_of_squares / static_cast<double>(num_components));
 }
 
-/**
- *  @brief Write axis-major `float` coordinates onto a molecule's conformer, widening once.
- *
- *  Both engines then read the same numbers: our device holds these `float` values exactly, and RDKit holds
- *  their exact double widening, so nothing in the comparison is a rounding of the other side's start.
- */
+/** Write axis-major `float` coordinates onto a molecule's conformer, widening once. Both engines then read the same
+ *  numbers — we hold these `float` values exactly, RDKit their exact double widening — so nothing in the comparison
+ *  is a rounding of the other side's start. */
 static void write_axis_major_into_conformer_(RDKit::RWMol &molecule, custd::span<float const> axis_major) {
     auto &conformer = molecule.getConformer();
     std::uint32_t const num_atoms = molecule.getNumAtoms();
@@ -213,13 +191,13 @@ static void write_axis_major_into_conformer_(RDKit::RWMol &molecule, custd::span
 
 #pragma region Sweep
 
-/** Buffers every molecule reuses, declared above the loop so the growth phase happens once. */
+/** Buffers every molecule reuses, declared above the loop so the growth phase happens once; `relaxed_axis_major`
+ *  holds our geometry at the production cap, kept for the precision probe. */
 struct sweep_scratch_t {
     sfp::etkdg_prepared_molecule_t prepared {};
     std::vector<float> atom_major;
     std::vector<float> start_axis_major;
     std::vector<float> working_axis_major;
-    /** Our relaxed geometry at the production cap, kept for the precision probe. */
     std::vector<float> relaxed_axis_major;
     std::vector<std::uint8_t> bond_hops;
     std::vector<double> gradient_components;
@@ -238,15 +216,13 @@ enum class molecule_outcome_t : std::uint8_t {
 /**
  *  @brief Run one molecule through the budget sweep, RDKit's own minimizer, and the precision probe.
  *
- *  @param[in] smiles Molecule to prepare, embed and relax.
  *  @param[inout] scratch Every buffer the molecule needs, carried in from above the loop.
  *  @param[out] record Filled only when the outcome is `measured_k`.
  *  @param[inout] tally Receives the step a device refusal came from, which the outcome alone cannot carry.
- *  @return Whether the molecule was measured, and why not when it was not.
  */
 static molecule_outcome_t measure_molecule_(std::string const &smiles, sweep_scratch_t &scratch,
                                             molecule_record_t &record, sweep_tally_t &tally) {
-    /** Keep the first refusal the run met, so the report can name the step that refused. */
+    // Keep the first refusal the run met, so the report can name the step that refused.
     auto const refuse_ = [&tally](sftest::mmff_energy_probe_t probe) {
         if (tally.first_refusal == sftest::mmff_energy_probe_t::completed_k) tally.first_refusal = probe;
         return molecule_outcome_t::refused_k;
@@ -262,8 +238,7 @@ static molecule_outcome_t measure_molecule_(std::string const &smiles, sweep_scr
     if (num_atoms != scratch.prepared.num_atoms) return molecule_outcome_t::unaligned_k;
     record.num_atoms = num_atoms;
 
-    // The start is read out of RDKit, rounded once to `float`, and written straight back, so the geometry
-    // both engines relax from is the same set of numbers rather than two roundings of one embedding.
+    // Read out of RDKit, rounded once to `float`, written straight back: both engines relax the same numbers.
     auto const atom_major = sft::reset_coordinates_aos<sft::coordinate_role_t::position_k>(scratch.atom_major,
                                                                                            num_atoms);
     sftest::read_conformer_into(*molecule, atom_major);
@@ -316,8 +291,7 @@ static molecule_outcome_t measure_molecule_(std::string const &smiles, sweep_scr
         if (point == production_cap_index_k) scratch.relaxed_axis_major = scratch.working_axis_major;
     }
 
-    // RDKit's double-precision gradient at the start, which is the control: two engines differing here
-    // would make every later comparison a comparison of two force fields rather than of two minimizers.
+    // The control: differing here would make every later comparison one of two force fields, not two minimizers.
     {
         std::unique_ptr<ForceFields::ForceField> field(RDKit::MMFF::constructForceField(*molecule, properties.get()));
         if (!field) return molecule_outcome_t::unreferenced_k;
@@ -325,8 +299,8 @@ static molecule_outcome_t measure_molecule_(std::string const &smiles, sweep_scr
         record.rdkit_rms_gradient_start = rdkit_rms_gradient_(*field, scratch.gradient_components);
     }
 
-    // The precision probe: RDKit's double-precision MMFF94 read at the geometry our `float` minimizer
-    // stopped on, so the residual is measured twice at one geometry rather than once at each of two.
+    // The precision probe: RDKit's double MMFF94 at the geometry our `float` minimizer stopped on, so the residual
+    // is measured twice at one geometry rather than once at each of two.
     write_axis_major_into_conformer_(*molecule, scratch.relaxed_axis_major);
     {
         std::unique_ptr<ForceFields::ForceField> field(RDKit::MMFF::constructForceField(*molecule, properties.get()));
@@ -336,9 +310,8 @@ static molecule_outcome_t measure_molecule_(std::string const &smiles, sweep_scr
         record.rdkit_energy_at_ours = field->calcEnergy();
     }
 
-    // RDKit relaxing the same start under its own minimizer, which bounds what this problem admits at all.
-    // `minimize` restarts its conjugate-gradient state per call, so the rounds are its own default budget
-    // repeated rather than one long run, and the iteration figure is a ceiling at that granularity.
+    // RDKit relaxing the same start, which bounds what this problem admits. `minimize` restarts its
+    // conjugate-gradient state per call, so the rounds repeat its default budget and the iteration figure is a ceiling.
     write_axis_major_into_conformer_(*molecule, scratch.start_axis_major);
     {
         std::unique_ptr<ForceFields::ForceField> field(RDKit::MMFF::constructForceField(*molecule, properties.get()));
@@ -355,9 +328,8 @@ static molecule_outcome_t measure_molecule_(std::string const &smiles, sweep_scr
         record.rdkit_final_rms_gradient = rdkit_rms_gradient_(*field, scratch.gradient_components);
     }
 
-    // Our own `float` evaluator read at RDKit's converged geometry, with a budget of one so it measures
-    // without stepping. RDKit says that geometry is relaxed; whatever we report there is the floor our
-    // absolute test can distinguish from zero, and no threshold below it is reachable.
+    // Our `float` evaluator at RDKit's converged geometry, budget one so it measures without stepping: whatever we
+    // report on a structure RDKit calls relaxed is the floor our absolute test can distinguish from zero.
     {
         sftest::read_conformer_into(*molecule, atom_major);
         sft::transpose_into(atom_major, sft::conformer_soa_t {scratch.working_axis_major.data(), num_atoms});
@@ -401,8 +373,8 @@ static void sweep_corpus_(std::vector<std::string> const &corpus, std::vector<mo
 
 /** Table one: where the residual gradient lands as the budget grows, and how often the budget ran out. */
 static void report_iteration_sweep_(std::vector<molecule_record_t> const &records) {
-    // Absolute rms gradient over 3N components. The sweep threshold is deliberately unreachable so no
-    // cap converges out from under the measurement; the production bar is printed beside it for scale.
+    // Absolute rms gradient over 3N components; the sweep threshold is deliberately unreachable, the production bar
+    // printed beside it for scale.
     fmt::println("iteration_sweep: sweep_threshold={:.3g} production_threshold={:.3g}", sweep_gradient_threshold_k,
                  production_gradient_threshold_k);
     std::vector<double> sample;
@@ -423,16 +395,15 @@ static void report_iteration_sweep_(std::vector<molecule_record_t> const &record
     for (molecule_record_t const &record : records) sample.push_back(record.rms_gradient_start);
     print_quantiles_("start_rms_ours", sample);
 
-    // The secant step is clamped into `[1e-6, 1]` and then again by the trust region. A last step sitting on
-    // one of those bounds is a step the curvature estimate did not choose.
+    // The secant step is clamped into `[1e-6, 1]` and again by the trust region; a last step on either bound is one
+    // the curvature estimate did not choose.
     for (std::size_t point = 0; point < iteration_caps_k.size(); ++point) {
         sample.clear();
         for (molecule_record_t const &record : records) sample.push_back(record.final_step[point]);
         print_quantiles_(fmt::format("final_step_at_{}", iteration_caps_k[point]), sample);
     }
 
-    // The ratio between consecutive caps is what separates a plateau from a decline: a factor near one is a
-    // minimizer that has stopped moving, whatever its residual happens to be.
+    // The ratio between consecutive caps separates a plateau from a decline: a factor near one has stopped moving.
     for (std::size_t point = 1; point < iteration_caps_k.size(); ++point) {
         sample.clear();
         for (molecule_record_t const &record : records)
@@ -495,8 +466,7 @@ static void report_precision_probe_(std::vector<molecule_record_t> const &record
     print_quantiles_("ratio_rdkit_over_ours", ratio);
     print_quantiles_("start_ratio_rdkit_over_ours", start_ratio);
 
-    // What our own `float` evaluator reports on a structure RDKit calls relaxed, which is the floor any
-    // absolute threshold of ours has to sit above.
+    // What our `float` evaluator reports on a structure RDKit calls relaxed: the floor our thresholds sit above.
     std::vector<double> ours_at_minimum, theirs_at_minimum, disagreement;
     for (molecule_record_t const &record : records) {
         ours_at_minimum.push_back(record.our_rms_gradient_at_rdkit_minimum);

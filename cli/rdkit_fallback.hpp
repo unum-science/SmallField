@@ -1,11 +1,9 @@
 /**
  *  @file cli/rdkit_fallback.hpp
- *  @brief Declares `rdkit_fallback`, RDKit-based conformer generation for molecules the GPU pipeline
- *  failed on.
+ *  @brief Declares `rdkit_fallback`, RDKit conformer generation for molecules the GPU pipeline failed on.
  *
- *  Each recovered conformer overwrites its coordinate and energy slot and flips that slot's status to
- *  `success_k`; a slot the fallback could not fill keeps the status the GPU left, which the writer emits as
- *  a null row.
+ *  Each recovered conformer overwrites its coordinate and energy slot and flips it to `success_k`; an unfilled
+ *  slot keeps the status the GPU left, which the writer emits as a null row.
  */
 
 #pragma once
@@ -31,75 +29,58 @@ namespace smallfield::cli {
 enum class fallback_disposition_t : std::uint8_t {
     /** RDKit embeds by a different route and may fill the slot. */
     retry_k,
-    /** Nothing worth spending an embedding on: either `admit_molecule_` re-derives the refusal from the
-     *  same caps and the same parser, so the dispatch buys one `SmilesToMol` and the verdict the slot
-     *  already carries, or the refusal is the producer's own and the fallback would be laundering it
-     *  rather than answering it. */
+    /** Nothing worth an embedding: either `admit_molecule_` re-derives the refusal from the same caps and
+     *  parser, buying one `SmilesToMol` and the verdict the slot holds, or the refusal is the producer's own. */
     terminal_k,
 };
 
-/**
- *  @brief Whether dispatching a slot at @p status to the `fallback-role` could ever fill it.
- *
- *  Exhaustive over `conformer_status_t` and carrying no `default:`, so a status appended to that
- *  append-only enum is a `-Wswitch` warning here rather than a policy inherited in silence.
- *
- *  Each verdict follows from what `admit_molecule_` runs: `parse_smiles` under the `max_atoms` and
- *  the salt policy the GPU path used, then `MMFF::MMFFMolProperties::isValid`. It builds no
- *  `molecule_descriptor_t`, so no extent of that descriptor is re-derivable.
- */
+/** Whether dispatching a slot at @p status to the `fallback-role` could ever fill it. Exhaustive over
+ *  `conformer_status_t` with no `default:`, so a status appended to that append-only enum is a `-Wswitch`
+ *  warning here rather than a policy inherited in silence. Each verdict follows from what `admit_molecule_`
+ *  runs — `parse_smiles` under the GPU path's `max_atoms` and salt policy, then
+ *  `MMFF::MMFFMolProperties::isValid` — which builds no `molecule_descriptor_t`, so its extents are not
+ *  re-derivable. */
 [[nodiscard]] constexpr fallback_disposition_t fallback_disposition(types::conformer_status_t status) noexcept {
     switch (status) {
 
-    /* Terminal: the fallback reaches the same answer by the same route. */
+    // Terminal: the fallback reaches the same answer by the same route.
     // The slot already holds a conformer, and the fallback leaves a filled slot alone.
     case types::conformer_status_t::success_k: return fallback_disposition_t::terminal_k;
     // `parse_smiles` gates the atom count against the cap the `gpu-runner-role` passed.
     case types::conformer_status_t::too_many_atoms_k: return fallback_disposition_t::terminal_k;
     // `MMFFMolProperties::isValid` is the same typing check on the same molecule.
     case types::conformer_status_t::unsupported_element_k: return fallback_disposition_t::terminal_k;
-    // The one verdict here that is not re-derived and is still terminal. RDKit would embed these — the
-    // molecule was never the problem — but the population is unbounded where every other retried status
-    // is per-molecule and rare: one mis-sized wave refuses an entire device's batch, so at 20,088 µs of
-    // CPU per molecule against 250 µs on GPU a single sizing failure would turn into hours of fallback
-    // and read as a hang rather than as the loud, cheap, re-runnable error it is. Two producers reach
-    // this: a device-side pool failure, which `cuda_error_count` already reports, and a host-side
-    // pinned reservation, which raises no CUDA error at all — so the exit code gates on this status's
-    // own terminal tally rather than on the counter. The shard is re-run at a wave that fits, not
-    // laundered one molecule at a time.
+    // Terminal though RDKit could embed these: the population is unbounded where every other retried status is
+    // per-molecule and rare, and one mis-sized wave refuses a whole device's batch — at 20,088 µs of CPU per
+    // molecule against 250 µs on GPU that is hours of fallback reading as a hang, not the loud, cheap,
+    // re-runnable error it is. Two producers reach it: a device-side pool failure, which `cuda_error_count`
+    // reports, and a host-side pinned reservation, which raises none — so the exit code gates on this status's
+    // own terminal tally. Re-run the shard at a wave that fits, not laundered one molecule at a time.
     case types::conformer_status_t::batch_overflow_k: return fallback_disposition_t::terminal_k;
 
-    /* Retry: nothing in `admit_molecule_` reproduces these. */
-    // ETKDG perceives and enforces chirality by its own route, so a chiral volume the device driver
-    // could not satisfy is not a verdict RDKit shares.
+    // Retry: nothing in `admit_molecule_` reproduces these.
+    // ETKDG perceives and enforces chirality by its own route, so a chiral volume the driver missed differs.
     case types::conformer_status_t::stereo_failure_k: return fallback_disposition_t::retry_k;
     // A different MMFF minimizer from the device FIRE driver may still converge where it did not.
     case types::conformer_status_t::mmff_unconverged_k: return fallback_disposition_t::retry_k;
-    // No kernel reached the slot, so there is no device verdict to re-derive and the molecule itself was
-    // never refused: the fallback is the only thing that has said anything about it.
+    // No kernel reached the slot, so there is no device verdict to re-derive and the molecule was never refused.
     case types::conformer_status_t::slot_unwritten_k: return fallback_disposition_t::retry_k;
-    // Both are a post-polish stereo refusal, which is what `stereo_failure_k` already routes here for:
-    // RDKit's ETKDG perceives and enforces chirality by its own route, so a centre or a bond our force
-    // field walked out of its basin is not a verdict it shares.
+    // Both are the post-polish stereo refusal `stereo_failure_k` already routes here for: a centre or bond our
+    // force field walked out of its basin is not a verdict RDKit's own chirality enforcement shares.
     case types::conformer_status_t::polish_inverted_center_k: return fallback_disposition_t::retry_k;
     case types::conformer_status_t::polish_inverted_bond_k: return fallback_disposition_t::retry_k;
-    // Two producers and only one is fully re-derived: `parse_smiles` refusing the string, which the
-    // fallback repeats, and `prepare_molecule_topology_into` catching an exception out of descriptor,
-    // bounds, chirality or MMFF typing construction. Only the last of those four does the fallback
-    // also run, and where it throws the same way `admit_molecule_` answers `unsupported_element_k`
-    // rather than embedding, so the dispatch costs a parse and a typing pass.
+    // Two producers, and only the parse is re-derived: `prepare_molecule_topology_into` can also throw
+    // out of descriptor, bounds or chirality construction, which the fallback never runs.
     case types::conformer_status_t::invalid_smiles_k: return fallback_disposition_t::retry_k;
     // Nothing produces it, and the fallback carries no deadline that could re-derive it.
     case types::conformer_status_t::preprocess_timeout_k: return fallback_disposition_t::retry_k;
-    // Both are extents of `molecule_descriptor_t`, which the fallback never builds; RDKit embeds a
-    // molecule wider than the flat descriptor without difficulty.
+    // Both are `molecule_descriptor_t` extents the fallback never builds; RDKit embeds wider molecules fine.
     case types::conformer_status_t::too_many_bonds_k: return fallback_disposition_t::retry_k;
     case types::conformer_status_t::too_many_rings_k: return fallback_disposition_t::retry_k;
     // `EmbedMultipleConfs` smooths its own bounds by a different route and may not agree the matrix
     // is infeasible. Whether it ever does is what the per-status recovery tally measures.
     case types::conformer_status_t::bounds_infeasible_k: return fallback_disposition_t::retry_k;
-    // RDKit reaches the geometry by an entirely different route — its own embedding and its own
-    // minimizer — so the energy that came back non-finite is not one it re-derives.
+    // RDKit reaches geometry by its own embedding and minimizer, so a non-finite energy is not one it re-derives.
     case types::conformer_status_t::nonphysical_energy_k: return fallback_disposition_t::retry_k;
     }
     // A status byte outside the enum keeps its second chance rather than being dropped.
@@ -172,14 +153,10 @@ constexpr std::size_t fallback_duration_bin_count_k = 16;
 using types::conformer_status_count_k;
 using types::unnamed_status_k;
 
-/**
- *  @brief Molecules counted per `conformer_status_t`, with one bucket for a byte no enumerator claims.
- *
- *  `conformer_status_t` is append-only because every value is persisted into a shipped shard, and a
- *  shard outlives the binaries that read it — so a status this reader has no name for is expected
- *  rather than exceptional. `of` routes such a byte into `unnamed`, where a non-zero count says the
- *  reader is older than the shard, instead of writing past the end of `named`.
- */
+/** Molecules counted per `conformer_status_t`, with one bucket for a byte no enumerator claims.
+ *  `conformer_status_t` is append-only because every value is persisted into a shipped shard that outlives the
+ *  binaries reading it, so a status this reader has no name for is expected. `of` routes such a byte into
+ *  `unnamed`, where a non-zero count says the reader is older than the shard, rather than past `named`'s end. */
 struct status_tally_t {
     /** Counts indexed by the enumerator itself. */
     std::array<std::uint64_t, conformer_status_count_k> named {};
@@ -200,13 +177,9 @@ struct status_tally_t {
     }
 };
 
-/**
- *  @brief Per-status account of what one `coprocessed-batch` of refusals cost and bought.
- *
- *  Every tally is keyed by the `conformer_status_t` that decided the molecule's fate, and every
- *  entry counts @b molecules rather than conformer slots. `skipped` is filled where the dispatch list
- *  is built, `attempted` and `recovered` by `rdkit_fallback` itself.
- */
+/** Per-status account of what one `coprocessed-batch` of refusals cost and bought. Every tally is keyed by the
+ *  `conformer_status_t` that decided the molecule's fate and counts @b molecules, not conformer slots.
+ *  `skipped` is filled where the dispatch list is built, the rest by `rdkit_fallback`. */
 struct fallback_report_t {
     /** Molecules a terminal status kept out of the fallback. */
     status_tally_t skipped {};
@@ -216,8 +189,7 @@ struct fallback_report_t {
     status_tally_t recovered {};
     /** Host nanoseconds the dispatched molecules cost, by stage, summed over every worker thread. */
     fallback_stage_nanoseconds_t nanoseconds {};
-    /** Dispatched molecules by the millisecond bin their whole attempt fell in, which is the shape a
-     *  mean over a heavy tail cannot show. */
+    /** Dispatched molecules by the millisecond bin their attempt fell in, a shape no mean over a tail shows. */
     std::array<std::uint64_t, fallback_duration_bin_count_k> molecules_by_duration {};
     /** The single slowest attempt of the batch, and the molecule that ran it. */
     std::uint64_t slowest_nanoseconds = 0;

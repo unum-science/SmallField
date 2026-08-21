@@ -2,10 +2,9 @@
  *  @file test/parameters/test_mmff94_tables_kernels.cu
  *  @brief Device-side validation kernels for test_mmff94_tables.
  *
- *  Launches one device lookup per probe key (vdw / bond / angle / torsion) and writes the resolved parameters into
- *  a device output buffer. The host then bit-equals the device result against the host-side lookup over the same
- *  inputs. `lookup_oop` and `lookup_stbn` are reached on the device through the extracted terms `test_mmff_gpu_extract`
- *  compares, so they need no probe of their own here.
+ *  One device lookup per probe key — vdw, bond, angle, torsion — writes its resolved parameters to a device buffer
+ *  the host then bit-equals against the host-side lookup over the same inputs. `lookup_oop` and `lookup_stbn` are
+ *  reached on the device through the terms `test_mmff_gpu_extract` compares, so they need no probe here.
  */
 
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`

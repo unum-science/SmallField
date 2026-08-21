@@ -10,9 +10,8 @@
  *    writer-role     → emits one output parquet-shard per consumed input shard
  *  @endverbatim
  *
- *  The reader-role accumulates parquet-shards until the coprocessed-batch size target is reached, which is
- *  what saturates every GPU per `generate_conformers` call. The fallback is conformer-granular: only the
- *  per-slot failures are re-embedded, and partial GPU successes are kept.
+ *  The reader-role accumulates shards to the batch-size target, which is what saturates every GPU per
+ *  `generate_conformers` call. Fallback is conformer-granular: only per-slot failures are re-embedded.
  */
 
 #include <csignal>
@@ -61,13 +60,11 @@ using smallfield::logger_t;
 
 namespace smallfield::cli {
 
-/* Set by SIGINT/SIGTERM, and by the gpu-runner-role's own CUDA fault. The reader-role stops feeding new
- * shards and the gpu-runner-role drops the ones already staged behind it, so what drains is the work
- * conformers were generated for and nothing else, and the run still exits zero; a runner wrapper pairs
- * this with a pause sentinel to hold off relaunch and free the GPU on demand.
- *
- * `handle_stop_signal_` keeps C language linkage for `std::signal`, which an ordinary `static`
- * function cannot combine with, so the unnamed namespace supplies the internal linkage here. */
+/* Set by SIGINT/SIGTERM and by the gpu-runner-role's own CUDA fault: the reader-role stops feeding shards and
+ * the gpu-runner-role drops those already staged, so only work conformers were generated for drains and the run
+ * still exits zero; a runner wrapper pairs this with a pause sentinel to hold off relaunch and free the GPU.
+ * `handle_stop_signal_` needs C language linkage for `std::signal`, which `static` cannot combine with, so the
+ * unnamed namespace supplies the internal linkage. */
 namespace {
 std::atomic<bool> stop_requested_ {false};
 extern "C" void handle_stop_signal_(int) { stop_requested_.store(true, std::memory_order_relaxed); }
@@ -76,36 +73,35 @@ extern "C" void handle_stop_signal_(int) { stop_requested_.store(true, std::memo
 /** The one name this binary prints, so the announcement and the usage cannot drift from the executable. */
 constexpr char const *executable_name_k = "smallfield_batch";
 
-/** Ceiling on `--rdkit-fallback-threads` and `--gpu-runner-threads`: an OpenMP team wider than this is a
- *  mistyped token, not a machine. */
+/** Ceiling on `--rdkit-fallback-threads` and `--gpu-runner-threads`: wider is a mistyped token, not a machine. */
 constexpr int max_threads_k = 4096;
 
-/** Ceiling on `--batch-size` in molecules. Six batches are in flight at once at roughly 100 KB of pinned
- *  host memory per molecule per slot — 70 GB per slot at 700 K — so a larger target names a batch no
- *  machine this runs on can hold. */
+/** Ceiling on `--batch-size` in molecules. Six batches fly at once at roughly 100 KB of pinned host memory per
+ *  molecule per slot — 70 GB per slot at 700 K — so more names a batch no machine this runs on can hold. */
 constexpr std::uint32_t max_batch_size_k = 4'000'000;
 
 /** Highest tier `--verbose` names: 1 is the per-`embedding-wave` summary, 2 adds the per-device breakdown. */
 constexpr int max_verbose_level_k = 2;
 
-/** All CLI flags. Immutable after parse. */
+/**
+ *  All CLI flags, immutable after parse. Zero is auto for `batch_size` — molecules per `coprocessed-batch`,
+ *  100 K per visible GPU — and for both thread counts, resolved in `compute_thread_budget_`; an empty
+ *  `dataset` omits that key from the shard's metadata; `polish_telemetry` costs a device region, a
+ *  device-to-host copy and a host pass per conformer slot.
+ */
 struct cli_config_t {
     fs::path input_dir;
     fs::path output_dir;
     std::string smiles_column = "smiles";
-    /** Empty omits the key from the shard's metadata. */
     std::string dataset;
     std::uint32_t num_conformers = 3;
     std::uint32_t max_atoms = sfapi::max_atoms_per_molecule_k;
-    /** Molecules per `coprocessed-batch`; zero is auto, 100 K per visible GPU. */
     std::uint32_t batch_size = 0;
     std::vector<int> gpu_ids;
-    /* Zero threads is auto on both, resolved in `compute_thread_budget_`. */
     int rdkit_fallback_threads = 0;
     int gpu_runner_threads = 0;
     restart_policy_t restart_policy = restart_policy_t::resume_k;
     std::uint64_t random_seed = 42;
-    /** Costs a device region, a device-to-host copy and a host pass, all per conformer slot. */
     sfapi::polish_telemetry_t polish_telemetry = sfapi::polish_telemetry_t::disabled_k;
     int verbose_level = 0;
 };
@@ -152,8 +148,8 @@ static bool parse_int_list_(char const *spec, std::vector<int> &out) {
 }
 
 static cli_parse_t parse_cli_(int argc, char **argv, cli_config_t &config) {
-    // `default_arguments::none` suppresses `argparse`'s own `-h` and `--version`, whose generated help cannot
-    // express `--verbose[=LEVEL]` or three names sharing one field. `-h` is bound by hand below.
+    // `default_arguments::none` drops `argparse`'s `-h`/`--version`, whose generated help cannot express
+    // `--verbose[=LEVEL]` or three names sharing one field; `-h` is bound by hand below.
     argparse::ArgumentParser parser {executable_name_k, "", argparse::default_arguments::none};
     bool help_requested = false;
 
@@ -161,13 +157,11 @@ static cli_parse_t parse_cli_(int argc, char **argv, cli_config_t &config) {
     add_string(parser, "--output", config.output_dir);
     add_string(parser, "--smiles-column", config.smiles_column);
     add_string(parser, "--dataset", config.dataset);
-    // Zero conformers asks the library for a wave of nothing, which it reports as a CUDA fault; zero atoms makes
-    // the conformer slot stride zero; an atom cap above the library's own lets a molecule overrun the interleaved
-    // scratch the descriptor pass gathers into. All three are refused here rather than at the launch.
+    // Refused here rather than at the launch: zero conformers is a wave of nothing the library reports as a CUDA
+    // fault, zero atoms zeroes the slot stride, and an atom cap above the library's overruns descriptor scratch.
     add_number(parser, "--num-conformers", 1u, sfapi::max_conformer_count_k, config.num_conformers);
     add_number(parser, "--max-atoms", 1u, sfapi::max_atoms_per_molecule_k, config.max_atoms);
-    // Three names for one field, registered separately rather than as aliases, so a rejected value is reported
-    // under the name the operator typed.
+    // Three names for one field, registered separately so a rejected value is reported under the name typed.
     add_number(parser, "--batch-size", 0u, max_batch_size_k, config.batch_size);
     add_number(parser, "--coprocessed-batch-size", 0u, max_batch_size_k, config.batch_size);
     add_number(parser, "--chunk-size", 0u, max_batch_size_k, config.batch_size);
@@ -193,8 +187,7 @@ static cli_parse_t parse_cli_(int argc, char **argv, cli_config_t &config) {
     parser.add_argument("--no-polish-telemetry").flag().append().action([&config](std::string const &) {
         config.polish_telemetry = sfapi::polish_telemetry_t::disabled_k;
     });
-    // Under `nargs(0, 1)` a bare `--verbose` consumes nothing and the action never fires, which is how it is
-    // told apart from `--verbose=LEVEL` below.
+    // Under `nargs(0, 1)` a bare `--verbose` never fires the action, telling it apart from `--verbose=LEVEL`.
     bool verbose_level_given = false;
     parser.add_argument("--verbose").nargs(0, 1).append().action([&](std::string const &text) {
         number_parse_t const status = parse_number(text, 0, max_verbose_level_k, config.verbose_level);
@@ -213,8 +206,7 @@ static cli_parse_t parse_cli_(int argc, char **argv, cli_config_t &config) {
         if (parser.is_used("--verbose") && !verbose_level_given) config.verbose_level = 1;
     }
     catch (std::exception const &error) {
-        // `argparse` reports every rejection by throwing, so this is the only place a bad command line surfaces.
-        // `--help` alongside a rejected flag is still a help request.
+        // `argparse` throws on every rejection, so a bad command line surfaces here; `--help` beside one still helps.
         if (help_requested) return cli_parse_t::help_requested_k;
         fmt::print(stderr, "{}\n", error.what());
         return cli_parse_t::invalid_k;
@@ -228,12 +220,10 @@ static cli_parse_t parse_cli_(int argc, char **argv, cli_config_t &config) {
     return cli_parse_t::parsed_k;
 }
 
-/**
- *  @brief Pre-allocated coordinate, energy and status arrays, owned by the buffer pool.
- *
- *  `resize_for` only ever grows, so a run allocates its widest batch once and nothing on the hot path
- *  frees. The spans handed downstream carry the extent of the batch in flight, not of the allocation.
- */
+/** Pre-allocated coordinate, energy and status arrays, owned by the buffer pool. `resize_for` only grows, so a
+ *  run allocates its widest batch once and never frees on the hot path; spans handed downstream carry the batch
+ *  in flight, not the allocation. `usrcat` holds `usrcat_components_k` per slot, `num_conformers_per_molecule`
+ *  is zero where preprocessing failed, `shape_described` marks a rebuild. */
 struct output_buffers_t {
     std::vector<__half> coordinates;
     std::vector<float> energies;
@@ -242,11 +232,8 @@ struct output_buffers_t {
     std::vector<std::uint16_t> num_heavy_atoms_per_molecule;
     std::vector<std::uint16_t> num_bonds_per_molecule;
     std::vector<float> molecular_weight_per_molecule;
-    /** Zero if the molecule failed preprocessing. */
     std::vector<std::uint8_t> num_conformers_per_molecule;
-    /** `usrcat_components_k` per conformer slot. */
     std::vector<double> usrcat;
-    /** Whether a molecule's shape context was rebuilt, so the writer can tell an absent descriptor from one. */
     std::vector<sfcli::shape_described_t> shape_described;
     std::vector<std::uint32_t> retry_indices;
 
@@ -274,13 +261,13 @@ enum class pipeline_item_t : bool {
     end_of_stream_k,
 };
 
-/** Combined input parquet-shards for one `coprocessed-batch`, owning the Arrow tables its SMILES view. */
+/** Combined input parquet-shards for one `coprocessed-batch`, owning the Arrow tables its SMILES view.
+ *  `input_file_boundaries` holds each file's first molecule, the last running to the end; `combined_smiles`
+ *  concatenates every file's SMILES and its extent @b is the batch's molecule count. */
 struct coprocessed_batch_accumulator_t {
     std::vector<sfcli::shard_data_t> input_file_data;
     std::vector<sfcli::shard_pair_t const *> input_file_pairs;
-    /** First molecule of each input file; the last file runs to the end. */
     std::vector<std::uint64_t> input_file_boundaries;
-    /** Every input file's SMILES end to end; its extent @b is the batch's molecule count. */
     std::vector<std::string_view> combined_smiles;
     pipeline_item_t item = pipeline_item_t::batch_k;
 
@@ -314,17 +301,17 @@ struct coprocessed_batch_accumulator_t {
 /** The slot an `end_of_stream_k` payload claims, which is none: it carries no batch and no buffers. */
 constexpr std::size_t unclaimed_buffer_slot_k = static_cast<std::size_t>(-1);
 
-/** A `coprocessed-batch` after the `gpu-runner-role`, which the `fallback-role` patches in place. */
+/** A `coprocessed-batch` after the `gpu-runner-role`, which the `fallback-role` patches in place.
+ *  `buffer_slot` is the pool slot the writer-role releases, unclaimed on a sentinel; `batch_start` marks the
+ *  gpu-runner pickup, so the progress line spans GPU, fallback and write; `fallback_report` records what the
+ *  refusals cost and bought by deciding status; `molecules_undescribed` counts molecules with coordinates
+ *  whose shape context could not be rebuilt, so they ship no USRCAT. */
 struct coprocessed_batch_result_t {
     coprocessed_batch_accumulator_t accumulator;
-    /** Buffer-pool slot this batch holds, released by the writer-role; unclaimed on a sentinel. */
     std::size_t buffer_slot = unclaimed_buffer_slot_k;
     pipeline_item_t item = pipeline_item_t::batch_k;
-    /** When the `gpu-runner-role` picked the batch up, so the progress line spans GPU, fallback and write. */
     std::chrono::steady_clock::time_point batch_start {};
-    /** What the batch's refusals cost and bought, by the status that decided each molecule. */
     sfcli::fallback_report_t fallback_report {};
-    /** Molecules with coordinates whose shape context could not be rebuilt, so they ship no USRCAT. */
     std::uint64_t molecules_undescribed = 0;
 };
 
@@ -361,13 +348,10 @@ struct handoff {
     }
 };
 
-/**
- *  @brief Pool of output buffer sets cycled between gpu-runner, fallback, and writer.
- *
- *  Each `output_buffers_t` owns its grow-only vectors, so acquire and release are slot accounting and never
- *  allocate. A batch carries the slot index rather than a pointer, because a slot travels through two
- *  queues before it is released.
- */
+/** Pool of output buffer sets cycled between gpu-runner, fallback, and writer. Each `output_buffers_t` owns its
+ *  grow-only vectors, so acquire and release are slot accounting and never allocate; `acquire` blocks until a
+ *  slot frees. A batch carries the slot index rather than a pointer, because a slot travels through two queues
+ *  before it is released. */
 struct buffer_pool_t {
     std::mutex mutex;
     std::condition_variable available;
@@ -378,7 +362,6 @@ struct buffer_pool_t {
 
     [[nodiscard]] output_buffers_t &at(std::size_t slot) noexcept { return buffers[slot]; }
 
-    /** Claim a free slot, blocking until one is released. */
     [[nodiscard]] std::size_t acquire() {
         std::unique_lock lock(mutex);
         auto first_free = [&] { return std::find(in_use.begin(), in_use.end(), false); };
@@ -395,15 +378,11 @@ struct buffer_pool_t {
     }
 };
 
-/**
- *  @brief Threads each `pipeline-role` runs its OpenMP regions with.
- *
- *  Reader and writer are Arrow-bound and mostly single-threaded inside Arrow, so both stay tiny. The other
- *  two each take the machine less a small OS reserve, and their sum deliberately exceeds the core count: on
- *  a pipeline deep enough to hold several batches in flight at most one of them is mid-parallel-for at any
- *  instant, because the fallback bursts on RDKit while the gpu-runner is stream-syncing. Where a workload's
- *  failure rate makes that untrue, `--rdkit-fallback-threads` overrides the split.
- */
+/** Threads each `pipeline-role` runs its OpenMP regions with. Reader and writer are Arrow-bound and near-serial
+ *  inside it, so both stay tiny. The other two each take the machine less a small OS reserve, their sum
+ *  deliberately exceeding the core count: at pipeline depth at most one is mid-parallel-for at a time, the
+ *  fallback bursting on RDKit while the gpu-runner stream-syncs, and `--rdkit-fallback-threads` overrides the
+ *  split where a failure rate makes that untrue. */
 struct thread_budget_t {
     int reader;
     int writer;
@@ -426,14 +405,10 @@ struct role_timing_t {
     std::atomic<std::uint64_t> molecules {0};
 };
 
-/**
- *  @brief Where a run's host time went, one entry per timed span of the outer pipeline.
- *
- *  `fallback` and `descriptors` both sit inside the `fallback-role` and are timed apart because they walk
- *  different populations: `rdkit_fallback` runs on the molecules the GPU refused a slot to, while
- *  `compute_shape_descriptors_` reparses every molecule of the `coprocessed-batch`. Summed, they are what
- *  that role costs; apart, they say which of the two is paying for it.
- */
+/** Where a run's host time went, one entry per timed span of the outer pipeline. `fallback` and `descriptors`
+ *  both sit in the `fallback-role` but walk different populations, so they are timed apart: `rdkit_fallback`
+ *  runs on molecules the GPU refused a slot, `compute_shape_descriptors_` reparses every molecule of the batch.
+ *  Summed they are the role's cost; apart they say which one pays it. */
 struct pipeline_timings_t {
     role_timing_t reader;
     role_timing_t gpu_runner;
@@ -442,13 +417,9 @@ struct pipeline_timings_t {
     role_timing_t writer;
 };
 
-/**
- *  @brief Folds one span of work into @p timing when it leaves scope.
- *
- *  @p molecules is read at scope exit rather than at entry, so a body that only learns its count on the way
- *  out — the reader-role, which has to open the shard first — reports the same way as one that knows it up
- *  front, and must therefore outlive the span.
- */
+/** Folds one span of work into @p timing when it leaves scope. @p molecules is read at scope exit, not entry,
+ *  so a body learning its count on the way out — the reader-role, which opens the shard first — reports like
+ *  one knowing it up front, and must outlive the span. */
 class scoped_role_span_t {
     role_timing_t &timing_;
     std::uint64_t const &molecules_;
@@ -469,28 +440,23 @@ class scoped_role_span_t {
     scoped_role_span_t &operator=(scoped_role_span_t const &) = delete;
 };
 
-/** Cumulative counters shared across pipeline stages. */
+/** Cumulative counters shared across pipeline stages. `batches_completed` says whether any two roles ever
+ *  overlapped, and the three failure counts stay apart because a rerun treats them differently:
+ *  `input_files_failed` reached no output shard on either end and drives the exit code, `input_files_parked` was
+ *  moved out of the offered set after a CUDA fault so only an operator putting it back brings it up again, and
+ *  `input_files_empty` carried no rows and was sealed with a zero-row output — a corpus defect, not the
+ *  preprocessing loss the fallback breakdown already names. `molecules_undescribed` shipped coordinates but no
+ *  USRCAT, their shape context unrebuildable. `molecules_batch_overflowed` counts molecules a wave refused for
+ *  its own sizing: the device-side producer raises `cuda_error_count`, the host-side pinned reservation raises
+ *  nothing, so without it a run reports a device's whole batch refused and still exits 0. */
 struct progress_counters_t {
     std::atomic<std::uint64_t> molecules_completed {0};
     std::atomic<std::uint64_t> input_files_completed {0};
-    /** Batches the writer-role has finished, which is what says whether any two roles ever overlapped. */
     std::atomic<std::uint64_t> batches_completed {0};
-    /** Pending input-files that reached no output shard, on either end of the pipeline; drives the exit code. */
     std::atomic<std::uint64_t> input_files_failed {0};
-    /** Input-files moved out of the offered set after a CUDA fault, each encoded by nothing. Counted apart
-     *  from a failure because a rerun does retry a failure and cannot retry one of these: the shard is gone
-     *  from where the corpus is globbed, and only an operator putting it back brings it up again. */
     std::atomic<std::uint64_t> input_files_parked {0};
-    /** Input-files that carried no rows at all, each sealed with a zero-row output shard. Counted apart from
-     *  the molecules a populated shard loses to preprocessing, which the fallback breakdown already names:
-     *  an empty shard and a shard nothing survived both finish, and only one of them is a corpus defect. */
     std::atomic<std::uint64_t> input_files_empty {0};
-    /** Molecules that shipped coordinates but no USRCAT, because their shape context could not be rebuilt. */
     std::atomic<std::uint64_t> molecules_undescribed {0};
-    /** Molecules a wave refused for its own sizing rather than for anything about them, summed across
-     *  batches. One producer is device-side and already raises `cuda_error_count`; the other is a
-     *  host-side pinned reservation, which raises nothing at all — so without this the run would report
-     *  a whole device's batch as refused and still exit 0. */
     std::atomic<std::uint64_t> molecules_batch_overflowed {0};
     std::uint64_t total_input_files = 0;
     std::chrono::steady_clock::time_point start_time;
@@ -513,8 +479,7 @@ static void reader_loop_(custd::span<shard_pair_t const *const> pending, cli_con
         {
             SF_NVTX_RANGE_COLORED("reader: parquet", 0xC0392B);
             scoped_role_span_t const timed {timings.reader, molecules_read};
-            // `read_shard` already named the refusal in the log, so this only says the shard was left behind.
-            // It leaves no sentinel either, so `--resume` picks it up again on the next invocation.
+            // `read_shard` already logged the refusal; no sentinel is left either, so `--resume` retries it.
             if (sfcli::read_shard(pair->input_path, config.smiles_column, data, &logger) !=
                 sfcli::input_read_t::read_k) {
                 logger.error("skipping {}", pair->input_path.string());
@@ -524,8 +489,7 @@ static void reader_loop_(custd::span<shard_pair_t const *const> pending, cli_con
             molecules_read = data.smiles.size();
         }
         accumulator.add_input_file(std::move(data), pair);
-        // A shard fetched into its final name can be truncated to nothing, so a zero-row read is a corpus
-        // fact rather than a refusal: it travels the pipeline like any other and seals a zero-row output.
+        // A shard fetched into its final name can truncate to nothing — zero rows is a corpus fact, not a refusal.
         if (molecules_read == 0) {
             logger.info("{} holds no rows — sealing a zero-row output shard", pair->input_path.string());
             counters.input_files_empty.fetch_add(1);
@@ -537,9 +501,8 @@ static void reader_loop_(custd::span<shard_pair_t const *const> pending, cli_con
         }
     }
 
-    // What the tail batch carries is input-files, not molecules: a batch of nothing but empty shards holds no
-    // molecule and still owes an output shard and a sentinel for each of them. Testing the molecule count here
-    // is what dropped those shards silently, and an unsealed shard is offered again by every later run.
+    // The tail batch carries input-files, not molecules: a batch of nothing but empty shards holds no molecule
+    // and still owes an output shard and a sentinel for each, and an unsealed shard is re-offered by every run.
     if (!accumulator.input_file_pairs.empty()) { output_queue.send(std::move(accumulator)); }
 
     coprocessed_batch_accumulator_t sentinel;
@@ -553,14 +516,10 @@ enum class gpu_runner_outcome_t {
     cuda_fault_k,
 };
 
-/**
- *  @brief Move every input shard that fed this batch out of the set a later run is offered.
- *
- *  A CUDA error poisons the driver context on every device, so parking is what makes the wrapper's next
- *  invocation skip these shards rather than fault on them again. Every shard of the batch is parked, not
- *  just the offending one; on Enamine and PubChem a batch holds one shard anyway. A shard that could not be
- *  moved is still offered, so it counts as a failure and the run says so rather than reporting it parked.
- */
+/** Move every input shard that fed this batch out of the set a later run is offered. A CUDA error poisons the
+ *  driver context on every device, so parking makes the next invocation skip these shards rather than fault
+ *  again. Every shard of the batch is parked, not just the offender — on Enamine and PubChem a batch holds one
+ *  anyway — and one that could not be moved is still offered, so it counts failed. */
 static void park_batch_shards_(coprocessed_batch_accumulator_t const &accumulator, logger_t const &logger,
                                progress_counters_t &counters) {
     for (auto const *pair : accumulator.input_file_pairs) {
@@ -571,14 +530,10 @@ static void park_batch_shards_(coprocessed_batch_accumulator_t const &accumulato
     }
 }
 
-/**
- *  @brief List the molecules the `fallback-role` could still fill a slot for into @p retry_indices,
- *  which is cleared first, and tally the ones it is spared into @p report.
- *
- *  A molecule whose every unfilled slot carries a status `admit_molecule_` re-derives is not
- *  dispatched: it would pay a `SmilesToMol`, an `addHs` and an `MMFFMolProperties` to arrive at the
- *  verdict its slots already hold. Those molecules ship at exactly the status they already carry.
- */
+/** List molecules the `fallback-role` could still fill a slot for into @p retry_indices, cleared first, and
+ *  tally the ones it is spared into @p report. A molecule whose every unfilled slot carries a status
+ *  `admit_molecule_` re-derives is not dispatched: it would pay a `SmilesToMol`, an `addHs` and an
+ *  `MMFFMolProperties` to reach the verdict its slots hold. */
 static void fill_retry_indices_into_(custd::span<sfapi::conformer_status_t const> status, std::uint32_t num_conformers,
                                      std::vector<std::uint32_t> &retry_indices, sfcli::fallback_report_t &report) {
     retry_indices.clear();
@@ -615,8 +570,7 @@ static void generate_batch_(sfapi::context_t &gpu_context, cli_config_t const &c
     generation_config.random_seed = config.random_seed;
     generation_config.polish_telemetry = config.polish_telemetry;
 
-    // The aggregate status is discarded because a batch-level `mmff_unconverged_k` may still carry a
-    // majority of successful conformers; the per-conformer codes in `buffer.status` drive every stage below.
+    // Discarded: a batch-level `mmff_unconverged_k` can still carry mostly successes; `buffer.status` drives below.
     [[maybe_unused]] sfapi::conformer_status_t const batch_status = gpu_context.generate_conformers(
         accumulator.combined_smiles, generation_config, config.max_atoms,
         custd::span<__half>(buffer.coordinates.data(), total_conformers * layout.slot_stride()),
@@ -639,12 +593,10 @@ static gpu_runner_outcome_t gpu_runner_loop_(sfapi::context_t &gpu_context, cli_
     for (;;) {
         auto accumulator = input_queue.receive();
         if (accumulator.item == pipeline_item_t::end_of_stream_k) break;
-        // A stopped run launches nothing further, but the loop keeps draining so the reader-role never
-        // blocks on a full ring and the whole pipeline can shut down in order. Both producers of a stop
-        // land here: a poisoned driver context, and the operator's SIGINT or SIGTERM. A batch dropped
-        // here has only been read — no conformer was generated for it and no shard of it was sealed, so
-        // `--resume` picks its input-files up again — and dropping it is what bounds a stop to the work
-        // already past this role rather than to the whole ring staged behind it.
+        // A stopped run launches nothing further but keeps draining, so the reader-role never blocks on a full
+        // ring and both stop producers — a poisoned driver context and the operator's SIGINT/SIGTERM — shut the
+        // pipeline down in order. A dropped batch was only read, so `--resume` picks its input-files up again,
+        // and dropping bounds the stop to work already past this role rather than the whole ring behind it.
         if (stop_requested_.load(std::memory_order_relaxed)) continue;
         SF_NVTX_RANGE_COLORED("gpu_runner: preprocess+launch", 0x2E86C1);
         std::uint64_t const batch_molecules = accumulator.num_molecules();
@@ -653,13 +605,11 @@ static gpu_runner_outcome_t gpu_runner_loop_(sfapi::context_t &gpu_context, cli_
         auto const batch_start = std::chrono::steady_clock::now();
         std::size_t const buffer_slot = pool.acquire();
         output_buffers_t &buffer = pool.at(buffer_slot);
-        // A batch of nothing but zero-row input shards has no wave to launch, and `generate_conformers` reports
-        // a wave of no molecules as a CUDA fault — which would park shards that are merely empty. It skips the
-        // device and travels on, so each of its input-files is still written and sealed downstream.
+        // A batch of only zero-row shards has no wave to launch, and `generate_conformers` calls a wave of no
+        // molecules a CUDA fault, parking merely-empty shards; skipping the device still writes and seals each.
         if (batch_molecules > 0) generate_batch_(gpu_context, config, accumulator, buffer);
 
-        // Park this batch's shards and stop feeding the GPU, so `main` returns non-zero and the wrapper
-        // relaunches with a fresh CUDA context.
+        // Park the batch's shards and stop the GPU, so `main` exits non-zero and the wrapper relaunches fresh.
         if (gpu_context.cuda_error_count.load() > 0) {
             park_batch_shards_(accumulator, logger, counters);
             logger.error("aborting invocation after {} CUDA errors; wrapper will relaunch",
@@ -692,8 +642,7 @@ static gpu_runner_outcome_t gpu_runner_loop_(sfapi::context_t &gpu_context, cli_
  *  @brief Compute USRCAT descriptors and separate disconnected fragments over a batch's coordinates.
  *
  *  Runs after the RDKit fallback, so every slot is final. A molecule whose shape context cannot be rebuilt is
- *  marked `undescribed_k`, which is what makes the writer null its `usrcat` rows instead of publishing the
- *  zero-filled block they hold.
+ *  `undescribed_k`, which nulls its `usrcat` rows in the writer rather than publishing the zero-filled block.
  *
  *  @return Molecules that had coordinates to describe and were left undescribed anyway.
  */
@@ -709,8 +658,7 @@ static std::uint64_t compute_shape_descriptors_(cli_config_t const &config, thre
     int const threads = budget.fallback > 0 ? budget.fallback : omp_get_max_threads();
     std::uint64_t undescribed = 0;
 
-    // `private` hands each thread its own context, which keeps the capacity of its five vectors across the
-    // molecules that thread walks; declaring it inside the body would allocate and free once per molecule.
+    // `private` gives each thread its own context, keeping its five vectors' capacity across that thread's work.
     sfpost::molecule_shape_context_t context;
 
 #pragma omp parallel for schedule(dynamic, 256) num_threads(threads) private(context) \
@@ -718,8 +666,7 @@ static std::uint64_t compute_shape_descriptors_(cli_config_t const &config, thre
     for (std::uint64_t molecule_index = 0; molecule_index < num_molecules; ++molecule_index) {
         std::uint8_t const stored_atoms = buffer.num_atoms_per_molecule[molecule_index];
         if (stored_atoms == 0) continue; // preprocess failed: no coordinates to describe
-        // Every refusal means the reparse could not reproduce the atom order the coordinates were written
-        // in, so the molecule stays undescribed and ships no shape fingerprint at all.
+        // A refusal means the reparse lost the coordinates' atom order, so the molecule ships no shape fingerprint.
         if (sfpost::build_shape_context_into(accumulator.combined_smiles[molecule_index], stored_atoms,
                                              smallfield::keep_largest_fragment_k,
                                              context) != sfpost::shape_typing_t::typed_k) {
@@ -729,8 +676,7 @@ static std::uint64_t compute_shape_descriptors_(cli_config_t const &config, thre
         buffer.shape_described[molecule_index] = sfcli::shape_described_t::described_k;
         std::uint32_t const num_atoms = stored_atoms;
 
-        // Left uninitialized: `gather_slot_into_interleaved` writes all `3 * num_atoms` components below, and
-        // nothing past them is ever read.
+        // Left uninitialized: `gather_slot_into_interleaved` writes all `3 * num_atoms` components, no more read.
         std::array<float, sfapi::max_atoms_per_molecule_k * 3u> interleaved;
         for (std::uint32_t conformer = 0; conformer < num_conformers; ++conformer) {
             std::size_t const flat = slot_layout.flat_slot(molecule_index, conformer);
@@ -773,8 +719,7 @@ static void fallback_loop_(cli_config_t const &config, thread_budget_t const &bu
         std::size_t const total_conformers = static_cast<std::size_t>(num_molecules) * config.num_conformers;
 
         if (!buffer.retry_indices.empty()) {
-            // Both the range and the span name the recovery alone. The descriptor pass below is the other
-            // half of this role and walks a population two orders of magnitude wider.
+            // Range and span name the recovery alone; the descriptor pass below walks a population 100× wider.
             SF_NVTX_RANGE_COLORED("fallback: rdkit recovery", 0xE67E22);
             std::uint64_t const retry_molecules = buffer.retry_indices.size();
             scoped_role_span_t const timed {timings.fallback, retry_molecules};
@@ -836,18 +781,13 @@ static sfcli::writer_inputs_t shard_writer_inputs_(cli_config_t const &config,
     };
 }
 
-/**
- *  @brief Emit one output shard per input file the batch consumed, sealing each with its `.encoded` sentinel.
- *
- *  `parquet::arrow::WriteTable` carries no threading of its own, so the role's budget is spent across the
- *  batch's files rather than inside one: each file owns a disjoint slice of the batch's buffers, reads them
- *  and writes its own path, and the counters it raises are atomic.
- */
+/** Emit one output shard per input file the batch consumed, sealing each with its `.encoded` sentinel.
+ *  `parquet::arrow::WriteTable` has no threading of its own, so the role's budget is spent across the batch's
+ *  files rather than inside one: each owns a disjoint buffer slice, writes its own path, and counts atomically. */
 static void write_batch_shards_(cli_config_t const &config, thread_budget_t const &budget,
                                 coprocessed_batch_accumulator_t const &accumulator, output_buffers_t &buffer,
                                 logger_t const &logger, progress_counters_t &counters) {
-    // No deduplication: every surviving molecule emits all K slots, and a failed one emits zero, which the
-    // writer turns into a single all-null row so every input row keeps at least one output row.
+    // No deduplication: a survivor emits all K slots, a failure zero — one all-null row, so every input row ships.
     for (std::uint64_t molecule_index = 0; molecule_index < accumulator.num_molecules(); ++molecule_index)
         buffer.num_conformers_per_molecule[molecule_index] = buffer.num_atoms_per_molecule[molecule_index] != 0
                                                                  ? static_cast<std::uint8_t>(config.num_conformers)
@@ -863,16 +803,14 @@ static void write_batch_shards_(cli_config_t const &config, thread_budget_t cons
         // `write_shard` already logged the column or the file that stopped it, so nothing is said here.
         sfcli::shard_write_report_t const report = sfcli::write_shard(
             output_path, shard_writer_inputs_(config, accumulator, buffer, file_index), &logger);
-        // A refused shard publishes nothing, so it counts as neither molecules nor a completed input-file, and
-        // its sentinel is left unwritten so `--resume` retries it on the next invocation.
+        // A refused shard publishes nothing and leaves no sentinel, so it counts as neither and `--resume` retries.
         if (report.status != sfcli::shard_write_t::written_k) {
             counters.input_files_failed.fetch_add(1);
             continue;
         }
-        // `write_shard` closed the shard before it returned, so the sentinel this iteration writes can only
-        // seal a file that is already durable — the one ordering the corpus's completeness signal depends on.
-        // A durable shard nothing sealed is the same infinite re-offer a shard nothing wrote is, because the
-        // sentinel is the whole completeness signal, so the two are counted alike.
+        // `write_shard` closes the shard before returning, so this sentinel can only seal an already-durable
+        // file — the ordering the corpus's completeness signal depends on. An unsealed durable shard re-offers
+        // forever just as an unwritten one does, so both count alike.
         if (sfcli::write_encoded_sentinel(output_path, &logger) != sfcli::sentinel_write_t::sealed_k) {
             counters.input_files_failed.fetch_add(1);
             continue;
@@ -890,13 +828,9 @@ static double percent_of_(std::uint64_t part, std::uint64_t whole) noexcept {
 
 using sfapi::conformer_status_name;
 
-/**
- *  @brief One line per status that sent molecules to the `fallback-role`, or held them back from it.
- *
- *  Recovery read against the dispatching status is what decides whether that status should stay
- *  `fallback_disposition_t::retry_k`: one whose molecules RDKit never fills is one the dispatch pays
- *  a full parse for and gets nothing from. Statuses nothing counted are left unprinted.
- */
+/** One line per status that sent molecules to the `fallback-role`, or held them back from it. Recovery read
+ *  against the dispatching status decides whether it stays `fallback_disposition_t::retry_k`: one whose
+ *  molecules RDKit never fills pays a full parse for nothing. Statuses nothing counted go unprinted. */
 static void log_fallback_breakdown_(coprocessed_batch_result_t const &result, logger_t const &logger) {
     for (std::size_t index = 0; index < sfcli::conformer_status_count_k; ++index) {
         auto const status = static_cast<sfapi::conformer_status_t>(index);
@@ -919,14 +853,10 @@ static void log_fallback_breakdown_(coprocessed_batch_result_t const &result, lo
                     fmt::group_digits(unnamed_skipped));
 }
 
-/**
- *  @brief What the dispatched molecules cost, by stage and by how long the whole attempt took.
- *
- *  Stage time is summed over the whole OpenMP team, so it exceeds the role's wall time by roughly the width
- *  of that team. The duration bins are what a per-molecule mean cannot show: a single molecule in the top
- *  bin outweighs a thousand in the bottom one, and which of the two a batch is made of decides whether the
- *  fallback is worth making faster or worth making smaller.
- */
+/** What the dispatched molecules cost, by stage and by how long the whole attempt took. Stage time sums over
+ *  the whole OpenMP team, exceeding the role's wall time by roughly that team's width. The duration bins show
+ *  what a per-molecule mean cannot: one molecule in the top bin outweighs a thousand in the bottom, and which a
+ *  batch is made of decides whether the fallback wants to be faster or smaller. */
 static void log_fallback_cost_(coprocessed_batch_result_t const &result, logger_t const &logger) {
     auto const &report = result.fallback_report;
     std::uint64_t summed_nanoseconds = 0;
@@ -971,8 +901,7 @@ static void log_batch_progress_(coprocessed_batch_result_t const &result, logger
         fallback_fragment = fmt::format("  fallback attempted={} recovered={} {:.3f}% terminal={}",
                                         fmt::group_digits(attempted), fmt::group_digits(recovered),
                                         percent_of_(recovered, attempted), fmt::group_digits(skipped));
-    // Molecules whose coordinates ship without a shape fingerprint, which is a hole in a similarity index
-    // rather than a missing row, so it is named on the same line as the batch that produced it.
+    // Coordinates shipping without a shape fingerprint hole a similarity index, so name them with their batch.
     std::string undescribed_fragment;
     if (result.molecules_undescribed > 0)
         undescribed_fragment = fmt::format(
@@ -1026,13 +955,9 @@ static void fill_pending_shards_into_(std::vector<shard_pair_t> const &shard_pai
                 fmt::group_digits(pending.size()), fmt::group_digits(shard_pairs.size() - pending.size()));
 }
 
-/**
- *  @brief Run the four `pipeline-roles` concurrently until every pending shard has been written.
- *
- *  The depth is how many coprocessed-batches the upstream may stage before back-pressuring, and the pool is
- *  one deeper so no stage blocks on a free output buffer. It hides the H2D/D2H tails on multi-GPU runs and
- *  costs about 70 GB of pinned host memory per extra slot at a 700 K-molecule batch target.
- */
+/** Run the four `pipeline-roles` concurrently until every pending shard has been written. Depth is how many
+ *  coprocessed-batches upstream may stage before back-pressuring, the pool one deeper so no stage blocks on a
+ *  buffer; hides multi-GPU H2D/D2H tails at ~70 GB pinned host per extra slot at a 700 K batch. */
 static gpu_runner_outcome_t run_pipeline_(sfapi::context_t &gpu_context, cli_config_t const &config,
                                           custd::span<shard_pair_t const *const> pending, std::uint32_t batch_target,
                                           thread_budget_t const &budget, logger_t const &logger,
@@ -1073,17 +998,11 @@ struct named_span_t {
     role_timing_t const &timing;
 };
 
-/**
- *  @brief Where the run's host time went, one line per timed span, printed once at the end.
- *
- *  A span opens when its role already holds work, so blocking on an empty queue belongs to no span and the
- *  summed span time is what the run spent doing something. Shares are of that sum rather than of the wall
- *  clock, because the spans overlap — their ratio is the overlap factor on the last line.
- *
- *  One `coprocessed-batch` has nothing to overlap with, so a single-batch run decomposes four roles that ran
- *  strictly serially. That is a cold decomposition and not a steady-state share, which is why the batch count
- *  leads the report.
- */
+/** Where the run's host time went, one line per timed span, printed once at the end. A span opens when its role
+ *  already holds work, so blocking on an empty queue belongs to no span and the summed span time is what the run
+ *  spent doing something. Shares are of that sum, not the wall clock, since spans overlap — their ratio is the
+ *  overlap factor on the last line. One `coprocessed-batch` has nothing to overlap with, so a single-batch run
+ *  is a cold decomposition of four serial roles, not a steady-state share, which is why the batch count leads. */
 static void log_pipeline_timings_(pipeline_timings_t const &timings, progress_counters_t const &counters,
                                   double wall_seconds, logger_t const &logger) {
     std::array<named_span_t, 5> const spans {{
@@ -1109,8 +1028,7 @@ static void log_pipeline_timings_(pipeline_timings_t const &timings, progress_co
         logger.info("  span={:<18} wall={:>8.1f}s share={:>7.3f}% per_molecule={:>7.1f}us molecules={}", span.name,
                     seconds, share, per_molecule_us, fmt::group_digits(molecules));
     }
-    // Naming the two middle spans as one role on the closing line, so their sum is read as the fallback-role's
-    // cost and neither is read as all of it.
+    // The two middle spans are one role, so their sum reads as the fallback-role's cost and neither as all of it.
     logger.info("  spans summed {:.1f}s over {:.1f}s wall, overlap {:.2f}x; " //
                 "rdkit-fallback and shape-descriptors are both the fallback-role",
                 summed_seconds, wall_seconds, wall_seconds > 0.0 ? summed_seconds / wall_seconds : 0.0);
@@ -1190,9 +1108,8 @@ int main(int argc, char **argv) {
         logger.error("{} CUDA errors reported by the library — output is unreliable", fmt::group_digits(cuda_errors));
         return 1;
     }
-    // A wave that could not size itself refuses molecules the corpus never had a problem with, and the
-    // host-side producer of that refusal raises no CUDA error — so this is the only thing between a
-    // silently short shard and a rerun at a wave that fits.
+    // A wave that could not size itself refuses molecules the corpus never had a problem with, and the host-side
+    // producer raises no CUDA error — so this is all that stands between a silently short shard and a rerun.
     std::uint64_t const batch_overflowed = counters.molecules_batch_overflowed.load();
     if (batch_overflowed > 0) {
         logger.error("{} molecules refused for wave sizing, not chemistry; rerun at a smaller --batch-size",

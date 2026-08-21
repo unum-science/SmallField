@@ -1,7 +1,6 @@
 /**
  *  @file cli/parquet_reader.cpp
- *  @brief Opens a Parquet shard through Arrow, reads the SMILES column, and slices it into `string_view`s over
- *  the retained table.
+ *  @brief Opens a Parquet shard through Arrow and slices its SMILES column into views over the retained table.
  */
 
 #include <memory> // `std::shared_ptr`, `std::move`
@@ -50,8 +49,7 @@ static int smiles_column_index_(parquet::arrow::FileReader const &reader, std::s
  */
 static input_read_t fill_smiles_views_into_(arrow::ChunkedArray const &column, std::vector<std::string_view> &smiles) {
     for (int chunk_index = 0; chunk_index < column.num_chunks(); ++chunk_index) {
-        // Checked, because a `static_pointer_cast` of a non-null pointer is never null: the refusal below
-        // would be unreachable and a column of some other type would be read as UTF-8.
+        // Checked: `static_pointer_cast` never yields null, so a non-UTF-8 column would read as UTF-8 unrefused.
         auto const *chunk = dynamic_cast<arrow::StringArray const *>(column.chunk(chunk_index).get());
         if (chunk == nullptr) return input_read_t::column_not_string_k;
         for (std::int64_t row = 0; row < chunk->length(); ++row) {
@@ -72,8 +70,7 @@ input_read_t read_shard(fs::path const &path, std::string const &smiles_column, 
     logger_t const fallback;
     logger_t const &logger = log != nullptr ? *log : fallback;
 
-    /* Every refusal below leaves through here, so the reason reaches the operator's log whatever the caller
-     * does with the status it gets back. */
+    // Every refusal leaves through here, so the reason reaches the log whatever the caller does with the status.
     auto refuse_ = [&](input_read_t status, std::string_view detail = {}) {
         if (detail.empty()) logger.error("{} {}", path, describe_input_read(status));
         else logger.error("{} {}: {}", path, describe_input_read(status), detail);

@@ -258,7 +258,7 @@ The stream must outlive the buffer, which is the lifetime rule every other strea
 `cudaHostAlloc` has no stream-ordered form, so a stream there would suggest an ordering the call does not have.
 
 Sub-allocation survives only where the single allocation is what makes an upload one `cudaMemcpyAsync` rather than N, which is true of the wave pool and of nothing else here.
-An arena carved by hand exists mostly to amortize `cudaMalloc`, and stream-ordered allocation removes that cost — so a table that used to be placed into a shared slab is now simply its own `buffer`.
+An arena carved by hand exists mostly to amortize `cudaMalloc`, and stream-ordered allocation removes that cost — so a table is simply its own `buffer` rather than a slice of a shared slab.
 
 __A grow allocates before it releases, and reports what it did.__
 
@@ -285,7 +285,7 @@ __Ownership is readable from a declaration, never reconstructed from call sites.
 An owning buffer is `buffer<value_type_, allocator_type_>` and a borrowed one is a `custd::span` or a view.
 There is no third thing, and a raw pointer that outlives the expression using it is a defect.
 
-A pointer into a container, held across a phase boundary, is a lifetime bug waiting for a reallocation — `gpu_pipeline_handle_t` carried one until it was replaced by the span it actually read.
+A pointer into a container, held across a phase boundary, is a lifetime bug waiting for a reallocation — `gpu_pipeline_handle_t` holds the span it actually reads instead.
 Residence is a compile-time property for the same reason: host code holding a device pointer should not compile rather than fail at run time.
 
 __Two facts that must agree are one fact, or they are a defect.__
@@ -621,7 +621,7 @@ __Three sinks, chosen by who reads the output, and an iostream is none of them._
 
 ## Tooling Entry Points
 
-These govern `cli/`, `bench/` and `test/` — the twenty-seven shipped binaries.
+These govern every binary under `cli/`, `bench/` and `test/`.
 They differ enough in nature that there is no shared scaffolding to inherit, so they are held to rules rather than to a base class.
 
 __One announcement, naming the executable, before any work starts.__
@@ -681,9 +681,9 @@ So:
 
 - Name the corpus and the sample size. `data/usearch-molecules/pubchem` and `data/usearch-molecules/gdb13` are the standing ones; they have different molecule-size distributions and a blended figure hides which half moved.
 - Weight any distribution-sensitive number by the measured distribution before quoting it.
-- Compare A against B within one run. Absolute throughput drifts by 10–15 % on a loaded machine while the ratio inside a single run stays stable.
-- Report the tail, not only the median. A shifted median and a heavy one-sided tail look identical otherwise, which is how an unpaired energy comparison hid a real defect here for months.
-- Say what you could not measure. An 8-GPU claim from a single-GPU box is a projection, and should read as one.
+- Compare A against B within one run, since absolute throughput drifts by 10–15 % on a loaded machine while the ratio inside a single run stays stable.
+- Report the tail, not only the median, since a shifted median and a heavy one-sided tail look identical otherwise — which is how an unpaired energy comparison hid a real defect here for months.
+- Say what you could not measure, because an 8-GPU claim from a single-GPU box is a projection and should read as one.
 
 ## Environment
 
@@ -754,7 +754,7 @@ Generator expressions are evaluated per configuration and do not have either fai
 
 ## Deliberately Not Rules
 
-- __STL containers in headers.__ Other projects in this family ban them in public headers and route to a house container. SmallField is an application pipeline consuming RDKit, whose API returns `std::vector` throughout, so the boundary is already impure and there is nothing to migrate to.
+- __STL containers in headers.__ Other projects in this family ban them in public headers and route to a house container, but SmallField is an application pipeline consuming RDKit, whose API returns `std::vector` throughout, so the boundary is already impure and there is nothing to migrate to.
 - __`PointerAlignment`.__ This repo carries `Right`, the C-idiomatic form, in a C++ project where the family heuristic says `Left`. Changing it reformats the whole tree for no functional gain.
-- __`clang-tidy` as a gate.__ Shipped advisory in `.clang-tidy`, deny-by-default so `__device__` code and intrinsics do not drown it. Too slow for a hook.
-- __Style checks in CI.__ CI is for correctness. Hooks are for style.
+- __`clang-tidy` as a gate.__ Shipped advisory in `.clang-tidy`, deny-by-default so `__device__` code and intrinsics do not drown it, and too slow for a hook.
+- __Style checks in CI.__ CI is for correctness, hooks are for style.

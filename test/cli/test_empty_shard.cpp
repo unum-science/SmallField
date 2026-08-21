@@ -2,14 +2,12 @@
  *  @file test/cli/test_empty_shard.cpp
  *  @brief Pin that a shard of no molecules is written, and written under the same schema as a populated one.
  *
- *  An input parquet-shard with no rows is a corpus fact rather than a defect — an `s3 sync` writes each shard
- *  directly to its final name, so a truncated fetch produces one — and the only completeness signal downstream
- *  keys on is the `.encoded` sentinel beside the output shard. A producer that refuses the empty case writes no
- *  shard, seals nothing, and hands the runner a shard it will offer again on every pass, forever.
- *
- *  So the zero-row shard has to be a first-class output: readable, carrying all thirteen fields, and differing
- *  from a populated shard in nothing but its row count. The refusal that guards the same call stays live for
- *  the case it was written for, which is a caller that dropped the molecule axis while its molecules exist.
+ *  An input shard with no rows is a corpus fact, not a defect — `s3 sync` writes each shard directly to its
+ *  final name, so a truncated fetch produces one — and downstream completeness keys on the `.encoded` sentinel
+ *  alone. A producer that refuses the empty case writes no shard, seals nothing, and hands the runner one it
+ *  will offer again on every pass, forever. So a zero-row shard is first-class: readable, carrying all thirteen
+ *  fields, and differing from a populated shard in nothing but row count. The refusal guarding the same call
+ *  stays live for its own case, a caller that dropped the molecule axis while its molecules exist.
  */
 
 #include <cstdint> // `std::uint8_t`, `std::uint16_t`
@@ -108,9 +106,8 @@ static std::shared_ptr<arrow::Table> read_table_(fs::path const &path) {
 
 /**
  *  @brief Compare the two tables column by column against each other and against the canonical roster.
- *
- *  A column name is asserted rather than reported: the reporter's delta is arithmetic, so a name belongs in
- *  the sentence `sf_verify_` prints and the numbers belong in the `MISMATCH` lines beside it.
+ *  A column name is asserted rather than reported: the reporter's delta is arithmetic, so names belong in
+ *  the sentence `sf_verify_` prints and numbers in the `MISMATCH` lines beside it.
  */
 static void check_zero_row_shard_(arrow::Table const &populated, arrow::Table const &empty,
                                   diagnostic_reporter_t &reporter) {
@@ -163,8 +160,7 @@ int main() {
     sf_verify_(empty_report.status == sfcli::shard_write_t::written_k,
                fmt::format("a shard of no molecules was refused: {}", sfcli::describe_shard_write(empty_report)));
 
-    // The axis dropped rather than empty: molecules exist and nothing describes them, which must stay a refusal
-    // or an input file with rows would seal an output shard holding none of them.
+    // Axis dropped, not empty — molecules exist, undescribed — or a file with rows seals a shard holding none.
     sfcli::writer_inputs_t dropped_axis = sftest::empty_inputs_();
     dropped_axis.molecules.num_conformers = {&molecule.num_conformers, 1};
     sfcli::shard_write_report_t const dropped_report = sfcli::write_shard(directory / "dropped.3D.parquet",

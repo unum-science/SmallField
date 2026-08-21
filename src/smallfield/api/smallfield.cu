@@ -2,10 +2,10 @@
  *  @file src/smallfield/api/smallfield.cu
  *  @brief Library implementation of the SmallField public API.
  *
- *  The one translation unit the header-only library funnels through. Holds `context_t`'s per-device
- *  CUDA resources, the VRAM-aware wave sizer, and the three steps every `embedding-wave` takes:
- *  prepare on the CPU, launch across every device, finalize back into the caller's arrays. The
- *  Python module is a separate translation unit, `python/smallfield/_binding.cpp`.
+ *  The one translation unit the header-only library funnels through: `context_t`'s per-device CUDA
+ *  resources, the VRAM-aware wave sizer, and the three steps every `embedding-wave` takes — prepare on the
+ *  CPU, launch across every device, finalize back into the caller's arrays. The Python module is a separate
+ *  translation unit, `python/smallfield/_binding.cpp`.
  */
 
 #include <cstring> // `std::memcpy`
@@ -110,16 +110,13 @@ using smallfield::cuda_error_sink_t;
 #pragma region Wave Sizing
 
 /**
- *  @brief Rough upper bound on the per-molecule batch-pool footprint in a wave.
+ *  @brief Rough upper bound on the per-molecule batch-pool footprint in a wave, sized against the
+ *  @p max_atoms cap: bytes to reserve across the device pool and the uploaded prefix together.
  *
- *  The wave sizer divides a VRAM budget by this, so it covers both sides of the pool: the prefix the
- *  host uploads, and the device-only regions the preprocessing kernels fill. At the
- *  `max_atoms_per_molecule_k` cap the bounds matrix dominates; the per-atom slack covers the
- *  constraint list, whose length scales with the bond and neighbour-pair counts rather than with the
- *  atom count alone.
- *
- *  @param[in] max_atoms Atom-count cap the wave is sized against.
- *  @return Bytes to reserve per molecule across the device pool and the uploaded prefix together.
+ *  The wave sizer divides a VRAM budget by this, so it covers both sides of the pool — the prefix the host
+ *  uploads and the device-only regions the preprocessing kernels fill. At the `max_atoms_per_molecule_k`
+ *  cap the bounds matrix dominates, and the per-atom slack covers the constraint list, whose length scales
+ *  with the bond and neighbour-pair counts rather than with the atom count alone.
  */
 static inline std::size_t estimate_per_molecule_batch_bytes(std::uint32_t max_atoms) noexcept {
     std::size_t const atom_count = max_atoms;
@@ -128,8 +125,8 @@ static inline std::size_t estimate_per_molecule_batch_bytes(std::uint32_t max_at
     std::size_t const per_atom_slack = atom_count * 128u;
     std::size_t const per_mol_fixed = 1024u;
     std::size_t const bond_distance_bytes = atom_count * atom_count * sizeof(std::uint8_t);
-    // A molecule with explicit hydrogens carries roughly (atom count + 16) bonds; the term
-    // reservations scale with that bond count and with the neighbour-pair count around each atom.
+    // A molecule with explicit hydrogens carries roughly atom count + 16 bonds, and the term reservations
+    // scale with that bond count and with the neighbour-pair count around each atom.
     std::size_t const bonds = atom_count + 16u;
     std::size_t const torsion_bytes = bonds * sizeof(etk_torsion_descriptor_t);
     std::size_t const mmff_term_bytes = 4u * bonds *
@@ -143,13 +140,11 @@ static inline std::size_t estimate_per_molecule_batch_bytes(std::uint32_t max_at
 /**
  *  @brief Bytes one virtual slot may spend on a wave, given the tightest per-slot VRAM census.
  *
- *  Leaves 25 % of the free pool untouched for peak-allocation headroom. When @p free_probe_count
- *  is zero — every `cudaMemGetInfo` on every device failed — degrades to half of the smallest
- *  per-slot *total* VRAM instead of to nothing, which would drop the sizer onto its hardcoded
- *  default. Both arms yield zero only when nothing at all is known about the hardware.
- *
- *  Deliberately not `static`: the probe that feeds it cannot be steered from a test, so
- *  `test/api/test_pipeline.cpp` drives this arithmetic directly.
+ *  Leaves 25 % of the free pool untouched for peak-allocation headroom. A zero @p free_probe_count — every
+ *  `cudaMemGetInfo` on every device failed — degrades to half the smallest per-slot @b total VRAM rather
+ *  than to nothing, which would drop the sizer onto its hardcoded default; both arms yield zero only when
+ *  nothing at all is known about the hardware. Not `static`, because the probe feeding it cannot be steered
+ *  from a test and `test/api/test_pipeline.cpp` drives this arithmetic directly.
  */
 std::size_t wave_budget_bytes(std::size_t free_probe_count, std::size_t smallest_free_per_slot,
                               std::size_t smallest_total_per_slot) noexcept {
@@ -157,26 +152,18 @@ std::size_t wave_budget_bytes(std::size_t free_probe_count, std::size_t smallest
     return smallest_total_per_slot / 2u;
 }
 
-/**
- *  @brief Ceiling of @p numerator divided by @p denominator, zero when there is nothing to divide by.
- *
- *  Split out of `reserve_molecules_per_device` so the zero-denominator edge is one named,
- *  test-visible answer rather than an unsigned wrap that a second wrap happens to undo.
- */
+/** Ceiling of @p numerator divided by @p denominator, zero when there is nothing to divide by. Split out of
+ *  `reserve_molecules_per_device` so the zero-denominator edge is one named, test-visible answer rather
+ *  than an unsigned wrap that a second wrap happens to undo. */
 std::uint32_t divide_rounding_up(std::uint32_t numerator, std::uint32_t denominator) noexcept {
     if (denominator == 0) return 0;
     return (numerator + denominator - 1u) / denominator;
 }
 
-/**
- *  @brief Molecules to pre-reserve on each device for a @p wave_size wave spread over
- *  @p device_count devices.
- *
- *  Adds one slack molecule so a wave whose remainder lands unevenly never leaves a device one
- *  slot short. With no devices there is nothing to spread and the reservation is the floor of one.
- *
- *  Deliberately not `static`: see `wave_budget_bytes`.
- */
+/** Molecules to pre-reserve on each device for a @p wave_size wave spread over @p device_count devices.
+ *  Adds one slack molecule so a wave whose remainder lands unevenly never leaves a device one slot short;
+ *  with no devices there is nothing to spread and the reservation is the floor of one. Not `static`: see
+ *  `wave_budget_bytes`. */
 std::uint32_t reserve_molecules_per_device(std::uint32_t wave_size, std::uint32_t device_count) noexcept {
     if (device_count == 0) return 1u;
     return divide_rounding_up(wave_size, device_count) + 1u;
@@ -190,13 +177,10 @@ static std::size_t smallest_slot_bytes_(std::unordered_map<int, std::size_t> con
     return smallest;
 }
 
-/**
- *  @brief Probe every physical device behind @p device_ids once and answer the binding per-slot budget.
- *
- *  A physical device is probed once however many virtual slots run on it — the `virtual-device` pattern
- *  runs K streams on one GPU as K virtual devices — and the probe divides by that replica count on the
- *  spot, so the smallest entry already describes one slot's share.
- */
+/** Probe every physical device behind @p device_ids once and answer the binding per-slot budget. A physical
+ *  device is probed once however many virtual slots run on it — the `virtual-device` pattern runs K streams
+ *  on one GPU as K virtual devices — and the probe divides by that replica count on the spot, so the
+ *  smallest entry already describes one slot's share. */
 static std::size_t probe_wave_budget_bytes_(custd::span<int const> device_ids, cuda_error_sink_t const &sink) {
     std::unordered_map<int, std::uint32_t> replicas;
     std::unordered_map<int, std::size_t> free_bytes_per_slot;
@@ -210,9 +194,8 @@ static std::size_t probe_wave_budget_bytes_(custd::span<int const> device_ids, c
             total_bytes_per_slot[device_id] = total_bytes / replica_count;
             continue;
         }
-        // `cudaGetDeviceProperties` reads the device's static description and needs no current
-        // context, so it still answers for a device whose `cudaMemGetInfo` did not. That is what
-        // keeps the half-of-total arm of `wave_budget_bytes` reachable rather than dead.
+        // `cudaGetDeviceProperties` needs no current context, so it still answers for a device whose
+        // `cudaMemGetInfo` did not, keeping the half-of-total arm of `wave_budget_bytes` reachable.
         cudaDeviceProp properties {};
         if (sink.check(cudaGetDeviceProperties(&properties, device_id), "cudaGetDeviceProperties"))
             total_bytes_per_slot[device_id] = properties.totalGlobalMem / replica_count;
@@ -226,10 +209,9 @@ static std::size_t probe_wave_budget_bytes_(custd::span<int const> device_ids, c
  *
  *  Applies the `wave_budget_bytes` VRAM fraction to the census, divides by the per-molecule footprint at
  *  @p max_atoms_per_molecule and @p conformer_count, and clamps to `[10K, 400K]` for kernel-launch
- *  amortisation and pinned-host sanity respectively.
- *
- *  The constructor calls this at `max_conformer_count_k` to size its pre-allocation and
- *  `choose_wave_size_` at the caller's K; what differs between them lives there rather than here.
+ *  amortisation and pinned-host sanity respectively. The constructor calls this at `max_conformer_count_k`
+ *  to size its pre-allocation and `choose_wave_size_` at the caller's K; what differs between them lives
+ *  there rather than here.
  */
 static std::uint32_t compute_wave_size_(custd::span<int const> device_ids, std::uint32_t max_atoms_per_molecule,
                                         std::uint32_t conformer_count, cuda_error_sink_t const &sink) {
@@ -256,11 +238,11 @@ static std::uint32_t compute_wave_size_(custd::span<int const> device_ids, std::
 /**
  *  @brief Molecules the MMFF extractor processes per pass through its fixed-stride staging.
  *
- *  The extractor and the CSR builder write into per-molecule slots of fixed stride, which costs
- *  118 KB per molecule; a whole wave's worth of that would be gigabytes of VRAM standing idle
- *  between kernels. Running the extract-build-compact triple over a fixed window instead caps the
- *  staging at this many molecules — 243 MB, allocated once per device — and costs three kernel
- *  launches per window against the milliseconds each window spends in the extractor.
+ *  The extractor and the CSR builder write into fixed-stride per-molecule slots costing 118 KB each, so a
+ *  whole wave's worth would be gigabytes of VRAM standing idle between kernels. Running the
+ *  extract-build-compact triple over a fixed window caps the staging at this many molecules — 243 MB,
+ *  allocated once per device — for three kernel launches per window against the milliseconds each window
+ *  spends in the extractor.
  */
 inline constexpr std::uint32_t mmff_extract_window_k = 2048;
 
@@ -275,14 +257,9 @@ struct mmff_staging_t {
     custd::span<mmff94_per_mol_counts_t> counts {};
 };
 
-/**
- *  @brief Place the window's staging arrays back to back out of @p cursor.
- *
- *  Every extent is a compile-time cap, so the same walk that carves a wave's staging also answers what
- *  the reservation at construction has to be — run once here over nothing, at compile time.
- *
- *  @param[inout] cursor Walk position over the staging allocation, or over nothing while sizing one.
- */
+/** Place the window's staging arrays back to back out of @p cursor, the walk position over the staging
+ *  allocation or over nothing while sizing one. Every extent is a compile-time cap, so the same walk that
+ *  carves a wave's staging also answers what the reservation at construction has to be. */
 constexpr mmff_staging_t carve_mmff_staging_(pool_cursor<std::byte> &cursor) noexcept {
     std::size_t const window = mmff_extract_window_k;
     mmff_staging_t staging {};
@@ -326,12 +303,8 @@ enum class wave_phase_t : std::uint8_t {
 /** Phases a wave is timed in. One more boundary event than this is needed to bracket them all. */
 inline constexpr std::size_t wave_phase_count_k = 4;
 
-/**
- *  @brief One wave's per-phase GPU and DMA wall on one device, in milliseconds.
- *
- *  Measured on events recorded into the device's own stream, so this is device time rather than
- *  host-side scheduling.
- */
+/** One wave's per-phase GPU and DMA wall on one device, in milliseconds, measured on events recorded into
+ *  the device's own stream, so this is device time rather than host-side scheduling. */
 struct gpu_phase_ms_t {
     /** Indexed by `wave_phase_t`. */
     std::array<float, wave_phase_count_k> phase_ms {};
@@ -340,15 +313,14 @@ struct gpu_phase_ms_t {
 };
 
 /**
- *  @brief Stream-local timestamps bracketing every phase of one wave on one device.
+ *  @brief Stream-local timestamps bracketing every phase of one wave on one device, one boundary more than
+ *  there are phases, so phase `p` spans `[boundaries[p], boundaries[p + 1])`.
  *
- *  One boundary more than there are phases, so phase `p` spans `[boundaries[p], boundaries[p + 1])`.
- *  Creation, recording, readback and destruction all walk the same array, which is what stops a phase
- *  from being timed against its neighbour's event.
- *
- *  Created once per device and reused: a `cudaEventDestroy` on one stream racing a `cudaEventCreate`
- *  from the next launch's fan-out thread is what per-wave events cost. `cudaEventBlockingSync` keeps
- *  the host out of a busy-wait inside `cudaStreamSynchronize` when many streams share CPU cores.
+ *  Creation, recording, readback and destruction all walk the same array, which is what stops a phase from
+ *  being timed against its neighbour's event. Created once per device and reused, because per-wave events
+ *  cost a `cudaEventDestroy` on one stream racing a `cudaEventCreate` from the next launch's fan-out
+ *  thread. `cudaEventBlockingSync` keeps the host out of a busy-wait inside `cudaStreamSynchronize` when
+ *  many streams share CPU cores.
  */
 struct phase_events_t {
     std::array<cudaEvent_t, wave_phase_count_k + 1> boundaries {};
@@ -416,9 +388,7 @@ struct phase_span_ms_t {
     [[nodiscard]] double duration_ms() const noexcept { return end_ms - start_ms; }
 };
 
-/**
- *  @brief Stamps a host wall-clock span on entry and on exit, so a step's two boundaries cannot drift.
- */
+/** Stamps a host wall-clock span on entry and on exit, so a step's two boundaries cannot drift. */
 class scoped_span_ms_t {
     wall_clock_t const &clock_;
     phase_span_ms_t &span_;
@@ -433,25 +403,23 @@ class scoped_span_ms_t {
     scoped_span_ms_t &operator=(scoped_span_ms_t const &) = delete;
 };
 
-/**
- *  @brief Per-`embedding-wave` timing record, pretty-printed by `print_wave_timeline_` at the end of
- *  `generate_conformers` when `logger.verbose_level >= 1`.
- */
+/** Per-`embedding-wave` timing record, pretty-printed by `print_wave_timeline_` at the end of
+ *  `generate_conformers` when `logger.verbose_level >= 1`. `per_device_gpu` holds one entry per device,
+ *  filled when the wave is finalized. */
 struct wave_record_t {
     std::uint32_t wave_index = 0;
     std::uint32_t num_molecules = 0;
     phase_span_ms_t prepare {};
     phase_span_ms_t launch {};
     phase_span_ms_t finalize {};
-    /** One entry per device, filled when the wave is finalized. */
     std::vector<gpu_phase_ms_t> per_device_gpu {};
 };
 
-/** One wave's per-device GPU timings folded to the two figures the timeline prints. */
+/** One wave's per-device GPU timings folded to the two figures the timeline prints, plus
+ *  `average_phase_ms` indexed by `wave_phase_t` and averaged over the devices that did work. */
 struct wave_gpu_summary_t {
     float average_ms = 0.f;
     float max_ms = 0.f;
-    /** Indexed by `wave_phase_t`, averaged over the devices that did work. */
     std::array<float, wave_phase_count_k> average_phase_ms {};
 };
 
@@ -475,18 +443,14 @@ static wave_gpu_summary_t summarize_wave_gpu_(std::vector<gpu_phase_ms_t> const 
     return summary;
 }
 
-/**
- *  @brief Verbose-tier-1 per-wave summary plus a verbose-tier-2 per-device breakdown.
- *
- *  No-op when `logger.verbose_level < 1`.
- */
+/** Verbose-tier-1 per-wave summary plus a verbose-tier-2 per-device breakdown; a no-op when
+ *  `logger.verbose_level < 1`. */
 static void print_wave_timeline_(logger_t const &logger, std::vector<wave_record_t> const &wave_records,
                                  double total_wall_ms) {
     if (logger.verbose_level < 1) return;
 
-    // One width per column kind, shared by the header and every row through `{:>{}}` dynamic width, so the
-    // two cannot drift apart. `time_width_k` is 8 because the widest header word — `finalize`, `download` —
-    // is 8 characters, and a width narrower than its own label is what silently misaligned this table before.
+    // One width per column kind, shared by header and rows through `{:>{}}`, so the two cannot drift apart.
+    // `time_width_k` is 8, the width of the longest header word — `finalize`, `download`.
     constexpr int wave_width_k = 4;
     constexpr int mols_width_k = 7;
     constexpr int time_width_k = 8;
@@ -528,20 +492,18 @@ static void print_wave_timeline_(logger_t const &logger, std::vector<wave_record
 
 #pragma region Launch Scratch
 
-/**
- *  @brief Persistent per-device scratch for the kernel launch path.
- *
- *  `device_pool` holds the batch-input mirror, the per-launch outputs and the metric scratch;
- *  `host_staging` holds the pinned readback regions the three device-to-host copies land in. Both are
- *  grow-only and reused across waves, so the single-threaded dispatcher never allocates per launch.
- */
+/** Persistent per-device scratch for the kernel launch path. `device_pool` holds the batch-input mirror,
+ *  the per-launch outputs and the metric scratch, and `host_staging` the pinned readback regions the three
+ *  device-to-host copies land in; both are grow-only and reused across waves, so the single-threaded
+ *  dispatcher never allocates per launch. `mmff_staging` is one window's fixed-stride staging for the MMFF
+ *  extractor and CSR builder, which the compaction pass copies out of into the batch pool's packed arrays.
+ *  `mmff_tables` and `csd_torsion_table` are this device's copies of the MMFF94 parameter tables and the
+ *  compiled CSD torsion patterns, uploaded once at construction, and `events` the phase-timing boundaries
+ *  every wave re-records. */
 struct launch_scratch_t {
-    /**
-     *  @brief Bind this device's stream, which every device allocation here is ordered against.
-     *
-     *  @param[in] stream Outlives this scratch, which is what `cudaFreeAsync` requires: `context_t`
-     *                    declares the owning `device_stream_t` ahead of every scratch built on it.
-     */
+    /** Bind this device's stream, which every device allocation here is ordered against. @p stream outlives
+     *  this scratch, as `cudaFreeAsync` requires: `context_t` declares the owning `device_stream_t` ahead
+     *  of every scratch built on it. */
     explicit launch_scratch_t(cudaStream_t stream) noexcept
         : device_pool(device_allocator_t {stream}), mmff_staging(device_allocator_t {stream}) {}
 
@@ -553,52 +515,42 @@ struct launch_scratch_t {
 
     device_bytes_t device_pool;
     pinned_bytes_t host_staging;
-    /** Fixed-stride staging the MMFF extractor and CSR builder write into, one window's
-     *  worth; the compaction pass copies out of it into the batch pool's packed arrays. */
     device_bytes_t mmff_staging;
-    /** This device's copy of the MMFF94 parameter tables, uploaded once at construction. */
     mmff94_tables_device_t mmff_tables;
-    /** This device's copy of the compiled CSD torsion patterns, uploaded once. */
     csd_torsion_table_device_t csd_torsion_table;
-    /** Persistent phase-timing boundaries, created once and re-recorded by every wave. */
     phase_events_t events;
 };
 
-/** Device-side regions one wave carves out of `launch_scratch_t::device_pool`. */
+/** Device-side regions one wave carves out of `launch_scratch_t::device_pool`. `batch` mirrors the batch
+ *  pool, uploaded prefix plus what the preprocess kernels fill; `coordinates_fp32` takes the kernel output
+ *  and `coordinates_fp16` the halved download; `status` is one `conformer_status_t` byte per slot, written
+ *  by the pipeline kernel and then by the stamp; `metric_embedding` is the four-dimensional embedding the
+ *  prepass writes and the pipeline kernel starts from; `molecule_verdicts` is what the prepass decided
+ *  about each molecule's bounds, read only by the stamp; and `polish_diagnostics` is
+ *  `polish_diagnostic_floats_k` floats per slot, empty under `polish_telemetry_t::disabled_k`. */
 struct device_wave_regions_t {
-    /** Mirror of the batch pool: the uploaded prefix plus the regions the preprocess kernels fill. */
     custd::span<std::byte> batch {};
-    /** Kernel output, in single precision. */
     custd::span<float> coordinates_fp32 {};
-    /** Post-conversion source of the coordinate download; halves the transfer. */
     custd::span<__half> coordinates_fp16 {};
     custd::span<float> energies {};
-    /** One `conformer_status_t` byte per slot, written by the pipeline kernel and then by the stamp. */
     custd::span<std::uint8_t> status {};
-    /** Four-dimensional metric embedding the prepass writes and the pipeline kernel starts from. */
     custd::span<float> metric_embedding {};
-    /** What the prepass decided about each molecule's bounds, which only the stamp reads. */
     custd::span<conformer_status_t> molecule_verdicts {};
-    /** `polish_diagnostic_floats_k` floats per slot, empty under `polish_telemetry_t::disabled_k`. */
     custd::span<float> polish_diagnostics {};
 };
 
-/** Pinned host regions the wave's device-to-host copies land in. */
+/** Pinned host regions the wave's device-to-host copies land in; `polish_diagnostics` mirrors the device
+ *  diagnostics region and is empty on exactly the same configuration. */
 struct host_wave_regions_t {
     custd::span<__half> coordinates {};
     custd::span<float> energies {};
     custd::span<std::uint8_t> status {};
-    /** Mirror of the device diagnostics region, and empty on exactly the same configuration. */
     custd::span<float> polish_diagnostics {};
 };
 
-/**
- *  @brief Element counts one wave's regions are carved at, derived once from a dispatch's geometry.
- *
- *  The device and host walks both read these, so a coordinate count the two sides disagreed on is not
- *  spellable — and the constructor's worst-case reservation goes through the same two walks the launch
- *  path carves with.
- */
+/** Element counts one wave's regions are carved at, derived once from a dispatch's geometry. The device and
+ *  host walks both read these, so a coordinate count the two sides disagreed on is not spellable, and the
+ *  constructor's worst-case reservation goes through the same two walks the launch path carves with. */
 struct wave_pool_shape_t {
     /** Bytes the batch mirror spans, uploaded prefix and device-only regions together. */
     std::size_t batch_bytes = 0;
@@ -616,7 +568,6 @@ struct wave_pool_shape_t {
 
 /**
  *  @brief Derive a wave's region extents from the shape of the dispatch.
- *
  *  @param[in] batch_bytes Bytes the batch pool spans, uploaded prefix and device-only regions together.
  *  @param[in] molecule_count Molecules this device carries.
  *  @param[in] conformer_count Conformers requested per molecule.
@@ -656,17 +607,16 @@ static device_wave_regions_t carve_device_wave_(wave_pool_shape_t const &shape,
  *  @brief Prime the device regions a wave inherits from the wave before it.
  *
  *  Every wave re-carves the same pool from offset zero, so all eight regions alias the previous wave's
- *  bytes. The five below are the ones a reader can reach before a kernel has written them; the walk
- *  follows the carve's own order so a region added there is missing here in the same place. Defence in
- *  depth rather than a live-bug fix: the pipeline kernel is a grid-stride loop that writes every slot,
- *  and a launch that fails parks the whole shard.
+ *  bytes; the five below are those a reader can reach before a kernel writes them, and the walk follows the
+ *  carve's own order so a region added there is missing here in the same place. Defence in depth, not a
+ *  live bug: the pipeline kernel is a grid-stride loop writing every slot, and a failed launch parks the
+ *  whole shard.
  */
 static void prime_wave_regions_(device_wave_regions_t const &regions, cudaStream_t stream,
                                 cuda_error_sink_t const &sink) noexcept {
 
-    // `write_conformer_output_` fills only the first `num_atoms` slots of each axis, so the padding up
-    // to the stride would reach `convert_coords_fp32_to_fp16_kernel` uninitialised — compute-sanitizer
-    // counts about 16K such reads on the 50-conformer corpus, and reading them risks propagating a NaN.
+    // `write_conformer_output_` fills only the first `num_atoms` slots of each axis, so the padding up to
+    // the stride reaches `convert_coords_fp32_to_fp16_kernel` uninitialised and can propagate a NaN.
     if (!regions.coordinates_fp32.empty()) {
         [[maybe_unused]] bool const zeroed = sink.check(
             cudaMemsetAsync(regions.coordinates_fp32.data(), 0, regions.coordinates_fp32.size_bytes(), stream),
@@ -690,9 +640,8 @@ static void prime_wave_regions_(device_wave_regions_t const &regions, cudaStream
             "memset device status (slot unwritten)");
     }
 
-    // The prepass writes a verdict only for the molecules it refuses, so the rest have to arrive saying
-    // nothing — and here `success_k` is that nothing, because the stamp reads this region to decide
-    // which molecules to overwrite and a refusal left behind would land on whoever now holds the slot.
+    // The prepass writes a verdict only for the molecules it refuses, so the rest must arrive saying
+    // nothing — `success_k` here — or a stale refusal would land on whoever now holds the slot.
     if (!regions.molecule_verdicts.empty()) {
         [[maybe_unused]] bool const cleared = sink.check(
             cudaMemsetAsync(regions.molecule_verdicts.data(), static_cast<int>(conformer_status_t::success_k),
@@ -700,9 +649,8 @@ static void prime_wave_regions_(device_wave_regions_t const &regions, cudaStream
             "memset device molecule verdicts (no refusal)");
     }
 
-    // `polish_path_t::unreached_k` is numbered zero so a zeroed row spells it, which is the whole reason
-    // the tally can tell a slot the polish grid never drew from one it skipped. Empty whenever the
-    // telemetry is off, so this costs a branch and nothing else.
+    // `polish_path_t::unreached_k` is numbered zero so a zeroed row spells it, which is how the tally tells
+    // a slot the polish grid never drew from one it skipped. Empty with the telemetry off, so it is free.
     if (!regions.polish_diagnostics.empty()) {
         [[maybe_unused]] bool const unreached = sink.check(
             cudaMemsetAsync(regions.polish_diagnostics.data(), 0, regions.polish_diagnostics.size_bytes(), stream),
@@ -736,12 +684,9 @@ static std::size_t host_wave_bytes_(wave_pool_shape_t const &shape) noexcept {
 
 #pragma region Polish Telemetry
 
-/**
- *  @brief What one wave's staged polish rows add up to, across every device that ran it.
- *
- *  What the conformer output cannot answer: three of the polish kernel's five exits ship a geometry
- *  MMFF94 never improved, and the status byte and the energy are written on all five.
- */
+/** What one wave's staged polish rows add up to, across every device that ran it — what the conformer
+ *  output cannot answer, since three of the polish kernel's five exits ship a geometry MMFF94 never
+ *  improved and the status byte and the energy are written on all five. */
 struct polish_tally_t {
     /** Rows read, which is one per conformer slot the wave carried. */
     std::uint64_t slots = 0;
@@ -796,14 +741,11 @@ static void log_polish_tally_(logger_t const &logger, std::uint32_t wave_index, 
 
 #pragma endregion Polish Telemetry
 
-/**
- *  @brief Grow the per-device metric scratch for the given group size and atom count; no-op on shrink.
- *
- *  The first wave of a workload pays the allocation and every later one reuses it. Declared here
- *  because `context_t`'s constructor pre-warms it, so the first user call does not allocate. A refused
- *  grow leaves the previous allocation and its capacity in place, and the prepass re-tests that
- *  capacity against the group it is about to bin, so the wave degrades rather than overruns.
- */
+/** Grow the per-device metric scratch for the given group size and atom count; a no-op on shrink. The first
+ *  wave of a workload pays the allocation and every later one reuses it, and `context_t`'s constructor
+ *  pre-warms it so the first user call does not allocate. A refused grow leaves the previous allocation and
+ *  its capacity in place, and the prepass re-tests that capacity against the group it is about to bin, so
+ *  the wave degrades rather than overruns. */
 void ensure_metric_scratch(context_t &context, std::size_t device_index, std::size_t max_group_size,
                            std::uint32_t max_atoms) {
     auto &scratch = context.metric_scratch[device_index];
@@ -816,10 +758,6 @@ void ensure_metric_scratch(context_t &context, std::size_t device_index, std::si
 
     cudaSetDevice(context.device_ids[device_index]);
 
-    // `embed_4d_power_iter_kernel` runs entirely out of shared memory — Gram matrix, means,
-    // eigenvectors and reduction scratch all live there for the kernel's lifetime — so the only
-    // persistent device scratch is the `group_indices` uint32 list of which molecule goes into
-    // which bin, which is KB-scale.
     if (scratch.group_indices.try_reserve(new_group) == reserve_outcome_t::failed_k) {
         context.logger.error("ensure_metric_scratch: device allocation ({} bytes) failed",
                              new_group * sizeof(std::uint32_t));
@@ -832,13 +770,11 @@ void ensure_metric_scratch(context_t &context, std::size_t device_index, std::si
 
 #pragma region Wave Launch
 
-/**
- *  @brief Where a wave's results land in the caller's arrays, and the permutation that takes them there.
- *
- *  `sort_perm` maps a position in the SMILES-length-sorted input to the caller's own row, and
- *  `wave_base` is the first sorted position this wave covers. The three spans are the caller's whole
- *  buffers rather than this wave's slice, because the permutation scatters across all of them.
- */
+/** Where a wave's results land in the caller's arrays, and the permutation that takes them there.
+ *  `sort_perm` maps a position in the SMILES-length-sorted input to the caller's own row and `wave_base` is
+ *  the first sorted position this wave covers, which is what `caller_index_of` composes. The three spans
+ *  are the caller's whole buffers rather than this wave's slice, because the permutation scatters across
+ *  all of them. */
 struct wave_outputs_t {
     custd::span<__half> coordinates {};
     custd::span<float> energies {};
@@ -846,17 +782,13 @@ struct wave_outputs_t {
     custd::span<std::uint32_t const> sort_perm {};
     std::uint32_t wave_base = 0;
 
-    /** Caller row the molecule at @p input_index within this wave belongs to. */
     [[nodiscard]] std::uint32_t caller_index_of(std::uint32_t input_index) const noexcept {
         return sort_perm[wave_base + input_index];
     }
 };
 
-/**
- *  @brief The four optional per-molecule readbacks, each empty when the caller did not ask for it.
- *
- *  Every one describes the parent fragment preprocess kept, and is indexed by the caller's own row.
- */
+/** The four optional per-molecule readbacks, each empty when the caller did not ask for it. Every one
+ *  describes the parent fragment preprocess kept, and is indexed by the caller's own row. */
 struct molecule_readback_t {
     custd::span<std::uint8_t> num_atoms {};
     custd::span<std::uint16_t> num_heavy_atoms {};
@@ -887,22 +819,17 @@ struct molecule_readback_t {
 };
 
 /**
- *  @brief Widen the byte a kernel wrote into the public per-conformer status, and check the energy
- *  behind a success.
+ *  @brief Widen the byte a kernel wrote into the public per-conformer status, and check the energy behind
+ *  a success — decided together here rather than re-derived by six consumers from the status byte alone.
  *
  *  Six values reach this buffer: `write_conformer_output_` writes `success_k` or `stereo_failure_k`,
  *  `validate_polished_stereo_kernel` demotes a success to `polish_inverted_center_k` or
  *  `polish_inverted_bond_k`, and `stamp_refused_molecules_kernel` overwrites whatever is there with the
- *  molecule's verdict — `bounds_infeasible_k` where the metric prepass found bounds no coordinates
- *  satisfy, `batch_overflow_k` where that prepass refused the whole batch over scratch it could not fit.
- *  The priming walk's own `slot_unwritten_k` survives wherever no kernel reached the slot.
- *
- *  Exhaustive over `conformer_status_t` and carrying no `default:`, so a status appended to that
- *  append-only enum is a `-Wswitch` warning here rather than a device verdict silently laundered into
- *  `slot_unwritten_k` — which is what the arm this replaces did to both polish demotions.
- *
- *  A success is only a success while its energy is a number a consumer can rank by, so the two facts are
- *  decided together here rather than left for six consumers to re-derive from the status byte alone.
+ *  molecule's verdict — `bounds_infeasible_k` where the metric prepass found bounds no coordinates satisfy,
+ *  `batch_overflow_k` where it refused the whole batch over scratch it could not fit. The priming walk's own
+ *  `slot_unwritten_k` survives wherever no kernel reached the slot. Exhaustive over `conformer_status_t` and
+ *  carrying no `default:`, so a status appended to that append-only enum is a `-Wswitch` warning here rather
+ *  than a device verdict silently laundered into `slot_unwritten_k`.
  */
 static conformer_status_t conformer_status_of_(std::uint8_t raw, float energy) noexcept {
     // A byte past the last enumerator comes from a producer this build does not know.
@@ -917,7 +844,7 @@ static conformer_status_t conformer_status_of_(std::uint8_t raw, float energy) n
     case conformer_status_t::polish_inverted_center_k:
     case conformer_status_t::polish_inverted_bond_k:
     case conformer_status_t::slot_unwritten_k: return status;
-    /* No kernel writes these, so a slot carrying one was never reached by the wave that primed it. */
+    // No kernel writes these, so a slot carrying one was never reached by the wave that primed it.
     case conformer_status_t::mmff_unconverged_k:
     case conformer_status_t::invalid_smiles_k:
     case conformer_status_t::too_many_atoms_k:
@@ -930,24 +857,18 @@ static conformer_status_t conformer_status_of_(std::uint8_t raw, float energy) n
     return conformer_status_t::slot_unwritten_k;
 }
 
-/**
- *  @brief Report the launch error the preceding `<<<>>>` left on the device, if any.
- *
- *  `cudaGetLastError` rather than `cudaPeekAtLastError`, because peeking leaves the sticky slot set:
- *  this runs eleven times per wave, so one refused kernel was re-reported by every later call under
- *  the name of a kernel that had not failed, and `cuda_error_count` counted one failure eleven times.
- *  It also picked up an error left by an earlier `cudaMemcpyAsync` on the same host thread and blamed
- *  it on whichever launch came next.
- */
+/** Report the launch error the preceding `<<<>>>` left on the device, if any. `cudaGetLastError` rather
+ *  than `cudaPeekAtLastError`: peeking leaves the sticky slot set, and this runs eleven times per wave, so
+ *  one refused kernel would read as eleven failures in `cuda_error_count`, ten under the name of a kernel
+ *  that launched fine. Clearing the slot also keeps an error left by an earlier `cudaMemcpyAsync` on the
+ *  same host thread off whichever launch comes next. */
 static void check_launch_(cuda_error_sink_t const &sink, char const *label) noexcept {
     [[maybe_unused]] bool const launched = sink.check(cudaGetLastError(), label);
 }
 
 /**
- *  @brief Enqueue everything that turns an uploaded batch of descriptors into the force field the
- *  conformer kernels read.
- *
- *  Six passes, all asynchronous on @p stream:
+ *  @brief Enqueue everything that turns an uploaded batch of descriptors into the force field the conformer
+ *  kernels read, in six passes all asynchronous on @p stream:
  *    1. the hop-count BFS over each descriptor's bond list;
  *    2. the MMFF atom typer and its partial-charge pass;
  *    3. the typing patch, which hands the molecules the native typer rejects RDKit's answer;
@@ -955,17 +876,13 @@ static void check_launch_(cuda_error_sink_t const &sink, char const *label) noex
  *    5. the CSD torsion matcher;
  *    6. the ETK per-atom CSR builder.
  *
- *  No pass reads anything back. The per-molecule bases each writer needs came up with the batch
- *  in `mmff_bases`, prefix-summed on the host from capacity bounds, so the packed-array sizing
- *  never has to wait on `mmff94_scan_counts_kernel`'s totals.
- *
+ *  No pass reads anything back: the per-molecule bases each writer needs came up with the batch in
+ *  `mmff_bases`, prefix-summed on the host from capacity bounds, so packed-array sizing never waits on
+ *  `mmff94_scan_counts_kernel`'s totals.
  *  @param[in] device_view Device mirror of the batch pool.
  *  @param[in] torsion_stride Slots the CSD matcher writes per molecule, as the slice was carved.
- *  @param[inout] launch_buffers This device's persistent scratch, holding the parameter tables and
- *                the extractor's fixed-stride staging.
- *  @param[in] molecule_count Molecules in the batch.
- *  @param[in] stream Stream to enqueue on.
- *  @param[in] sink Error sink routing failures through the caller's logger.
+ *  @param[inout] launch_buffers This device's persistent scratch: the parameter tables and the extractor's
+ *                fixed-stride staging.
  */
 static void enqueue_device_preprocess_(wave_slice_view_t const &device_view, std::uint32_t torsion_stride,
                                        launch_scratch_t &launch_buffers, std::uint32_t molecule_count,
@@ -993,8 +910,7 @@ static void enqueue_device_preprocess_(wave_slice_view_t const &device_view, std
     if (sink.log != nullptr)
         sink.log->trace2("device preprocess: {} of {} molecules take the host typing path", patch_count,
                          molecule_count);
-    // A batch every molecule typed natively leaves no patch records, and a zero-block launch is a
-    // configuration error rather than a no-op.
+    // No patch records means every molecule typed natively, and a zero-block launch is a configuration error.
     if (patch_count != 0) {
         mmff94_apply_typing_patch_kernel<<<patch_count, warp_size_k, 0, stream>>>(
             device_view.typing_patches.data(), patch_count, device_view.patch_atom_types.data(),
@@ -1042,42 +958,32 @@ static void enqueue_device_preprocess_(wave_slice_view_t const &device_view, std
     check_launch_(sink, "etk_build_csr_kernel launch");
 }
 
-/**
- *  @brief Per-wave, per-GPU state carried from `launch_gpu_pipeline` to `finalize_gpu_pipeline`.
- *
- *  Holds only what finalize still needs: the stream to drain, the staging the download lands in, the
- *  two permutations that take a staged slot back to a caller row, and the two coordinate strides.
- *  The device-side regions do not appear, because nothing reads them after the launch returns.
- */
+/** Per-wave, per-GPU state carried from `launch_gpu_pipeline` to `finalize_gpu_pipeline`: only what
+ *  finalize still needs — the stream to drain, the staging the download lands in, the two permutations that
+ *  take a staged slot back to a caller row, and the two coordinate strides. The device-side regions do not
+ *  appear, because nothing reads them after the launch returns. */
 struct gpu_pipeline_handle_t {
+    /** The GPU this wave ran on, rebound before finalize drains its stream. */
     int device_id = -1;
+    /** That device's own stream, borrowed from `context_t::streams`. */
     cudaStream_t stream = nullptr;
-    /**
-     *  @brief Sorted-index to input-index map, viewing this device's pinned pool.
-     *
-     *  A view rather than a pointer to the pool, because the pinned allocation does not move while a
-     *  wave is in flight but the container holding the pools may be reshaped. Its extent is this
-     *  device's molecule count, so the two never have to be carried separately.
-     */
+    /** Sorted-index to caller-row map, viewing this device's pinned pool. A view rather than a pointer to
+     *  the pool, because the pinned allocation does not move while a wave is in flight but the container
+     *  holding the pools may be reshaped; its extent is this device's molecule count, so the two never
+     *  have to be carried separately. */
     custd::span<std::uint32_t const> input_indices {};
+    /** Conformers per molecule, which is the slot multiplier on both sides of the permutation. */
     std::uint32_t conformer_count = 0;
-    /**
-     *  @brief The largest atom count this wave actually carries, driving the GPU coordinate stride
-     *  and the device-to-host staging stride.
-     *
-     *  An observation rather than a cap, so a wave of small molecules pays no full-stride tax in
-     *  output VRAM or download bandwidth. It never exceeds `host_max_atoms`, and that is a gate rather
-     *  than a coincidence: `prepare_per_device_batches_into` refuses any molecule above the caller's
-     *  `output_atom_capacity` with `too_many_atoms_k`.
-     */
+    /** The largest atom count this wave actually carries, driving the GPU coordinate stride and the
+     *  device-to-host staging stride. An observation rather than a cap, so a wave of small molecules pays
+     *  no full-stride tax in output VRAM or download bandwidth. It never exceeds `host_max_atoms`, by gate
+     *  rather than coincidence: `prepare_per_device_batches_into` refuses any molecule above the caller's
+     *  `output_atom_capacity` with `too_many_atoms_k`. */
     std::uint32_t gpu_max_atoms = 0;
-    /**
-     *  @brief The caller's own output stride, which is what `outputs.coordinates` was allocated at.
-     *
-     *  Finalize copies `gpu_max_atoms` halves per axis into a slot `host_max_atoms` wide, leaving the
-     *  trailing halves at their pre-zeroed value. The two strides are independent numbers and
-     *  conflating them is what once wrote one wave's y plane over another's x.
-     */
+    /** The caller's own output stride, which is what `outputs.coordinates` was allocated at. Finalize
+     *  copies `gpu_max_atoms` halves per axis into a slot `host_max_atoms` wide, leaving the trailing
+     *  halves at their pre-zeroed value. The two are independent numbers: reading one for the other lands
+     *  a slot's y plane on its neighbour's x. */
     std::uint32_t host_max_atoms = 0;
     /** Pinned staging the download wrote into; finalize drains the stream, then permutes out of it. */
     host_wave_regions_t staged {};
@@ -1098,20 +1004,17 @@ struct gpu_pipeline_handle_t {
  *  @brief Enqueue the per-bin pipeline and polish launches for one device's whole batch, and the stamp
  *  that closes the status buffer behind them.
  *
- *  Molecules arrive atom-count ascending, so each atom-limited bin is a contiguous run and the bin's
- *  shared-memory footprint and occupancy come straight out of the construction-time launch cache.
- *  Both kernels assign one warp per `(molecule, conformer)` pair, so the grid covers the pair count
- *  rather than the molecule count; several bins hold fewer molecules than the device has resident-warp
- *  slots, and scaling by the conformer count is what lets those launches fill the device.
- *
+ *  Molecules arrive atom-count ascending, so each atom-limited bin is a contiguous run whose shared-memory
+ *  footprint and occupancy come straight out of the construction-time launch cache. Both kernels assign one
+ *  warp per `(molecule, conformer)` pair, so the grid covers the pair count rather than the molecule count —
+ *  several bins hold fewer molecules than the device has resident-warp slots, and scaling by the conformer
+ *  count is what lets those launches fill it.
  *  @param[in] device_view Device mirror of the batch pool.
  *  @param[in] host_metadata This device's molecules in the same order, read to find the bin edges.
  *  @param[in] regions Device output regions this wave writes into.
  *  @param[in] launch_config Per-bin occupancy, probed once at construction.
  *  @param[in] config Conformer count, stereo retry limit and seed.
  *  @param[in] gpu_max_atoms Coordinate stride these launches write at.
- *  @param[in] stream Stream to enqueue on.
- *  @param[in] sink Error sink routing failures through the caller's logger.
  */
 static void enqueue_binned_kernels_(wave_slice_view_t const &device_view,
                                     custd::span<etkdg_molecule_metadata_t const> host_metadata,
@@ -1189,14 +1092,14 @@ static void enqueue_binned_kernels_(wave_slice_view_t const &device_view,
     }
 
     // Last on the status buffer, and after every bin: the two warp kernels above write a verdict for each
-    // slot they touch, and this replaces it wherever the metric prepass refused the molecule's bounds
-    // outright. A molecule refused there was still minimised from a zeroed embedding above, so what it holds
-    // is a conformer nothing asked for — the status is what stops it being read as one.
+    // slot they touch, and this replaces it wherever the metric prepass refused the molecule's bounds. Such
+    // a molecule was still minimised from a zeroed embedding, so the status is what stops the geometry it
+    // holds being read as a conformer.
     if (molecule_count != 0) {
-        // Before the stamp and before the half-precision narrowing: the polish kernel above rewrote
-        // every coordinate after the pipeline kernel's own chirality gate, so this is the only place a
-        // center it inverted can still be seen. One warp per slot, over the whole batch at once — every
-        // bin writes coordinates at the same stride, so no per-bin offset walk is needed here.
+        // Before the stamp and before the half-precision narrowing: the polish kernel rewrote every
+        // coordinate after the pipeline kernel's own chirality gate, so this is the only place a center it
+        // inverted can still be seen. Every bin writes at the same stride, so one warp per slot over the
+        // whole batch needs no per-bin offset walk.
         std::uint32_t const validate_grid = std::min<std::uint32_t>(
             molecule_count * conformer_count, static_cast<std::uint32_t>(8 * multiprocessor_count));
         validate_polished_stereo_kernel<<<validate_grid, warp_size_k, 0, stream>>>(
@@ -1235,20 +1138,17 @@ static void enqueue_download_(device_wave_regions_t const &regions, host_wave_re
 }
 
 /**
- *  @brief Enqueue upload, device preprocessing, the metric prepass, the kernels and the download on
- *  one device's stream.
+ *  @brief Enqueue upload, device preprocessing, the metric prepass, the kernels and the download on one
+ *  device's stream, returning as soon as the work is enqueued.
  *
- *  Returns as soon as the work is enqueued; the caller eventually hands the returned handle to
- *  `finalize_gpu_pipeline`. A handle with no work — an allocation that failed, or a device this wave
- *  gave no molecules — finalizes to nothing.
- *
+ *  The caller eventually hands the returned handle to `finalize_gpu_pipeline`; a handle with no work — a
+ *  failed allocation, or a device this wave gave no molecules — finalizes to nothing.
  *  @param[inout] context Owns this device's stream, scratch and launch cache.
  *  @param[in] device_index Position of this device in `context.device_ids`.
  *  @param[in] batch This device's prepared pinned batch pool.
  *  @param[in] config Conformer count, stereo retry limit and seed.
  *  @param[in] host_max_atoms The caller's output stride.
  *  @param[in] outputs Caller destination and the permutation into it.
- *  @param[in] sink Error sink routing failures through the caller's logger.
  */
 static gpu_pipeline_handle_t launch_gpu_pipeline(context_t &context, std::size_t device_index,
                                                  wave_slice_pool_t const &batch, config_t const &config,
@@ -1259,9 +1159,8 @@ static gpu_pipeline_handle_t launch_gpu_pipeline(context_t &context, std::size_t
     launch_scratch_t &launch_buffers = *context.launch_scratch[device_index];
     [[maybe_unused]] bool const bound = sink.check(cudaSetDevice(device_id), "cudaSetDevice(launch_gpu_pipeline)");
 
-    // Preprocess already partitioned and atom-count sorted this device's molecules, so the kernels read
-    // the uploaded metadata in place and no per-device sort happens here. The metadata region's extent
-    // is this device's molecule count, which is the count every step below walks.
+    // Preprocess already partitioned and atom-count sorted this device's molecules, so the kernels read the
+    // uploaded metadata in place. Its extent is this device's molecule count, which every step below walks.
     wave_slice_const_view_t const host_view = batch.host_view();
     custd::span<etkdg_molecule_metadata_t const> const host_metadata = host_view.molecule_metadata;
     sf_assert_(host_metadata.size() == batch.num_molecules());
@@ -1275,27 +1174,22 @@ static gpu_pipeline_handle_t launch_gpu_pipeline(context_t &context, std::size_t
     std::size_t const device_bytes = device_wave_bytes_(shape);
     std::size_t const host_bytes = host_wave_bytes_(shape);
 
-    // Pools were pre-sized to the worst case at construction, so these are no-ops barring an input that
-    // exceeded the worst-case probe. A grow here means an allocation fired on the path the reservation
-    // exists to keep clear, which is a sizing bug rather than a memory shortage.
+    // Pools were pre-sized to the worst case at construction, so these are no-ops; a grow here means an
+    // allocation fired on the path the reservation keeps clear, a sizing bug rather than a shortage.
     reserve_outcome_t const device_outcome = launch_buffers.device_pool.try_reserve(device_bytes);
     reserve_outcome_t const host_outcome = launch_buffers.host_staging.try_reserve(host_bytes);
     sf_assert_(device_outcome != reserve_outcome_t::grown_k);
     sf_assert_(host_outcome != reserve_outcome_t::grown_k);
     if (device_outcome == reserve_outcome_t::failed_k || host_outcome == reserve_outcome_t::failed_k) {
-        // Through the sink rather than the logger, because `cuda_error_count` is what the batch CLI
-        // reads to park a shard and to set its exit code. Logging alone left this device's molecules
-        // carrying the `invalid_smiles_k` pre-fill, so an out-of-memory device shipped as "these
-        // SMILES failed to parse" and the process still returned zero.
+        // Through the sink rather than the logger: `cuda_error_count` is what the batch CLI reads to park a
+        // shard and set its exit code, and logging alone would ship an out-of-memory device as bad input.
         if (sink.log != nullptr)
             sink.log->error("launch_gpu_pipeline: pool allocation failed on device {} ({} device, {} host bytes)",
                             device_id, device_bytes, host_bytes);
         [[maybe_unused]] bool const reserved = sink.check(cudaErrorMemoryAllocation,
                                                           "launch_gpu_pipeline pool reserve");
-        // The handle finalizes to nothing, so this is the only place these rows are ever written. The
-        // pre-fill would otherwise name the molecules, and nothing about them is what refused: the same
-        // input at a smaller wave fits. `prepare` has already translated the pool's indices into caller
-        // rows, so the walk lands directly.
+        // The handle finalizes to nothing, so this is the only place these rows are ever written.
+        // `prepare` has already translated the pool's indices into caller rows, so the walk lands directly.
         for (std::uint32_t const caller_index : host_view.input_indices)
             for (std::uint32_t conformer = 0; conformer < config.num_conformers; ++conformer)
                 outputs.status[static_cast<std::size_t>(caller_index) * config.num_conformers + conformer] =
@@ -1320,9 +1214,8 @@ static gpu_pipeline_handle_t launch_gpu_pipeline(context_t &context, std::size_t
     // before anything reads it. Bandwidth-trivial against the FIRE relaxation that follows.
     prime_wave_regions_(regions, stream, sink);
 
-    // Everything from here to the metric prepass reads the uploaded descriptors and writes the regions
-    // past the uploaded prefix, so the host ships the molecular graph and the GPU derives the force
-    // field from it. One stream, in order, so each pass sees the previous one's output with no event.
+    // Everything to the metric prepass reads the uploaded descriptors and writes the regions past the
+    // prefix: the host ships the graph, the GPU derives the field. One stream, in order, so no event.
     enqueue_device_preprocess_(device_view, batch.shape.torsion_stride, launch_buffers, batch.num_molecules(), stream,
                                sink);
 
@@ -1332,11 +1225,10 @@ static gpu_pipeline_handle_t launch_gpu_pipeline(context_t &context, std::size_t
         regions.metric_embedding.data(), regions.molecule_verdicts.data(), context.metric_scratch[device_index], sink,
         stream);
 
-    // The prepass refuses a bin its scratch cannot hold, and it refuses before writing that bin's
-    // embedding. The kernels below run either way, so without this they would relax the zeroed embedding
-    // into a geometry that met no bounds and report it as a conformer. One verdict per molecule rather
-    // than a bail-out, because the download and the timings behind it are already enqueued and the stamp
-    // is the channel every other refusal already travels.
+    // The prepass refuses a bin its scratch cannot hold, before writing that bin's embedding, and the
+    // kernels below run either way — without this they would relax the zeroed embedding into a geometry
+    // that met no bounds and report it as a conformer. A verdict per molecule rather than a bail-out: the
+    // download and its timings are already enqueued, and the stamp is the channel every refusal travels.
     if (!embedded && !regions.molecule_verdicts.empty()) {
         [[maybe_unused]] bool const refused = sink.check(
             cudaMemsetAsync(regions.molecule_verdicts.data(), static_cast<int>(conformer_status_t::batch_overflow_k),
@@ -1364,39 +1256,31 @@ static gpu_pipeline_handle_t launch_gpu_pipeline(context_t &context, std::size_t
             .sink = sink};
 }
 
-/**
- *  @brief Wait for an already-launched wave to finish and permute its results into the caller's arrays.
- *
- *  All three device-to-host transfers were enqueued by `launch_gpu_pipeline` into pinned staging, so
- *  this drains the stream, reads the phase timings back, and scatters staging into caller rows.
- *
- *  @param[inout] handle The wave's state; its `timings` are filled here.
- */
+/** Wait for an already-launched wave to finish and permute its results into the caller's arrays. All three
+ *  device-to-host transfers were enqueued by `launch_gpu_pipeline` into pinned staging, so this drains the
+ *  stream, reads the phase timings back, and scatters staging into caller rows; @p handle carries the
+ *  wave's state and its `timings` are filled here. */
 static void finalize_gpu_pipeline(gpu_pipeline_handle_t &handle) {
     [[maybe_unused]] bool const bound = handle.sink.check(cudaSetDevice(handle.device_id),
                                                           "cudaSetDevice(finalize_gpu_pipeline)");
-    // Draining the stream, rather than syncing on the closing event, is correct whether or not that
-    // event was ever recorded, and costs about 5 ms per wave per device. See ROADMAP.md under
-    // "Optimizations tried and rejected" for why the event form is not used.
+    // Draining the stream, rather than syncing on the closing event, is correct whether or not that event
+    // was ever recorded, and costs about 5 ms per wave per device; CHANGELOG.md holds why the event form
+    // was rejected.
     [[maybe_unused]] bool const drained = handle.sink.check(cudaStreamSynchronize(handle.stream),
                                                             "cudaStreamSynchronize(finalize)");
     handle.events.elapsed_into(handle.timings);
 
-    // Preprocess wrote this device's batch in atom-count ascending order, and `prepare` has already
-    // translated `input_indices` into the caller's own rows, so a staged slot maps to its destination
-    // with no further indirection.
+    // Preprocess wrote this device's batch atom-count ascending and `prepare` already translated
+    // `input_indices` into the caller's own rows, so a staged slot maps to its destination directly.
     std::uint32_t const molecule_count = static_cast<std::uint32_t>(handle.input_indices.size());
     std::uint32_t const conformer_count = handle.conformer_count;
     conformer_slot_layout_t const destination_layout {handle.host_max_atoms, conformer_count};
     conformer_slot_layout_t const source_layout {handle.gpu_max_atoms, conformer_count};
     // The caller's coordinate buffer was zero-filled at the top of `generate_conformers`, so the halves
-    // past `gpu_max_atoms` in each axis stay zero without an explicit memset here.
-    //
-    // This loop runs between the stream drain above and the next wave's launch, so every GPU is idle
-    // for its duration — at 400K molecules and K=3 it is millions of scattered 256-byte copies.
-    // `input_indices` is a permutation and the destination slot is a pure function of the source slot,
-    // so no two iterations touch the same output bytes and the loop parallelises as written. Devices
-    // are still finalized one at a time, so the fan-out here gives each device's permutation every core.
+    // past `gpu_max_atoms` in each axis stay zero with no memset here. This loop runs between the drain
+    // above and the next wave's launch, every GPU idle, millions of scattered 256-byte copies to make.
+    // `input_indices` is a permutation and the destination slot is a pure function of the source, so no
+    // two iterations touch the same output bytes; devices finalize one at a time, so each gets every core.
 #pragma omp parallel for schedule(static)
     for (std::uint32_t sorted_index = 0; sorted_index < molecule_count; ++sorted_index) {
         std::uint32_t const caller_index = handle.input_indices[sorted_index];
@@ -1408,9 +1292,8 @@ static void finalize_gpu_pipeline(gpu_pipeline_handle_t &handle) {
             float const energy = handle.staged.energies[source_slot];
             handle.outputs.energies[destination_slot] = energy;
             handle.outputs.status[destination_slot] = conformer_status_of_(handle.staged.status[source_slot], energy);
-            // Both sides are structure-of-arrays but at different strides, so each axis is copied into
-            // its own section. `conformer_slot_layout_t` is the contract shared with the RDKit fallback
-            // producer and the Parquet writer.
+            // Both sides are structure-of-arrays at different strides, so each axis is copied on its own.
+            // `conformer_slot_layout_t` is the contract shared with the fallback producer and the writer.
             __half *const destination = handle.outputs.coordinates.data() +
                                         destination_slot * destination_layout.slot_stride();
             __half const *const source = handle.staged.coordinates.data() + source_slot * source_layout.slot_stride();
@@ -1425,13 +1308,10 @@ static void finalize_gpu_pipeline(gpu_pipeline_handle_t &handle) {
 
 #pragma region Context
 
-/**
- *  @brief Populate the per-device launch-configuration cache.
- *
- *  One-shot at construction: probes `cudaDeviceGetAttribute` and
- *  `cudaOccupancyMaxActiveBlocksPerMultiprocessor` for the two warp kernels across every atom-limited
- *  bin, so the per-wave hot path reads `device_launch_config_t` and never calls the driver again.
- */
+/** Populate the per-device launch-configuration cache. One-shot at construction: probes
+ *  `cudaDeviceGetAttribute` and `cudaOccupancyMaxActiveBlocksPerMultiprocessor` for the two warp kernels
+ *  across every atom-limited bin, so the per-wave hot path reads `device_launch_config_t` and never calls
+ *  the driver again. */
 static void populate_device_launch_config_(int device_id, device_launch_config_t &config,
                                            cuda_error_sink_t const &sink) {
     [[maybe_unused]] bool const probed = sink.check(
@@ -1461,9 +1341,8 @@ context_t::context_t(custd::span<int const> devices) {
     else { device_ids.assign(devices.begin(), devices.end()); }
 
     // `batch_slots_per_device` holds `max_devices_k` slots per ring position and reaches
-    // `prepare_per_device_batches_into` as a dynamic-extent span, so the callee indexes it by the device
-    // count alone. An unclamped list writes past the array, and the default constructor enumerates every
-    // visible GPU, so nothing unusual on the caller's side is needed to reach it.
+    // `prepare_per_device_batches_into` as a dynamic-extent span indexed by the device count alone, so an
+    // unclamped list writes past the array — and the default constructor enumerates every visible GPU.
     static_assert(max_devices_k <= smallfield::preprocess::distribute_scratch_t::max_devices_k,
                   "preprocess indexes its per-device scratch by the count this API admits");
     if (device_ids.size() > max_devices_k) {
@@ -1472,11 +1351,10 @@ context_t::context_t(custd::span<int const> devices) {
         device_ids.resize(max_devices_k);
     }
 
-    // Every container below is filled only on the success path of the bring-up loop, so a device that
-    // refuses is absent rather than present-and-null. `device_ids` is rewritten from the survivors at the
-    // end, which is what stops preprocess partitioning molecules across a device the launch cannot reach.
-    // Reserved rather than resized: the loop appends, and reserving up front means no regrow moves a
-    // half-built entry.
+    // Every container below is filled only on the bring-up loop's success path, so a device that refuses is
+    // absent rather than present-and-null, and `device_ids` is rewritten from the survivors at the end —
+    // which stops preprocess partitioning molecules across a device the launch cannot reach. Reserved
+    // rather than resized, because the loop appends and no regrow may move a half-built entry.
     std::vector<int> const requested_device_ids = device_ids;
     std::size_t const requested_count = requested_device_ids.size();
     device_ids.clear();
@@ -1487,17 +1365,15 @@ context_t::context_t(custd::span<int const> devices) {
     launch_configs.reserve(requested_count);
 
     // The MMFF94 parameter tables and the compiled CSD torsion patterns are process-wide constants
-    // extracted once from RDKit; each device gets its own arena so no kernel reaches across a
-    // device boundary for a parameter lookup.
+    // extracted once from RDKit; each device gets its own arena, so no lookup crosses a device boundary.
     mmff94_tables_host_t mmff_tables_host;
     extract_mmff94_tables_from_rdkit(mmff_tables_host);
     csd_torsion_table_host_t csd_torsion_host;
     build_csd_torsion_table(csd_torsion_host);
     cuda_error_sink_t const sink {&this->logger, &this->cuda_error_count};
 
-    // `cudaFuncAttributeMaxDynamicSharedMemorySize` on the embed kernel stays in effect for the lifetime
-    // of each device's primary context. At the `max_atoms_per_molecule_k` cap that kernel needs about
-    // 148.5 KB of shared memory, above the 48 KB default.
+    // `cudaFuncAttributeMaxDynamicSharedMemorySize` on the embed kernel holds for the lifetime of each
+    // device's primary context; at the `max_atoms_per_molecule_k` cap it needs about 148.5 KB, over 48 KB.
     std::size_t const max_embed_shared_bytes = smallfield::cuda::embed_shared_bytes(max_atoms_per_molecule_k);
 
     for (int const device_id : requested_device_ids) {
@@ -1536,9 +1412,8 @@ context_t::context_t(custd::span<int const> devices) {
                                device_id, max_embed_shared_bytes);
             continue;
         }
-        // The launch path expects this reservation to be already sufficient, so a refusal here is a device
-        // that cannot run a wave. It goes through the sink rather than the logger alone, because
-        // `cuda_error_count` is what tells a caller the context is not trustworthy.
+        // The launch path expects this reservation to be already sufficient, so a refusal is a device that
+        // cannot run a wave — through the sink, because `cuda_error_count` is what marks a context untrusted.
         if (scratch.mmff_staging.try_reserve(mmff_staging_bytes_k) == reserve_outcome_t::failed_k) {
             [[maybe_unused]] bool const reported = sink.check(cudaErrorMemoryAllocation,
                                                               "mmff_staging.try_reserve(context_t)");
@@ -1560,9 +1435,8 @@ context_t::context_t(custd::span<int const> devices) {
         metric_scratch.push_back(std::move(scratch_for_metric));
     }
 
-    // No survivor means every later stage has nothing to run on, and `generate_conformers` would return a
-    // batch that reads exactly like unparseable input. `cuda_error_count` already carries each refusal, so
-    // this line names the aggregate rather than adding a second encoding of it.
+    // No survivor leaves every later stage nothing to run on, and `generate_conformers` would return a batch
+    // reading exactly like unparseable input; `cuda_error_count` carries each refusal, this the aggregate.
     if (device_ids.empty())
         this->logger.error("context_t: none of the {} requested devices came up; this context runs nothing",
                            requested_count);
@@ -1571,10 +1445,9 @@ context_t::context_t(custd::span<int const> devices) {
                            requested_count);
     std::size_t const device_count = device_ids.size();
 
-    // Pre-allocate every per-device wave pool so the hot path never grows: a grow discards the
-    // buffer's contents whatever it costs, so `launch_gpu_pipeline` asserts it finds `unchanged_k`.
-    // Sizing runs after the loop above, so the VRAM census sees the tables and the staging already
-    // resident and does not promise a wave the free pool cannot hold.
+    // Pre-allocate every per-device wave pool so the hot path never grows: a grow discards the buffer's
+    // contents whatever it costs, so `launch_gpu_pipeline` asserts `unchanged_k`. Sizing runs after the loop
+    // above, so the VRAM census sees the tables and staging resident and promises no wave the pool cannot hold.
     std::uint32_t const worst_case_wave_size = compute_wave_size_(device_ids, max_atoms_per_molecule_k,
                                                                   max_conformer_count_k, sink);
     per_device_reserved_molecules = reserve_molecules_per_device(worst_case_wave_size,
@@ -1601,32 +1474,22 @@ context_t::context_t(custd::span<int const> devices) {
             this->logger.error("context_t: pool reservation failed on device {} ({} device, {} host bytes)", device_id,
                                worst_case_device_bytes, worst_case_host_bytes);
     }
-    // The pinned batch slots are deliberately left unreserved. `prepare_per_device_batches_into`
-    // sizes each one from the wave's own uploaded prefix, and preprocess partitions atom-count
-    // descending, so the first wave carries the largest molecules and every slot reaches its peak
-    // capacity on that wave; later waves find the buffer already large enough. Reserving here
-    // instead would have to assume the `max_atoms_per_molecule_k` cap, which costs far more per
-    // molecule than a corpus like GDB13 actually stages.
+    // The pinned batch slots are deliberately left unreserved: `prepare_per_device_batches_into` sizes each
+    // from the wave's own uploaded prefix, and preprocess partitions atom-count descending, so the first
+    // wave carries the largest molecules and every slot peaks there. Reserving here would have to assume
+    // the `max_atoms_per_molecule_k` cap, far more per molecule than a corpus like GDB13 actually stages.
 }
 
-/**
- *  Teardown is entirely the members', which is what keeps every `cudaFreeAsync` ahead of the destruction
- *  of the stream it names: `streams` is declared before every buffer built on it, so reverse declaration
- *  order releases the buffers first. Defined here rather than in the header because `launch_scratch_t`
- *  is complete only in this translation unit.
- */
+/** Here rather than in the header because `launch_scratch_t` is complete only in this translation unit. */
 context_t::~context_t() = default;
 
 #pragma endregion Context
 
 #pragma region Wave Dispatch
 
-/**
- *  @brief Half-open `[begin, end)` slice of the sorted input that one `embedding-wave` covers.
- *
- *  Indices are positions in the SMILES-length-sorted view, not in the caller's array; `begin`
- *  doubles as the wave base that `wave_outputs_t` adds before consulting the sort permutation.
- */
+/** Half-open `[begin, end)` slice of the sorted input that one `embedding-wave` covers. Indices are
+ *  positions in the SMILES-length-sorted view, not in the caller's array, and `begin` doubles as the wave
+ *  base that `wave_outputs_t` adds before consulting the sort permutation. */
 struct wave_range_t {
     std::uint32_t begin = 0;
     std::uint32_t end = 0;
@@ -1634,15 +1497,10 @@ struct wave_range_t {
     [[nodiscard]] std::uint32_t size() const noexcept { return end - begin; }
 };
 
-/**
- *  @brief Build a descending-by-SMILES-length permutation of the input and write the reordered
- *  SMILES views into @p sorted_smiles_storage.
- *
- *  Putting the smallest molecules in the last `embedding-wave` shortens the tail: the last wave's GPU
- *  work is the only fully unhidden one, so making it the cheapest shrinks overall wall.
- *  `finalize_gpu_pipeline` folds this permutation into the same reorder that undoes the per-GPU
- *  atom-count sort.
- */
+/** Build a descending-by-SMILES-length permutation of the input and write the reordered SMILES views into
+ *  @p sorted_smiles_storage. Putting the smallest molecules in the last `embedding-wave` shortens the tail,
+ *  that wave's GPU work being the only fully unhidden one; `finalize_gpu_pipeline` folds this permutation
+ *  into the same reorder that undoes the per-GPU atom-count sort. */
 static void sort_input_by_smiles_length_(custd::span<std::string_view const> smiles,
                                          std::vector<std::uint32_t> &sort_perm,
                                          std::vector<std::string_view> &sorted_smiles_storage) {
@@ -1660,13 +1518,11 @@ static void sort_input_by_smiles_length_(custd::span<std::string_view const> smi
  *  @brief Molecules per wave, and with it how many waves the run takes.
  *
  *  A caller's explicit `wave_size` is bounded by @p wave_size_ceiling exactly as the auto-sized one is,
- *  which is what keeps preprocess's `batch_overflow_k` tail empty: past that bound a molecule's rows
- *  would be packed at a wrapped 32-bit region offset, so the tail is refused rather than aliased.
- *
- *  An auto-sized wave may additionally never exceed what the constructor reserved, because going past it
- *  fires a grow from inside the per-device fan-out that discards a pool the wave is mid-way through
- *  filling. The two sizings disagree without that ceiling: the constructor assumes `max_conformer_count_k`
- *  while this uses the caller's K, which at K=3 halves the per-molecule estimate.
+ *  which keeps preprocess's `batch_overflow_k` tail empty: past that bound a molecule's rows would pack at
+ *  a wrapped 32-bit region offset. An auto-sized wave may additionally never exceed what the constructor
+ *  reserved, since going past fires a grow inside the per-device fan-out that discards a pool the wave is
+ *  mid-way through filling — the two sizings disagree without that ceiling, the constructor assuming
+ *  `max_conformer_count_k` while this uses the caller's K, which at K=3 halves the per-molecule estimate.
  */
 static std::uint32_t choose_wave_size_(context_t const &context, config_t const &config,
                                        std::uint32_t max_atoms_per_molecule, std::uint32_t wave_size_ceiling,
@@ -1683,13 +1539,11 @@ static std::uint32_t choose_wave_size_(context_t const &context, config_t const 
 /**
  *  @brief Cut @p num_input positions into the waves the dispatch loop walks.
  *
- *  An input that fits within half again the target rides in a single wave, which is what the
- *  un-pipelined dispatch amounted to: with one wave there is nothing to overlap with, so the ring
- *  never turns and the loop below degenerates to prepare, launch, finalize.
- *
- *  @p wave_size_ceiling bounds that shortcut as well as the target. `choose_wave_size_` already holds
- *  its answer under what a 32-bit per-molecule region offset addresses, and half again a bounded target
- *  is not bounded — the shortcut is the one path that can hand preprocess a slice it has to refuse.
+ *  An input that fits within half again the target rides in a single wave: nothing to overlap, so the ring
+ *  never turns and the loop below degenerates to prepare, launch, finalize. @p wave_size_ceiling bounds
+ *  that shortcut as well as the target — `choose_wave_size_` already holds its answer under what a 32-bit
+ *  per-molecule region offset addresses, and half again a bounded target is not bounded, which makes the
+ *  shortcut the one path that can hand preprocess a slice it has to refuse.
  */
 static std::vector<wave_range_t> split_into_waves_(std::uint32_t num_input, std::uint32_t wave_size_target,
                                                    std::uint32_t wave_size_ceiling) {
@@ -1704,28 +1558,25 @@ static std::vector<wave_range_t> split_into_waves_(std::uint32_t num_input, std:
     return waves;
 }
 
-/**
- *  @brief The three steps one `embedding-wave` takes, and the state all three share.
- *
- *  A receiver rather than a cluster of capture-everything lambdas: each method names the wave it acts
- *  on, and the loop in `generate_conformers` reads as prepare, finalize the previous, launch.
- */
+/** The three steps one `embedding-wave` takes, and the state all three share. A receiver rather than a
+ *  cluster of capture-everything lambdas: each method names the wave it acts on, and the loop in
+ *  `generate_conformers` reads as prepare, finalize the previous, launch. `sorted_smiles` is the input in
+ *  descending-SMILES-length order, each wave taking a contiguous slice; `host_max_atoms` is the caller's
+ *  output stride and the atom cap preprocess refuses molecules against; `outputs` is the caller destination
+ *  and sort permutation, whose `wave_base` is filled per wave. `rejected` and `prep_scratch` are grow-only
+ *  across this run's waves — `prepare` refills the first from each slice, and one dispatcher owning the
+ *  second, preprocess's per-worker and partition buffers, lets two `context_t` objects prepare on two
+ *  threads. */
 struct wave_dispatcher_t {
     context_t &context;
     config_t const &config;
-    /** Input in descending-SMILES-length order; each wave takes a contiguous slice. */
     custd::span<std::string_view const> sorted_smiles;
-    /** The caller's output stride, and the atom cap preprocess refuses molecules against. */
     std::uint32_t host_max_atoms = 0;
-    /** Caller destination and sort permutation; `wave_base` is filled per wave. */
     wave_outputs_t outputs {};
     molecule_readback_t readback {};
     wall_clock_t const &clock;
     cuda_error_sink_t sink {};
-    /** Grow-only across waves; `prepare` refills it from each slice. */
     std::vector<rejected_mol_t> rejected {};
-    /** Preprocess's per-worker and partition buffers. One dispatcher owns one, which is what lets two
-     *  `context_t` objects prepare waves on two threads; grow-only across this run's waves. */
     batch_prep_scratch_t prep_scratch {};
 
     [[nodiscard]] std::uint32_t device_count() const noexcept {
@@ -1739,14 +1590,11 @@ struct wave_dispatcher_t {
         return wave_outputs;
     }
 
-    /**
-     *  @brief Parse and pack one slice into this wave's ring slot, and stamp what preprocess refused.
-     *
-     *  Preprocess partitions by atom count descending and writes each device's pool atom-count
-     *  ascending, so the kernels can read the batch metadata directly with no per-device sort. The
-     *  molecules it rejects — unsupported element, too many atoms, invalid SMILES — never reach the
-     *  GPU pools; their status is stamped here so the `fallback-role` picks them up caller-side.
-     */
+    /** Parse and pack one slice into this wave's ring slot, and stamp what preprocess refused. Preprocess
+     *  partitions by atom count descending and writes each device's pool atom-count ascending, so the
+     *  kernels read the batch metadata directly with no per-device sort. The molecules it rejects —
+     *  unsupported element, too many atoms, invalid SMILES — never reach the GPU pools, and their status
+     *  is stamped here so the `fallback-role` picks them up caller-side. */
     void prepare(wave_range_t range, std::uint32_t wave_index, wave_record_t &record) {
         SF_NVTX_RANGE_COLORED("prep: rdkit preprocess", 0x8E44AD);
         scoped_span_ms_t const timed {clock, record.prepare};
@@ -1756,9 +1604,8 @@ struct wave_dispatcher_t {
 
         wave_outputs_t const wave_outputs = outputs_for(range);
 
-        // Preprocess numbers its molecules by their position in the slice it was handed, and that slice is a
-        // wave of the length-sorted order. Translate to the caller's own rows here, once, so everything
-        // downstream reads one fact rather than two: the finalize scatter indexes the caller's buffers
+        // Preprocess numbers molecules by position in the slice it was handed, a wave of the length-sorted
+        // order. Translate to caller rows here, once: the finalize scatter then indexes the caller's buffers
         // directly, and the kernel seeds Philox from a row that does not move when the batch changes.
         for (wave_slice_pool_t &batch : slot) {
             custd::span<std::uint32_t> const input_indices = batch.host_view().input_indices;
@@ -1781,12 +1628,9 @@ struct wave_dispatcher_t {
         }
     }
 
-    /**
-     *  @brief Fan out across the devices, each enqueueing its own upload, compute and download chain.
-     *
-     *  Every call inside is asynchronous against that device's own stream and reads only from that
-     *  device's pinned pool, so concurrent launches share neither a pinned source nor a driver lock.
-     */
+    /** Fan out across the devices, each enqueueing its own upload, compute and download chain. Every call
+     *  inside is asynchronous against that device's own stream and reads only from that device's pinned
+     *  pool, so concurrent launches share neither a pinned source nor a driver lock. */
     void launch(wave_range_t range, std::uint32_t wave_index, wave_record_t &record,
                 std::vector<gpu_pipeline_handle_t> &handles) {
         SF_NVTX_RANGE_COLORED("launch: gpu dispatch", 0x2E86C1);
@@ -1794,10 +1638,10 @@ struct wave_dispatcher_t {
         custd::span<wave_slice_pool_t> const slot = context.wave_slot(wave_index);
         handles.assign(device_count(), gpu_pipeline_handle_t {});
 
-        // Small-molecule corpora pack most of a wave into a single atom-count bin, which can exceed the
-        // metric scratch sized at construction from a wave-size estimate; the prepass refuses an
-        // oversized bin. Growing here is a no-op after the first such wave and costs a uint32 per
-        // molecule, and doing it serially keeps the one-time allocation out of the launch fan-out.
+        // Small-molecule corpora pack most of a wave into one atom-count bin, which can exceed the metric
+        // scratch sized at construction from a wave-size estimate and which the prepass then refuses.
+        // Growing here is a no-op after the first such wave, costs a uint32 per molecule, and done serially
+        // keeps the one-time allocation out of the launch fan-out.
         bool any_molecules = false;
         for (std::uint32_t device_index = 0; device_index < device_count(); ++device_index) {
             if (slot[device_index].num_molecules() == 0) continue;
@@ -1815,12 +1659,9 @@ struct wave_dispatcher_t {
         }
     }
 
-    /**
-     *  @brief Drain every device's stream in turn and permute the wave's results out of staging.
-     *
-     *  The first drain blocks until that stream finishes; the others started within microseconds of it
-     *  and carry equal work, so they return almost immediately.
-     */
+    /** Drain every device's stream in turn and permute the wave's results out of staging. The first drain
+     *  blocks until that stream finishes; the others started within microseconds of it and carry equal
+     *  work, so they return almost immediately. */
     void finalize(std::vector<gpu_pipeline_handle_t> &handles, wave_record_t &record) {
         scoped_span_ms_t const timed {clock, record.finalize};
         record.per_device_gpu.assign(device_count(), gpu_phase_ms_t {});
@@ -1868,9 +1709,8 @@ conformer_status_t context_t::generate_conformers(
     sort_input_by_smiles_length_(smiles, sort_perm, sorted_smiles);
 
     std::uint32_t const num_input = static_cast<std::uint32_t>(smiles.size());
-    // Molecules one batch can address at this atom cap, which bounds the wave both times it is decided:
-    // once when the size is chosen and once when the input is cut, because the single-wave shortcut takes
-    // half again the chosen size.
+    // Molecules one batch can address at this atom cap, bounding the wave both times it is decided — when
+    // the size is chosen and when the input is cut, the single-wave shortcut taking half again that size.
     std::uint32_t const addressable_molecules = smallfield::preprocess::max_molecules_for_atom_capacity(
         max_atoms_per_molecule);
     std::uint32_t const wave_size_target = choose_wave_size_(*this, config, max_atoms_per_molecule,
@@ -1880,11 +1720,9 @@ conformer_status_t context_t::generate_conformers(
                        wave_size_target, waves.size());
     if (waves.empty()) return conformer_status_t::mmff_unconverged_k;
 
-    // The constructor pre-grew the device pool, the pinned staging and the metric scratch to the
-    // worst-case wave, so no mid-run grow fires on the hot path and every per-launch `try_reserve`
-    // returns `unchanged_k` at steady state. The pinned batch slots are the exception: they size
-    // themselves from the first wave, which is the largest because preprocess sorts atom-count
-    // descending.
+    // The constructor pre-grew the device pool, the pinned staging and the metric scratch to the worst-case
+    // wave, so no mid-run grow fires on the hot path and every per-launch `try_reserve` returns
+    // `unchanged_k` at steady state. The pinned batch slots size themselves from the first, largest wave.
     wall_clock_t const clock;
     std::vector<wave_record_t> records(waves.size());
     for (std::uint32_t wave = 0; wave < waves.size(); ++wave)
@@ -1902,10 +1740,9 @@ conformer_status_t context_t::generate_conformers(
                                   .clock = clock,
                                   .sink = sink};
 
-    // One wave is GPU-resident at a time: N-1 is finalized before N is launched, so a single handle
-    // vector spans exactly the window it describes. The pinned ring is deeper than this for a different
-    // reason — wave N-1's host-to-device copy is still reading its slot while `prepare` fills wave N's —
-    // and sizing the handles by that depth implied a second resident wave this loop has never issued.
+    // One wave is GPU-resident at a time: N-1 is finalized before N is launched, so a single handle vector
+    // spans exactly the window it describes. The pinned ring is deeper for a different reason — wave N-1's
+    // host-to-device copy is still reading its slot while `prepare` fills wave N's.
     std::vector<gpu_pipeline_handle_t> in_flight;
     dispatcher.prepare(waves[0], 0, records[0]);
     dispatcher.launch(waves[0], 0, records[0], in_flight);
@@ -1918,9 +1755,9 @@ conformer_status_t context_t::generate_conformers(
 
     print_wave_timeline_(this->logger, records, clock.elapsed_ms());
 
-    // Every permutation already happened inside `finalize_gpu_pipeline`, which folds each wave's
-    // per-GPU sort and the outer SMILES-length sort into one reorder straight into caller rows. What
-    // remains is a scan of the permuted status buffer for the aggregate return code.
+    // Every permutation already happened inside `finalize_gpu_pipeline`, which folds each wave's per-GPU
+    // sort and the outer SMILES-length sort into one reorder straight into caller rows; only the scan of
+    // the permuted status buffer for the aggregate return code is left.
     return any_conformer_succeeded_(status_out) ? conformer_status_t::success_k
                                                 : conformer_status_t::mmff_unconverged_k;
 }

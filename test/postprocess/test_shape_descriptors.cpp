@@ -2,26 +2,21 @@
  *  @file test/postprocess/test_shape_descriptors.cpp
  *  @brief Confirm native USR / USRCAT match RDKit within tolerance, and that fragment separation is rigid.
  *
- *  Each molecule is parsed with the library's parse contract, embedded as one ETKDGv3 conformer with a fixed
- *  seed and MMFF-optimized; that conformer's float coordinates then feed both the native descriptors and
- *  RDKit's reference `Descriptors::USR` / `USRCAT`. To compare like with like, the RDKit conformer is
- *  overwritten with the same float-rounded coordinates the native path sees, so any residual difference is
- *  accumulation order only. Every one of the 12 USR and 60 USRCAT elements is compared at 1e-4, rather than
- *  their worst deviation alone, so a single divergent moment names itself.
+ *  Each molecule is parsed with the library's parse contract, embedded as one ETKDGv3 conformer at a fixed seed
+ *  and MMFF-optimized; those float coordinates feed both the native descriptors and RDKit's `Descriptors::USR`
+ *  / `USRCAT`, whose conformer is overwritten with the same float-rounded values so any residual difference is
+ *  accumulation order only. All 12 USR and 60 USRCAT elements are compared at 1e-4 rather than their worst
+ *  deviation alone, so a single divergent moment names itself. The four CREDO subsets are checked separately
+ *  and index for index against `SubstructMatch` over the same SMARTS, since the descriptor comparison would
+ *  hide a subset differing by an atom the moments happen not to move; needing no conformer, it covers every
+ *  corpus line rather than only the ones that embed.
  *
- *  The four CREDO subsets are checked separately and index for index against `SubstructMatch` over the same
- *  SMARTS, because the descriptor comparison above would hide a subset that differs by an atom the moments
- *  happen not to move. That check needs no conformer, so it covers every corpus line rather than only the
- *  ones that embed.
- *
- *  `separate_fragments` documents a rigid translation that strings the component centroids along +x with their
+ *  `separate_fragments` documents a rigid translation stringing the component centroids along +x with their
  *  bounding spheres clear, so the checks are exactly those three claims: intra-component distances unchanged,
- *  each centroid on the axis, and consecutive centroids at least the sum of their two radii apart. A gap that
- *  merely grew is not the contract — two fragments the embedder left far apart legitimately move closer.
- *
- *  The builtin molecules run unconditionally; naming a `.smi` file on the command line, or in
- *  `SMALLFIELD_TEST_CORPUS`, widens both halves, and every multi-component corpus molecule also reaches the
- *  separation checks on the conformer it was already embedded for.
+ *  each centroid on the axis, consecutive centroids at least the sum of their two radii apart. A gap that
+ *  merely grew is not the contract — two fragments the embedder left far apart legitimately move closer. The
+ *  builtins run unconditionally; a `.smi` named on the command line or in `SMALLFIELD_TEST_CORPUS` widens both
+ *  halves, and every multi-component corpus molecule also reaches separation on the conformer it already has.
  */
 
 #include <cmath>   // `std::fabs`, `std::sqrt`
@@ -69,11 +64,10 @@ static constexpr int embedding_seed_k = 0xC0FFEE;
 static constexpr double descriptor_tolerance_k = 1e-4;
 
 /**
- *  Relative slack on the intra-component distance sum, which a rigid translation leaves alone.
- *
- *  The sum is over every pair in the component, so on a 400-atom fragment it reaches five figures and carries
- *  the float coordinates' rounding proportionally: an absolute bound would reject a translation that moved it
- *  by 3e-8 of itself. Any transform that is not rigid moves the sum by orders of magnitude more than this.
+ *  Relative slack on the intra-component distance sum, which a rigid translation leaves alone. Summed over
+ *  every pair, so on a 400-atom fragment it reaches five figures and carries the float rounding proportionally:
+ *  an absolute bound would reject a translation moving it by 3e-8 of itself, while any non-rigid transform
+ *  moves the sum by orders of magnitude more.
  */
 static constexpr double rigid_relative_tolerance_k = 1e-5;
 
@@ -104,22 +98,21 @@ static constexpr std::array<std::string_view, sfpost::credo_subset_count_k + 1> 
     "all", "hydrophobic", "aromatic", "acceptor", "donor",
 };
 
-/** How far a molecule got before the descriptors could be compared. */
+/**
+ *  How far a molecule got before the descriptors could be compared: `SmilesToMol` refused or threw on the line,
+ *  ETKDGv3 found no conformer at this seed, or the parser's aromaticity could not be restored after MMFF typing
+ *  rewrote it.
+ */
 enum class prepare_outcome_t {
     prepared_k,
-    /** `SmilesToMol` refused the line, or threw on it. */
     unparsed_k,
-    /** ETKDGv3 found no conformer at this seed. */
     unembedded_k,
-    /** The parser's aromaticity perception could not be restored after MMFF typing rewrote it. */
     unsanitized_k,
 };
 
 /**
- *  @brief Parse with the same contract `build_shape_context_into` uses, add Hs, embed one ETKDGv3 conformer at a
- *  fixed seed, and MMFF-optimize it.
- *
- *  @param[in] smiles SMILES to prepare.
+ *  @brief Parse with the contract `build_shape_context_into` uses, add Hs, embed one ETKDGv3 conformer at a
+ *         fixed seed, and MMFF-optimize it.
  *  @param[out] molecule Owns the prepared molecule on `prepared_k`, and is left null otherwise.
  *  @return Which of the two ways preparation can end short, or `prepared_k`.
  */
@@ -148,10 +141,9 @@ static prepare_outcome_t prepare_molecule_(std::string_view smiles, std::unique_
     }
     RDKit::MMFF::MMFFOptimizeMolecule(*molecule);
 
-    // MMFF typing kekulizes the molecule and re-perceives aromaticity under the MMFF94 model, which marks
-    // strictly fewer atoms than the model the parser used — 6 rather than 20 on a fused heteroaromatic.
-    // RDKit's reference USRCAT matches its `[a]` subset against this same object, so leaving MMFF's
-    // perception in place types the reference on a different graph from the one `build_shape_context_into` saw.
+    // MMFF typing kekulizes and re-perceives aromaticity under MMFF94, marking strictly fewer atoms than the
+    // parser's model — 6 rather than 20 on a fused heteroaromatic. RDKit's reference USRCAT matches its `[a]`
+    // subset against this same object, so leaving that perception would type the reference on another graph.
     try {
         RDKit::MolOps::sanitizeMol(*molecule);
     }
@@ -198,9 +190,12 @@ struct component_before_t {
     std::array<double, 3> centroid {0.0, 0.0, 0.0};
 };
 
-/** Buffers that outlive the molecule loop, so a corpus sweep grows each of them once. */
+/**
+ *  Buffers that outlive the molecule loop, so a corpus sweep grows each of them once. `context` is typed once
+ *  per molecule into the same object the production loops hoist, capacity included, and `substruct_subsets`
+ *  holds the CREDO subsets as `SubstructMatch` collects them, against which that typing is checked.
+ */
 struct shape_scratch_t {
-    /** Typed once per molecule into the same object the production loops hoist, capacity included. */
     sfpost::molecule_shape_context_t context;
     std::vector<float> coordinates;
     std::array<double, sfpost::usr_components_k> native_usr {};
@@ -210,7 +205,6 @@ struct shape_scratch_t {
     std::vector<std::vector<unsigned int>> rdkit_usrcat_atoms;
     std::vector<std::uint32_t> component_atoms;
     std::vector<component_before_t> components_before;
-    /** The CREDO subsets as `SubstructMatch` collects them, against which the typing is checked. */
     std::array<std::vector<std::uint32_t>, sfpost::credo_subset_count_k> substruct_subsets;
     std::vector<RDKit::MatchVectType> substruct_matches;
 };
@@ -236,9 +230,8 @@ struct shape_tally_t {
  *  @brief RDKit's default USRCAT SMARTS, compiled as whole-molecule queries.
  *
  *  The oracle for the typing in `build_shape_context_into`, which tests one atom at a time and fills the
- *  recursive `$()` environments itself. `SubstructMatch` is the mechanism that filling replaced, so an
- *  environment left unfilled, filled twice, or filled against the wrong molecule shows up here as a subset
- *  that differs.
+ *  recursive `$()` environments itself in place of `SubstructMatch`, so an environment left unfilled, filled
+ *  twice, or filled against the wrong molecule shows up here as a differing subset.
  */
 static std::array<RDKit::ROMol, sfpost::credo_subset_count_k> const &substruct_matchers_() {
     static char const *const patterns[sfpost::credo_subset_count_k] = {
@@ -274,10 +267,7 @@ static void fill_substruct_subsets_(RDKit::ROMol const &molecule, shape_scratch_
 
 /**
  *  @brief Compare one molecule's four typed subsets against `scratch.substruct_subsets`, index for index.
- *
- *  @param[in] smiles The molecule's SMILES, carried into every diagnostic key.
- *  @param[in] observed The subsets the per-atom typing produced, single-threaded or concurrent.
- *  @param[inout] reporters Reporters counting and printing the comparisons.
+ *  @param[in] observed_subsets What the per-atom typing produced, single-threaded or concurrent.
  *  @param[in] scratch Holds the oracle's answer for the same molecule.
  */
 static void compare_credo_subsets_(std::string_view smiles, credo_subsets_t const &observed_subsets,
@@ -285,8 +275,7 @@ static void compare_credo_subsets_(std::string_view smiles, credo_subsets_t cons
     for (std::size_t subset_index = 0; subset_index < sfpost::credo_subset_count_k; ++subset_index) {
         std::vector<std::uint32_t> const &reference = scratch.substruct_subsets[subset_index];
         std::vector<std::uint32_t> const &observed = observed_subsets[subset_index];
-        // The atoms carry their own index as their value, so a differing position names itself and the field
-        // name does not have to be built per element.
+        // Atoms carry their own index as their value, so a differing position names itself.
         comparison_group_t group = reporters.credo.mismatch("credo_typing", "smiles={} subset={}", smiles,
                                                             usrcat_block_names_k[subset_index + 1]);
         group.field("size", static_cast<std::uint32_t>(reference.size()), static_cast<std::uint32_t>(observed.size()),
@@ -299,12 +288,9 @@ static void compare_credo_subsets_(std::string_view smiles, credo_subsets_t cons
 /**
  *  @brief Compare the four CREDO subsets against the `SubstructMatch` oracle, index for index.
  *
- *  Needs no conformer, so it runs over every corpus line rather than only the ones that embed. A line the
- *  parse or the typing refuses is left uncompared: the production path ships no descriptor for it either.
- *
- *  @param[in] smiles Molecule to type.
+ *  Needs no conformer, so it runs over every corpus line rather than only the ones that embed. A line the parse
+ *  or the typing refuses is left uncompared: the production path ships no descriptor for it either.
  *  @param[in] salt_policy Counterion handling, applied to both sides so they type the same molecule.
- *  @param[inout] reporters Reporters counting and printing the comparisons.
  *  @param[inout] scratch Buffers reused across molecules; left holding this molecule's typing context.
  */
 static void check_credo_typing_(std::string_view smiles, smallfield::salt_policy_t salt_policy,
@@ -334,19 +320,13 @@ struct concurrent_typing_t {
 /**
  *  @brief Type the whole corpus again from several workers at once, then judge every answer against the oracle.
  *
- *  Each worker owns its `molecule_shape_context_t`, and that context owns the four compiled matchers whose
- *  recursive `$()` sets priming writes into. A typing that is right on one thread and wrong on many is exactly
- *  what per-worker matchers can get wrong, so this runs the same comparison `check_credo_typing_` runs and
- *  gates on it.
- *
- *  The concurrent pass only writes its own slot of @p typings; the oracle is then run single-threaded over the
- *  same lines, so nothing here depends on `SubstructMatch` being reentrant and a divergence is attributable to
- *  the code under test alone.
- *
- *  @param[in] corpus SMILES to type.
+ *  Each worker owns its `molecule_shape_context_t`, which owns the four compiled matchers whose recursive `$()`
+ *  sets priming writes into -- right on one thread and wrong on many is exactly what per-worker matchers get
+ *  wrong -- so this runs the same comparison `check_credo_typing_` runs and gates on it. Each worker writes only
+ *  its own slot of @p typings and the oracle then runs single-threaded over the same lines, so nothing depends
+ *  on `SubstructMatch` being reentrant and a divergence belongs to the code under test alone.
  *  @param[in] salt_policy Counterion handling, applied to both sides so they type the same molecule.
  *  @param[in] threads Workers the parallel pass runs on.
- *  @param[inout] reporters Reporters counting and printing the comparisons.
  *  @param[inout] scratch Buffers reused across the serial comparison pass.
  *  @param[inout] typings One slot per corpus line, grown once and reused.
  *  @return Molecules the concurrent pass typed, and whose subsets were therefore compared.
@@ -359,8 +339,7 @@ static std::uint64_t check_credo_typing_concurrently_(std::vector<std::string> c
 
     // `private` hands each worker its own context, exactly as both production loops do.
     sfpost::molecule_shape_context_t context;
-    // A small chunk on purpose: the in-tree fixture is a hundred lines, and a chunk that let two workers cover
-    // it would leave the concurrency this section exists to exercise unexercised.
+    // A small chunk on purpose: the fixture is a hundred lines, and two workers covering it exercise nothing.
 #pragma omp parallel for schedule(dynamic, 4) num_threads(threads) private(context)
     for (std::size_t molecule = 0; molecule < corpus.size(); ++molecule) {
         smallfield::parse_options_t parse_options;
@@ -397,10 +376,7 @@ static std::uint64_t check_credo_typing_concurrently_(std::vector<std::string> c
 
 /**
  *  @brief Compare all 72 native descriptor elements against RDKit's, on identical float coordinates.
- *
  *  @param[inout] molecule Prepared molecule; its conformer is overwritten with the float-rounded coordinates.
- *  @param[in] smiles The molecule's SMILES, carried into every diagnostic key.
- *  @param[inout] reporters Reporters counting and printing the comparisons.
  *  @param[inout] scratch Buffers reused across molecules, carrying this molecule's typing context.
  */
 static void compare_descriptors_(RDKit::RWMol &molecule, std::string_view smiles, shape_reporters_t &reporters,
@@ -416,8 +392,7 @@ static void compare_descriptors_(RDKit::RWMol &molecule, std::string_view smiles
 
     sfpost::usrcat_descriptor(scratch.coordinates, scratch.context, scratch.native_usrcat);
     scratch.rdkit_usrcat.assign(scratch.native_usrcat.size(), 0.0);
-    // `USRCAT` reads the atom-id argument as an input whenever it arrives non-empty, so a reused buffer would
-    // type this molecule with the previous one's CREDO subsets and compare two unrelated descriptors.
+    // `USRCAT` reads its atom-id argument as input when non-empty; a reused buffer would carry the last subsets.
     scratch.rdkit_usrcat_atoms.clear();
     RDKit::Descriptors::USRCAT(molecule, scratch.rdkit_usrcat, scratch.rdkit_usrcat_atoms);
 
@@ -432,8 +407,8 @@ static void compare_descriptors_(RDKit::RWMol &molecule, std::string_view smiles
     for (std::size_t block = 0; block < usrcat_block_names_k.size(); ++block) {
         auto usrcat_group = reporters.usrcat.mismatch("usrcat", "smiles={} subset={}", smiles,
                                                       usrcat_block_names_k[block]);
-        // Block 0 is the plain USR over every atom; the four CREDO subsets follow it, and RDKit hands back the
-        // atom ids it typed, so a typing divergence names itself here instead of surfacing as twelve moments.
+        // Block 0 is plain USR over all atoms; the CREDO subsets follow with RDKit's typed ids, so a typing
+        // divergence names itself rather than surfacing as twelve moments.
         std::size_t const subset_atoms = block == 0 ? scratch.context.num_atoms()
                                                     : scratch.rdkit_usrcat_atoms[block - 1].size();
         if (block > 0)
@@ -441,20 +416,18 @@ static void compare_descriptors_(RDKit::RWMol &molecule, std::string_view smiles
                                scratch.context.credo_subsets[block - 1].size(), exactly_equal);
 
         // Skewness is the third central moment standardized by the cube of the deviation, and on fewer than
-        // three points its exact value is identically zero — the deviations cancel term for term. Both sides
-        // are then dividing one roundoff residual by another and taking a cube root of the quotient, which
-        // maps a `1e-21` numerator onto a `1e-3` answer. Neither number is wrong about the geometry and
-        // neither is stable, so the pair is cited rather than gated; the mean and the deviation beside it are
-        // well-conditioned on the same subset and stay gated. Ours is the value nearer the exact zero.
+        // three points it is exactly zero — the deviations cancel term for term. Both sides then divide one
+        // roundoff residual by another and cube-root it, mapping a `1e-21` numerator onto a `1e-3` answer:
+        // unstable but not wrong, so the pair is cited rather than gated, while the well-conditioned mean and
+        // deviation on the same subset stay gated; ours is the value nearer the exact zero.
         auto degenerate_group = reporters.usrcat.divergence("usrcat_degenerate_skewness",
                                                             "smiles={} subset={} atoms={}", smiles,
                                                             usrcat_block_names_k[block], subset_atoms);
         std::size_t const base = block * usr_slot_names_k.size();
         for (std::size_t slot = 0; slot < usr_slot_names_k.size(); ++slot) {
             bool const is_skewness = slot % moments_per_reference_point_k == skewness_slot_k;
-            // Cited only where the two actually disagree. A degenerate subset whose skewness both sides
-            // put at zero is an agreement, and routing it to the divergence group would trade a real
-            // comparison for a cited non-difference — the count would grow while the evidence shrank.
+            // Cited only where the two actually disagree: routing an agreed zero to the divergence group
+            // would trade a real comparison for a cited non-difference, growing the count as evidence shrank.
             if (is_skewness && subset_atoms < 3 &&
                 !within_tolerance(scratch.rdkit_usrcat[base + slot], scratch.native_usrcat[base + slot]))
                 degenerate_group.field(usr_slot_names_k[slot], scratch.rdkit_usrcat[base + slot],
@@ -470,10 +443,9 @@ static void compare_descriptors_(RDKit::RWMol &molecule, std::string_view smiles
 
 #pragma region Fragment Separation
 
-/*  The helpers below re-derive the centroid, the radius and the pairwise distances rather than calling
- *  `centroid_of_` and `point_distance_` from `shape_descriptors.hpp`, which the code under test uses. Sharing
- *  those would let a defect in either appear on both sides of the comparison and cancel itself out.
- */
+/*  The helpers below re-derive centroid, radius and pairwise distances rather than calling `centroid_of_` and
+ *  `point_distance_` from `shape_descriptors.hpp`, which the code under test uses: sharing those would let a
+ *  defect appear on both sides of the comparison and cancel itself out. */
 
 /** Sum of pairwise distances within one component — invariant under a rigid translation. */
 static double intra_component_distance_sum_(std::vector<float> const &coords, std::vector<int> const &label,
@@ -545,12 +517,9 @@ static double centroid_offaxis_(std::array<double, 3> const &centroid) {
 /**
  *  @brief Separate the components of one conformer and check the three claims the function documents.
  *
- *  Only consecutive centroid pairs are checked for clearance, because the components are laid along one axis in
- *  label order, so consecutive clearance implies every pair's.
- *
- *  @param[in] smiles The molecule's SMILES, carried into every diagnostic key.
- *  @param[inout] reporters Reporters counting and printing the comparisons.
- *  @param[inout] scratch Carries this molecule's multi-component context and the coordinates in, and is left
+ *  Only consecutive centroid pairs are checked for clearance: the components lie along one axis in label order,
+ *  so consecutive clearance implies every pair's.
+ *  @param[inout] scratch Carries this molecule's multi-component context and coordinates in, and is left
  *      holding the separated ones.
  */
 static void check_separation_(std::string_view smiles, shape_reporters_t &reporters, shape_scratch_t &scratch) {
@@ -570,8 +539,7 @@ static void check_separation_(std::string_view smiles, shape_reporters_t &report
     auto const unchanged = [](double reference, double observed) {
         return std::fabs(reference - observed) <= rigid_relative_tolerance_k * std::max(1.0, std::fabs(reference));
     };
-    // The claim is where the centroid ended up, not how far it moved, so the before value is reported as context
-    // and deliberately not consulted.
+    // The claim is where the centroid ended up, not how far it moved, so the before value is context only.
     auto const on_axis = [](double, double observed) { return observed < on_axis_tolerance_k; };
 
     std::array<double, 3> previous_centroid {0.0, 0.0, 0.0};
@@ -629,8 +597,8 @@ static void check_builtin_(std::string_view smiles, shape_reporters_t &reporters
     sf_verify_(prepare_molecule_(smiles, molecule) == prepare_outcome_t::prepared_k,
                fmt::format("a builtin SMILES must parse and embed, but {} did not", smiles));
 
-    // One verdict covers both claims a builtin has to meet: it types, and it types the molecule that was
-    // just embedded, which is what makes the coordinates below address the atoms the context describes.
+    // One verdict for both claims a builtin must meet: it types, and it types the molecule just embedded,
+    // which is what makes the coordinates below address the atoms the context describes.
     sfpost::shape_typing_t const typing = sfpost::build_shape_context_into(
         smiles, molecule->getNumAtoms(), smallfield::keep_largest_fragment_k, scratch.context);
     sf_verify_(typing == sfpost::shape_typing_t::typed_k,
@@ -642,8 +610,8 @@ static void check_builtin_(std::string_view smiles, shape_reporters_t &reporters
 /**
  *  @brief Run the separation checks over the builtin salt.
  *
- *  `separate_fragments` is a geometric utility over a multi-component context; the production path strips
- *  counterions before it can ever see one, so the context is built with every fragment kept.
+ *  `separate_fragments` is a geometric utility over a multi-component context, and the production path strips
+ *  counterions before it can see one, so the context here keeps every fragment.
  */
 static void check_builtin_salt_(shape_reporters_t &reporters, shape_scratch_t &scratch) {
     std::unique_ptr<RDKit::RWMol> molecule;
@@ -664,9 +632,8 @@ static void check_builtin_salt_(shape_reporters_t &reporters, shape_scratch_t &s
 /**
  *  @brief Walk one corpus line, counting every way it can miss a comparison instead of failing on it.
  *
- *  The context keeps every fragment here, because the reference descriptors come from a molecule parsed
- *  straight out of the same SMILES: a context that stripped a counterion would be typing a different molecule
- *  from the one RDKit measures.
+ *  The context keeps every fragment: the reference descriptors come from a molecule parsed straight out of the
+ *  same SMILES, so stripping a counterion would type a different molecule from the one RDKit measures.
  */
 static void check_corpus_line_(std::string_view smiles, shape_reporters_t &reporters, shape_scratch_t &scratch,
                                shape_tally_t &tally) {
@@ -678,8 +645,7 @@ static void check_corpus_line_(std::string_view smiles, shape_reporters_t &repor
     case prepare_outcome_t::prepared_k: break;
     }
 
-    // Each refusal is a corpus line the comparison never reaches rather than a defect, so each is counted
-    // under its own name and the section's `compared=` stays honest about what it saw.
+    // Each refusal is a line the comparison never reaches, not a defect: counted by name, `compared=` honest.
     switch (sfpost::build_shape_context_into(smiles, molecule->getNumAtoms(), smallfield::keep_all_fragments_k,
                                              scratch.context)) {
     case sfpost::shape_typing_t::unparsed_k: ++tally.untyped; return;
@@ -729,8 +695,7 @@ int main(int argc, char **argv) {
     reporters.credo.summarize("credo_builtin");
 
     if (selection.knob == sftest::corpus_knob_t::named_k) {
-        // Naming a corpus is a request to validate against it, so a path that does not open is a failure
-        // rather than an empty run: the sections would otherwise close with nothing compared.
+        // Naming a corpus asks for validation against it, so a path that will not open fails, not runs empty.
         std::vector<std::string> corpus;
         auto const outcome = sftest::load_smiles_into(selection.path, selection.max_molecules, corpus);
         if (outcome != sftest::smiles_load_t::loaded_k)
@@ -742,8 +707,7 @@ int main(int argc, char **argv) {
             sftest::check_credo_typing_(smiles, smallfield::keep_all_fragments_k, reporters, scratch);
         reporters.credo.summarize("credo_corpus");
 
-        // The same corpus and the same oracle, typed from every core the machine offers. Each worker owns its
-        // matchers, so a priming that reached another worker's sets would surface here and nowhere else.
+        // Same corpus and oracle from every core: a priming that reached another worker's matchers shows here.
         int const threads = omp_get_max_threads();
         std::vector<sftest::concurrent_typing_t> typings;
         std::uint64_t const typed_concurrently = sftest::check_credo_typing_concurrently_(
@@ -762,8 +726,7 @@ int main(int argc, char **argv) {
         reporters.usrcat.summarize("usrcat_corpus");
     }
 
-    // The builtin salt closes the separation section last, so that section covers the corpus fragments too and
-    // still compares something when every corpus molecule turned out to be a single fragment.
+    // The builtin salt closes separation last, so it covers corpus fragments and always compares at least one.
     sftest::check_builtin_salt_(reporters, scratch);
     reporters.separation.summarize("fragment_separation");
 

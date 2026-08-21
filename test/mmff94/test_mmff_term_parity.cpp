@@ -2,21 +2,16 @@
  *  @file test/mmff94/test_mmff_term_parity.cpp
  *  @brief Gate per-term MMFF94 energy and gradient parity between the GPU kernel and RDKit.
  *
- *  The total-energy checks elsewhere cannot localize a divergence, and a term that is wrong in one direction can be
- *  masked by another that is wrong in the other. RDKit exposes per-term toggles, so each term is compared in
- *  isolation on identical coordinates, and each term closes its own `compared=` section.
+ *  A total-energy check cannot localize a divergence, and two terms wrong in opposite directions mask each other, so
+ *  RDKit's per-term toggles isolate each term on identical coordinates and each closes its own `compared=` section.
+ *  Both halves are compared: `calcEnergy` answers the kernel's scalar and `calcGrad` its gradient component by
+ *  component, since an energy cannot see a sign error the scalar integrates away and the gradient is what the
+ *  minimizer consumes. Isolation on the native side keeps only one category's offsets and interactions; the
+ *  nonbonded sweep, enumerated on the fly not from a list, is suppressed by marking every pair BFS-unreachable.
  *
- *  Both halves of a term are compared. `calcEnergy` answers the kernel's scalar, and `calcGrad` answers its
- *  gradient component by component: the energy alone cannot see a sign error in a force that the scalar integrates
- *  away, and the gradient is what the minimizer actually consumes.
- *
- *  Isolation on the native side: bonded terms are selected by keeping only that category's offsets and
- *  interactions, and the nonbonded sweep — which is enumerated on the fly rather than from a list — is suppressed
- *  by marking every pair BFS-unreachable.
- *
- *  Coverage is a curated set chosen for the terms most likely to diverge, each scored at its embedded geometry and
- *  again distorted, plus an optional SMILES corpus named by `argv[1]` or by `SMALLFIELD_TEST_CORPUS` and capped by
- *  `argv[2]` or `SMALLFIELD_TEST_MAX_MOLS`. A named corpus that does not open is a failure, never an empty run.
+ *  Coverage is a curated set chosen for the terms most likely to diverge, each scored embedded and again distorted,
+ *  plus an optional SMILES corpus named by `argv[1]` or `SMALLFIELD_TEST_CORPUS` and capped by `argv[2]` or
+ *  `SMALLFIELD_TEST_MAX_MOLS`. A named corpus that does not open is a failure, never an empty run.
  */
 
 #include <cmath>   // `std::fabs`
@@ -62,23 +57,19 @@ static constexpr std::size_t default_max_molecules_k = 200;
 static constexpr float corpus_distortion_k = 0.20f;
 
 /**
- *  @brief Ceiling on one corpus term's disagreement, in parts per million of that term's comparisons.
+ *  @brief Ceiling on one corpus term's disagreement, in parts per million of that term's comparisons. One budget
+ *  covers every term, so none hides a regression behind another's allowance.
  *
- *  The curated set is held to exact agreement; a corpus is not, because the terms are extracted from this
- *  project's own parse of the SMILES while the coordinates come from RDKit's. Atom indexing is fingerprinted
- *  before a molecule is compared at all, so what remains is chemistry the two parses perceive differently.
+ *  The curated set is held to exact agreement; a corpus is not, because the terms come from this project's parse of
+ *  the SMILES while the coordinates come from RDKit's, and indexing is fingerprinted before any comparison, so what
+ *  remains is chemistry the two parses perceive differently. Measured 2026-08-14 over the first 300 SMILES of
+ *  `data/usearch-molecules/example`, 526 of 600 scorings reaching a comparison and 73,282 comparisons per term:
+ *  bond and nonbonded exact, out-of-plane and torsion 123 ppm, stretch-bend 396 ppm, angle 423 ppm — gradient
+ *  components only, no energy — so this budget is five times the worst and an order of magnitude below a regression.
  *
- *  Measured 2026-08-14 over the first 300 SMILES of `data/usearch-molecules/example`, 526 of 600 scorings
- *  reaching a comparison and 73,282 comparisons per term: bond and nonbonded are exact, out-of-plane and
- *  torsion differ at 123 ppm, stretch-bend at 396 ppm and angle at 423 ppm — gradient components only, no
- *  energy — so this budget is roughly five times the worst of them and still an order of magnitude below a
- *  term that has actually regressed.
- *
- *  One budget covers every term. Torsion carried its own at 80,000 ppm, admitting a 47,644 ppm divergence
- *  in which 149 disagreements were energies rather than gradient components; on the same corpus it now
- *  measures 123 ppm, level with out-of-plane. The divergence was fixed and the exception outlived it,
- *  which is what a per-term budget does when nobody re-measures. Triage a rise against
- *  `test_mmff_cpu_port` and the SMILES parser rather than reintroducing one.
+ *  Torsion's own 80,000 ppm exception once admitted a 47,644 ppm divergence, 149 of them energies rather than
+ *  gradient components; it now measures 123 ppm on the same corpus. Triage a rise against `test_mmff_cpu_port` and
+ *  the SMILES parser rather than reintroducing a per-term exception.
  */
 static constexpr double max_corpus_term_mismatch_ppm_k = 2000.0;
 
@@ -86,9 +77,8 @@ namespace smallfield::tests {
 
 #pragma region Coordinate Layouts
 
-/* `smallfield/types/views.hpp` owns the whole extent-inside-the-view vocabulary, matrices and coordinates
-   alike. A layout is a type there rather than an index expression, so handing an atom-major buffer to an
-   axis-major reader stops compiling instead of quietly addressing another atom's coordinates. */
+/* `smallfield/types/views.hpp` owns the extent-inside-the-view vocabulary for matrices and coordinates alike: a
+   layout is a type, so handing an atom-major buffer to an axis-major reader stops compiling. */
 
 using sft::conformer_aos_t;
 using sft::conformer_soa_t;
@@ -129,20 +119,13 @@ static char const *term_name_(term_kind_t kind) {
     }
 }
 
-/**
- *  @brief Fill @p single with @p full, every term but @p kind neutralized.
- *
- *  The per-atom interaction CSR is left exactly as production builds it — rebuilding it
- *  by hand would test the reconstruction rather than the kernel. Excluded bonded terms
- *  are zeroed at their force constants, which contributes neither energy nor gradient.
- *  The nonbonded sweep is enumerated on the fly from the hop matrix rather than from a list,
- *  so it is isolated at the call site instead: the caller hands the kernel a matrix of the
- *  unreachable sentinel for every other term, which the sweep skips pair by pair.
- *
+/** Fill @p single with @p full, every term but @p kind neutralized. The per-atom interaction CSR is left as
+ *  production builds it — rebuilding it by hand would test the reconstruction rather than the kernel. Excluded
+ *  bonded terms are zeroed at their force constants, contributing neither energy nor gradient; the nonbonded sweep
+ *  reads the hop matrix rather than a list, so the caller isolates it with a matrix of the unreachable sentinel.
  *  @param[in] full Prepared molecule carrying every term.
  *  @param[in] kind The one term left intact.
- *  @param[out] single Caller-owned copy, so the assignment reuses its buffers across terms.
- */
+ *  @param[out] single Caller-owned copy, so the assignment reuses its buffers across terms. */
 static void isolate_term_into_(sfp::etkdg_prepared_molecule_t const &full, term_kind_t kind,
                                sfp::etkdg_prepared_molecule_t &single) {
     single = full;
@@ -159,28 +142,22 @@ static void isolate_term_into_(sfp::etkdg_prepared_molecule_t const &full, term_
         for (auto &term : single.mmff_stretchbends) term.kba_ijk = term.kba_kji = 0.0f;
 }
 
-/** Whether RDKit produced a reference for one isolated term, or which stage declined it. */
+/** Whether RDKit produced a reference for one isolated term, or which stage declined it: `MMFFMolProperties`
+ *  came back invalid, or `constructForceField` returned nothing for the enabled term. */
 enum class reference_state_t {
     evaluated_k,
-    /** `MMFFMolProperties` came back invalid, so the molecule has no MMFF94 typing at all. */
     untypable_k,
-    /** `constructForceField` returned nothing for the enabled term. */
     unconstructable_k,
 };
 
-/**
- *  @brief RDKit's MMFF94 energy and gradient with exactly @p kind enabled, at the molecule's coordinates.
- *
- *  The six setters take a `bool` because that is RDKit's API; the answer is derived from `kind` at the call
- *  itself, so the enum is what this file reasons about and the flags exist only across the boundary.
- *  `calcGrad` accumulates, which is why @p gradient arrives zeroed from `reset_coordinates_aos`.
- *
+/** RDKit's MMFF94 energy and gradient with exactly @p kind enabled, at the molecule's coordinates. The six setters
+ *  take a `bool` because that is RDKit's API; the answer is derived from `kind` at the call itself, so the enum is
+ *  what this file reasons about. `calcGrad` accumulates, so @p gradient arrives zeroed from `reset_coordinates_aos`.
  *  @param[inout] molecule Molecule whose conformer is scored; RDKit caches properties on it.
  *  @param[in] kind The one term left enabled.
  *  @param[out] gradient Receives dE/dx per atom, atom-major, as RDKit lays it out.
  *  @param[out] energy Receives the term's energy in kcal/mol; untouched unless `evaluated_k` is returned.
- *  @return Whether a reference was produced.
- */
+ *  @return Whether a reference was produced. */
 static reference_state_t rdkit_single_term_(RDKit::RWMol &molecule, term_kind_t kind, gradient_aos_t gradient,
                                             double &energy) {
     RDKit::MMFF::MMFFMolProperties props(molecule);
@@ -201,21 +178,15 @@ static reference_state_t rdkit_single_term_(RDKit::RWMol &molecule, term_kind_t 
     return reference_state_t::evaluated_k;
 }
 
-/**
- *  @brief Deterministically displace every atom by roughly @p amplitude angstroms.
- *
- *  An RDKit-embedded geometry sits at or near equilibrium, where several MMFF forms
- *  coincide — a linear center at theta = 180 gives the same energy under the quadratic
- *  and the linear bend, so a comparison there cannot tell them apart. Distorting the
- *  geometry moves the terms onto the parts of their curves that actually differ.
- *
+/** Deterministically displace every atom by roughly @p amplitude angstroms. An RDKit-embedded geometry sits near
+ *  equilibrium, where several MMFF forms coincide — at a linear center, theta = 180 gives the same energy under the
+ *  quadratic and the linear bend — so distorting it moves the terms onto the parts of their curves that differ.
  *  @param[inout] positions Coordinates displaced in place; the walk order fixes the sequence.
- *  @param[in] amplitude Half-width of the per-component displacement, in angstroms.
- */
+ *  @param[in] amplitude Half-width of the per-component displacement, in angstroms. */
 static void perturb_(conformer_soa_t positions, float amplitude) {
     std::uint32_t state = 0x9E3779B9u;
-    // The walk is axis-outer because the sequence it draws has to stay what it was; the view is addressed
-    // atom-first, so the two orders differ and only the subscript follows the layout.
+    // Axis-outer so the sequence it draws stays what it was; the view is addressed atom-first, and only the
+    // subscript follows the layout.
     for (std::uint32_t axis = 0; axis < sft::conformer_dimensions_k; ++axis)
         for (std::uint32_t atom = 0; atom < positions.extent(0); ++atom) {
             state = state * 1664525u + 1013904223u;
@@ -231,51 +202,39 @@ static void perturb_(conformer_soa_t positions, float amplitude) {
 /** Whether a case narrates every term it scores, or only the components that disagree. */
 enum class narration_t { silent_k, narrated_k };
 
-/** One comparison: a molecule, and how far its embedded geometry is distorted before scoring. */
+/** One comparison: a molecule, and the angstroms of deterministic per-component displacement applied to its
+ *  embedded geometry before scoring, zero scoring that geometry as it is. */
 struct term_parity_case_t {
     std::string smiles;
-    /** Angstroms of deterministic displacement per component; zero scores the embedded geometry as it is. */
     float perturbation = 0.0f;
 };
 
-/**
- *  @brief Census of the cases that never reached a comparison; the reporters own everything that did.
- *
- *  Counting the comparisons here as well would be two bookkeeping schemes for one fact, so nothing below
- *  duplicates a `compared=` or a `mismatches=`.
- */
+/** Census of the cases that never reached a comparison; the reporters own everything that did, so nothing here
+ *  duplicates a `compared=` or a `mismatches=`. `preprocess_rejected` and `unparsable` are the two parsers refusing
+ *  the SMILES and `embed_failures` is ETKDG leaving no coordinates; `fragment_differs` is preprocessing keeping one
+ *  fragment where RDKit kept the salt; `parses_differ` is the same molecule under two atom indexings; `untypable`
+ *  is RDKit's MMFF94 typing failing, so it can neither fingerprint the indexing nor reference a term.
+ *  `reference_unavailable` and `device_refused` count case-and-term pairs, the latter having written neither energy
+ *  nor gradient; `first_refusal` carries the step of the first, which a count cannot; and `cases_differing` lets a
+ *  rate read per molecule as well as per component. */
 struct intake_tally_t {
     std::uint64_t cases = 0;
-    /** Cases that reached the per-term loop. */
     std::uint64_t compared = 0;
-    /** `prepare_molecule_into` refused the SMILES. */
     std::uint64_t preprocess_rejected = 0;
-    /** RDKit refused the SMILES. */
     std::uint64_t unparsable = 0;
-    /** ETKDG produced no conformer, so there are no coordinates to score. */
     std::uint64_t embed_failures = 0;
-    /** Preprocessing kept one fragment where RDKit kept the salt, so the two describe different atoms. */
     std::uint64_t fragment_differs = 0;
-    /** The two parsers agreed on the molecule and disagreed on the order its atoms are indexed in. */
     std::uint64_t parses_differ = 0;
-    /** RDKit's MMFF94 typing failed, so it can neither fingerprint the indexing nor reference a term. */
     std::uint64_t untypable = 0;
-    /** Case-and-term pairs RDKit declined to reference. */
     std::uint64_t reference_unavailable = 0;
-    /** Case-and-term pairs the device refused a launch for, so no energy or gradient was ever written. */
     std::uint64_t device_refused = 0;
-    /** Which step the first refusal came from, which is the one thing the count cannot carry. */
     mmff_energy_probe_t first_refusal = mmff_energy_probe_t::completed_k;
-    /** Cases carrying at least one disagreement, so a rate reads per molecule as well as per component. */
     std::uint64_t cases_differing = 0;
 };
 
-/**
- *  @brief One diagnostic sink per term, so each closes its own `compared=` section.
- *
- *  A shared sink could not say which term a comparison came from, and a term whose energy is identically
- *  zero across the whole corpus would hide inside another term's count.
- */
+/** One diagnostic sink per term, so each closes its own `compared=` section: a shared sink could not say which
+ *  term a comparison came from, and a term whose energy is identically zero corpus-wide would hide in another's
+ *  count. */
 struct term_reporters_t {
     std::array<diagnostic_reporter_t, term_kind_count_k> per_term {
         diagnostic_reporter_t {"rdkit", "gpu"}, diagnostic_reporter_t {"rdkit", "gpu"},
@@ -288,11 +247,8 @@ struct term_reporters_t {
         for (auto &reporter : per_term) reporter.limit_printed_lines(maximum);
     }
 
-    /**
-     *  @brief Close one section per term, which is also what fails a term that compared nothing.
-     *
-     *  @param[in] sweep Prefixes every subject, so the curated sections and the corpus ones stay distinct.
-     */
+    /** Close one section per term, which is also what fails a term that compared nothing.
+     *  @param[in] sweep Prefixes every subject, so the curated and corpus sections stay distinct. */
     void summarize_terms(std::string_view sweep) {
         for (term_kind_t kind : term_kinds_k) (*this)[kind].summarize(fmt::format("{}_{}", sweep, term_name_(kind)));
     }
@@ -316,16 +272,13 @@ struct term_reporters_t {
     }
 };
 
-/**
- *  @brief Every buffer one case needs, owned by the sweep so the growth phase happens once.
- *
- *  Each is refilled through a `reset_` builder that hands back a view, so no extent here is carried
- *  beside the storage it describes.
- */
+/** Every buffer one case needs, owned by the sweep so the growth phase happens once. Each is refilled through a
+ *  `reset_` builder that hands back a view, so no extent here is carried beside its storage. `isolated` is
+ *  `prepared` with one term left intact, rewritten per term; the two `*_bond_keys` are each parser's sorted bond
+ *  keys, compared once per molecule. */
 struct molecule_scratch_t {
     std::unique_ptr<RDKit::RWMol> molecule;
     sfp::etkdg_prepared_molecule_t prepared;
-    /** `prepared` with one term left intact, rewritten per term. */
     sfp::etkdg_prepared_molecule_t isolated;
     std::vector<float> interleaved;
     std::vector<float> positions;
@@ -333,7 +286,6 @@ struct molecule_scratch_t {
     std::vector<double> rdkit_gradient;
     std::vector<std::uint8_t> bond_hops;
     std::vector<std::uint8_t> unreachable_hops;
-    /** Sorted bond keys from each parser, compared once per molecule. */
     std::vector<std::uint32_t> native_bond_keys;
     std::vector<std::uint32_t> rdkit_bond_keys;
 };
@@ -343,32 +295,24 @@ static std::uint32_t packed_bond_key_(std::uint32_t atom_i, std::uint32_t atom_j
     return (std::min(atom_i, atom_j) << 8) | std::max(atom_i, atom_j);
 }
 
-/** Whether the native parse and RDKit's can be compared atom for atom. */
+/** Whether the native parse and RDKit's can be compared atom for atom: RDKit's MMFF94 typing failed, so there is
+ *  nothing to fingerprint against, or the same molecule arrived under two atom indexings. */
 enum class parse_agreement_t {
     agrees_k,
-    /** RDKit's MMFF94 typing failed, so there is nothing to fingerprint the indexing against. */
     untypable_k,
-    /** The same molecule under a different atom indexing, which no coordinate comparison survives. */
     differs_k,
 };
 
-/**
- *  @brief Whether the native parse and RDKit's describe the same molecule under the same atom indices.
- *
- *  The terms come from `prepare_molecule_into`, which runs this project's own parser, while the coordinates come
- *  from RDKit's, so a comparison means something only where the two agree atom for atom. They do not always
- *  agree: a molecule indexed differently by the two would have its bond, angle and torsion parameters scored
- *  against another atom's position, and the divergence that follows says nothing about the kernel. Two
- *  fingerprints together settle it — the bond set, which pins the topology, and the per-atom partial charge,
- *  which pins each index to an environment. What survives both is a relabeling preserving adjacency and charge,
- *  under which the two term lists are the same list.
- *
+/** Whether the native parse and RDKit's describe the same molecule under the same atom indices. The terms come from
+ *  this project's parser and the coordinates from RDKit's, so a molecule the two index differently would have its
+ *  bond, angle and torsion parameters scored against another atom's position. Two fingerprints settle it — the bond
+ *  set pins the topology and the per-atom partial charge pins each index to an environment — so what survives both
+ *  is a relabeling preserving adjacency and charge, under which the two term lists are the same list.
  *  @param[in] prepared Terms the native parse produced.
  *  @param[inout] molecule RDKit's parse of the same SMILES; typing caches properties on it.
  *  @param[out] native_bond_keys Scratch, refilled with the native bond keys.
  *  @param[out] rdkit_bond_keys Scratch, refilled with RDKit's bond keys.
- *  @return Whether the two indexings agree, or why the question could not be answered.
- */
+ *  @return Whether the two indexings agree, or why the question could not be answered. */
 static parse_agreement_t parses_agree_(sfp::etkdg_prepared_molecule_t const &prepared, RDKit::RWMol &molecule,
                                        std::vector<std::uint32_t> &native_bond_keys,
                                        std::vector<std::uint32_t> &rdkit_bond_keys) {
@@ -403,15 +347,11 @@ static bool gradient_components_agree_(double reference, double observed) {
 /** One field name per axis, so a differing component names itself instead of carrying an index. */
 static constexpr std::string_view gradient_field_names_k[3] = {"gradient_x", "gradient_y", "gradient_z"};
 
-/**
- *  @brief Score one molecule term by term, on one geometry, against RDKit.
- *
- *  @param[in] probe Molecule and distortion to score.
+/** Score one molecule term by term, on one geometry, against RDKit.
  *  @param[in] narration Whether every term's energy prints, or only the components that disagree.
  *  @param[inout] scratch Buffers reused across cases.
  *  @param[inout] reporters Sinks that count and print, one per term.
- *  @param[inout] tally Counters for the cases that never reached a comparison.
- */
+ *  @param[inout] tally Counters for the cases that never reached a comparison. */
 static void compare_case_(term_parity_case_t const &probe, narration_t narration, molecule_scratch_t &scratch,
                           term_reporters_t &reporters, intake_tally_t &tally) {
     ++tally.cases;
@@ -429,16 +369,15 @@ static void compare_case_(term_parity_case_t const &probe, narration_t narration
         ++tally.embed_failures;
         return;
     }
-    // Preprocessing keeps only the largest fragment, so a salt leaves RDKit holding atoms the prepared terms
-    // never describe, and scoring the two against each other would compare different molecules.
+    // Preprocessing keeps only the largest fragment, so a salt leaves RDKit holding atoms the prepared terms never
+    // describe — two different molecules.
     std::uint32_t const num_atoms = scratch.prepared.num_atoms;
     if (molecule.getNumAtoms() != num_atoms) {
         ++tally.fragment_differs;
         return;
     }
-    // Same molecule, and it must also be the same atom indexing: the terms are the native parser's and the
-    // coordinates are RDKit's, so a relabeling between them would score one atom's parameters at another's
-    // position and report a divergence that says nothing about the kernel.
+    // Same molecule is not enough; a relabeling between the native parser's terms and RDKit's coordinates would
+    // score one atom's parameters at another's position.
     parse_agreement_t const agreement = parses_agree_(scratch.prepared, molecule, scratch.native_bond_keys,
                                                       scratch.rdkit_bond_keys);
     if (agreement == parse_agreement_t::untypable_k) {
@@ -464,8 +403,8 @@ static void compare_case_(term_parity_case_t const &probe, narration_t narration
         set_coords_interleaved(molecule, interleaved.data_handle());
     }
 
-    // Production rebuilds the hop matrix on the device, so this single-molecule harness derives it from the
-    // bond list, and hands the sweep an all-unreachable matrix whenever the comparison isolates some other term.
+    // Production rebuilds the hop matrix on the device; this single-molecule harness derives it from the bond list,
+    // and hands the sweep an all-unreachable matrix whenever the comparison isolates some other term.
     auto const bond_hops = sft::reset_square_matrix(scratch.bond_hops, num_atoms, sft::unreachable_hops_k);
     fill_bond_hops_into(scratch.prepared.mmff_bonds, bond_hops);
     auto const unreachable_hops = sft::reset_square_matrix(scratch.unreachable_hops, num_atoms,
@@ -489,8 +428,8 @@ static void compare_case_(term_parity_case_t const &probe, narration_t narration
             .interactions = single.mmff_interactions,
             .atom_offsets = single.mmff_atom_offsets,
         };
-        // A refused launch never writes the gradient, and the buffer is not zeroed first, so a term whose
-        // launch the driver declined would otherwise be scored against RDKit on whatever it held.
+        // A refused launch never writes the gradient and the buffer is not zeroed first, so a declined term would
+        // otherwise be scored against RDKit on whatever it held.
         if (mmff_energy_probe_t const probe = gpu_mmff_energy(scratch.positions, single.num_atoms, terms,
                                                               scratch.gpu_gradient, &gpu_energy);
             probe != mmff_energy_probe_t::completed_k) {
@@ -507,8 +446,8 @@ static void compare_case_(term_parity_case_t const &probe, narration_t narration
             continue;
         }
 
-        // Every curated term prints whether it agrees or not, because the number is what the reader came for;
-        // a corpus sweep narrates nothing and spends its line budget on the components that disagree.
+        // A curated term prints whether it agrees or not, since the number is what the reader came for; a corpus
+        // sweep spends its line budget on the components that disagree.
         if (narration == narration_t::narrated_k)
             reporters[kind]
                 .note("mmff_term", "smiles={} distortion={:.2f} term={}", probe.smiles, probe.perturbation,
@@ -519,9 +458,8 @@ static void compare_case_(term_parity_case_t const &probe, narration_t narration
                       term_name_(kind))
             .field("energy", rdkit_energy, static_cast<double>(gpu_energy), energies_agree_);
 
-        // The two gradients are compared through their own layouts rather than through a shared buffer:
-        // RDKit fills atom-major triples and the kernel fills axis-major planes, but both views are addressed
-        // `(atom, axis)` and the layout supplies the stride, so the two reads look alike and cannot be crossed.
+        // Each gradient is read through its own layout: RDKit fills atom-major triples and the kernel axis-major
+        // planes, yet both views are addressed `(atom, axis)`, so the two reads cannot be crossed.
         for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
             auto group = reporters[kind].mismatch("mmff_term", "smiles={} distortion={:.2f} term={} atom={}",
                                                   probe.smiles, probe.perturbation, term_name_(kind), atom);
@@ -533,29 +471,20 @@ static void compare_case_(term_parity_case_t const &probe, narration_t narration
     if (reporters.mismatch_count() != mismatches_before) ++tally.cases_differing;
 }
 
-/**
- *  @brief Score every case in @p probes.
- *
- *  The loop is deliberately non-short-circuiting: the counters are the output and feed the gate, so a
+/** Score every case in @p probes, non-short-circuiting: the counters are the output and feed the gate, so a
  *  differing molecule is reported and then walked past.
- *
  *  @param[in] probes Cases to score, in order.
  *  @param[in] narration Whether every term's energy prints, or only the components that disagree.
  *  @param[inout] scratch Buffers reused across cases.
  *  @param[inout] reporters Sinks that count and print, one per term.
- *  @param[inout] tally Counters for the cases that never reached a comparison.
- */
+ *  @param[inout] tally Counters for the cases that never reached a comparison. */
 static void sweep_(custd::span<term_parity_case_t const> probes, narration_t narration, molecule_scratch_t &scratch,
                    term_reporters_t &reporters, intake_tally_t &tally) {
     for (auto const &probe : probes) compare_case_(probe, narration, scratch, reporters, tally);
 }
 
-/**
- *  @brief Print what one sweep took in; the comparison counts belong to the terms' own sections.
- *
- *  @param[in] heading Which sweep the counters describe.
- *  @param[in] tally Counters to report.
- */
+/** Print what one sweep took in; the comparison counts belong to the terms' own sections.
+ *  @param[in] heading Which sweep the counters describe. */
 static void report_intake_(std::string_view heading, intake_tally_t const &tally) {
     fmt::println("NOTE intake sweep={} cases={} compared={}"                     //
                  " preprocess_rejected={} unparsable={} embed_failures={}"       //
@@ -570,15 +499,11 @@ static void report_intake_(std::string_view heading, intake_tally_t const &tally
 
 #pragma region Corpora
 
-/**
- *  @brief The molecules every run scores, whatever else the command line names.
- *
- *  Aspirin is the general case; the rest target the terms most likely to diverge — linear centers, and the
- *  double-bond geometry the torsion term reads. The distorted repeats are not redundant: at equilibrium the
- *  quadratic and the linear bend coincide at a linear center, so only a bent geometry tells them apart.
- *
- *  @return One case per scoring, built once at start-up.
- */
+/** The molecules every run scores, whatever else the command line names. Aspirin is the general case; the rest
+ *  target linear centers and the double-bond geometry the torsion term reads. The distorted repeats are not
+ *  redundant: at a linear center the quadratic and the linear bend coincide at equilibrium, so only a bent geometry
+ *  tells them apart.
+ *  @return One case per scoring, built once at start-up. */
 static std::vector<term_parity_case_t> curated_cases_() {
     return {
         {.smiles = "CC(=O)Oc1ccccc1C(=O)O", .perturbation = 0.0f},  // aspirin
@@ -593,12 +518,9 @@ static std::vector<term_parity_case_t> curated_cases_() {
     };
 }
 
-/**
- *  @brief Score every corpus molecule twice, embedded and distorted.
- *
+/** Score every corpus molecule twice, embedded and distorted.
  *  @param[in] corpus SMILES as loaded, in order.
- *  @param[out] probes Cleared, then filled with two cases per SMILES.
- */
+ *  @param[out] probes Cleared, then filled with two cases per SMILES. */
 static void fill_corpus_cases_into_(custd::span<std::string const> corpus, std::vector<term_parity_case_t> &probes) {
     probes.clear();
     probes.reserve(corpus.size() * 2);
@@ -612,16 +534,12 @@ static void fill_corpus_cases_into_(custd::span<std::string const> corpus, std::
 
 #pragma region Verdicts
 
-/**
- *  @brief Close the curated sections and answer with the exit code they decided.
- *
- *  The curated set is chosen rather than sampled, so it is held to exact agreement and to full intake: a
- *  molecule that preprocessing, RDKit or ETKDG drops here is a regression in one of them.
- *
+/** Close the curated sections and answer with the exit code they decided. The curated set is chosen rather than
+ *  sampled, so it is held to exact agreement and to full intake: a molecule that preprocessing, RDKit or ETKDG
+ *  drops here is a regression in one of them.
  *  @param[inout] reporters Sinks the curated sweep reported through.
  *  @param[in] tally What the curated sweep took in.
- *  @return `0` when every curated term agrees, `1` otherwise.
- */
+ *  @return `0` when every curated term agrees, `1` otherwise. */
 static int report_curated_(term_reporters_t &reporters, intake_tally_t const &tally) {
     report_intake_("curated", tally);
     reporters.summarize_terms("curated");
@@ -639,14 +557,11 @@ static int report_curated_(term_reporters_t &reporters, intake_tally_t const &ta
     return 0;
 }
 
-/**
- *  @brief Close the corpus sections and answer with the exit code the budget decided.
- *
+/** Close the corpus sections and answer with the exit code the budget decided.
  *  @param[inout] reporters Sinks the corpus sweep reported through.
  *  @param[in] tally What the corpus sweep took in.
  *  @param[in] path The corpus, named in the failure so the run is reproducible.
- *  @return `0` when the disagreement stays inside the budget, `1` otherwise.
- */
+ *  @return `0` when the disagreement stays inside the budget, `1` otherwise. */
 static int report_corpus_(term_reporters_t &reporters, intake_tally_t const &tally, std::string_view path) {
     report_intake_("corpus", tally);
     if (tally.compared == 0)
@@ -655,10 +570,9 @@ static int report_corpus_(term_reporters_t &reporters, intake_tally_t const &tal
         return report_fail(test_name_k, "the device refused {} corpus terms, first as {}", tally.device_refused,
                            mmff_energy_probe_reason(tally.first_refusal));
 
-    // The sections close here rather than through `summarize`, because on a corpus a disagreement inside
-    // budget is not a failure and the verb at column zero has to agree with the exit code. Every term is
-    // judged against its own budget, so a term that is exact today cannot hide a regression behind torsion's
-    // allowance, and the loop runs to completion because every line of it is the report.
+    // Not through `summarize`: on a corpus a disagreement inside budget is not a failure, and the verb at column
+    // zero has to agree with the exit code. Each term is judged against its own budget so none hides behind
+    // another's allowance, and the loop runs to completion because every line of it is the report.
     std::size_t terms_over_budget = 0;
     for (term_kind_t kind : term_kinds_k) {
         auto const &reporter = reporters[kind];
@@ -706,8 +620,8 @@ int main(int argc, char **argv) {
     if (int const verdict = sftest::report_curated_(curated_reporters, curated); verdict != 0) return verdict;
 
     if (selection.knob == sftest::corpus_knob_t::named_k) {
-        // Naming a corpus is a request to validate against it, so a path that does not open is a failure and
-        // never an empty run that passes because it compared nothing.
+        // Naming a corpus is a request to validate against it, so a path that does not open is a failure, never an
+        // empty run that passes having compared nothing.
         std::vector<std::string> corpus;
         auto const outcome = sftest::load_smiles_into(selection.path, selection.max_molecules, corpus);
         if (outcome != sftest::smiles_load_t::loaded_k)

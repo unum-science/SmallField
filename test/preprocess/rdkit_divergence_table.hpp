@@ -2,15 +2,11 @@
  *  @file test/preprocess/rdkit_divergence_table.hpp
  *  @brief The registry of places where disagreeing with RDKit is the correct answer.
  *
- *  A parity suite has exactly one lever when a comparison fails: widen the tolerance until it stops.
- *  That lever is right when the difference is arithmetic noise and wrong when the reference is the
- *  side that is mistaken, because the widened tolerance then also hides every future regression of
- *  that size. This registry is the second lever. A row names one upstream defect, records what each
- *  implementation says today, and asserts that they still say it -- so a change on either side breaks
- *  the build instead of drifting past a tolerance whose meaning it has quietly spent.
- *
- *  The rows live in a host-only `.cpp` for the same reason `csd_torsion_table.cpp` does: they are
- *  string literals no kernel reads.
+ *  Widening a tolerance until a comparison stops failing is right for arithmetic noise and wrong where the
+ *  reference is the mistaken side, since it also hides every future regression of that size. A row instead
+ *  names one upstream defect, records what each implementation says, and asserts they still say it, so a change
+ *  on either side breaks the build. The rows live in a host-only `.cpp`, for the same reason
+ *  `csd_torsion_table.cpp` does: they are string literals no kernel reads.
  *
  *  @see test/preprocess/test_rdkit_divergences.cpp, which is the whole of this table's contract.
  */
@@ -30,9 +26,8 @@ namespace smallfield::tests {
 /**
  *  @brief What a row's atoms index and what its two recorded values mean.
  *
- *  The kind is the row's whole configuration: it fixes the arity of `atoms`, the meaning and unit of
- *  both value slots, and the measurement that produces them. There is deliberately no second knob
- *  beside it, because every combination a second knob could spell would be one that does not exist.
+ *  The kind is the row's whole configuration: the arity of `atoms`, the meaning and unit of both value slots, and
+ *  the measurement producing them. No second knob sits beside it -- any combination one could spell does not.
  */
 enum class divergence_kind_t : std::uint8_t {
     /** Two bonded atoms; the values are the lower and upper bound in angstroms. */
@@ -41,22 +36,15 @@ enum class divergence_kind_t : std::uint8_t {
     bounds_1_3_k,
     /** Two atoms three bonds apart; the values are the lower and upper bound in angstroms. */
     bounds_1_4_k,
-    /**
-     *  Four atoms of a tetrahedral center; the values are the signed volume its constraint targets
-     *  and the signed volume the implementation actually enforces, both in cubic angstroms.
-     */
+    /** Four atoms of a tetrahedral center; values are the targeted and enforced signed volumes, cubic angstroms. */
     chiral_volume_k,
     /**
-     *  Four atoms of one CSD torsion; the values are `E(phi) - E(0)` in kcal/mol and `dE/dphi` in
-     *  kcal/mol per radian, both at `torsion_probe_dihedral_radians_k` and both for the Fourier
-     *  coefficients the molecule's own matched pattern supplies. The energy slot is the control: a
-     *  gradient defect moves the second value and leaves the first alone.
+     *  Four atoms of one CSD torsion; values are `E(phi) - E(0)` in kcal/mol and `dE/dphi` in kcal/mol per radian,
+     *  both at `torsion_probe_dihedral_radians_k` for the Fourier coefficients the molecule's matched pattern
+     *  supplies. The energy slot is the control: a gradient defect moves the second value and leaves the first.
      */
     torsion_preference_k,
-    /**
-     *  Two atoms; the values are the lower and upper bound in angstroms after triangle smoothing, with
-     *  both smoothers handed one identical unsmoothed matrix so the smoothing is the only difference.
-     */
+    /** Two atoms; bounds in angstroms after triangle smoothing of one identical unsmoothed matrix per side. */
     smoothing_consistency_k,
 };
 
@@ -73,17 +61,17 @@ struct divergence_kind_traits_t {
 /**
  *  @brief The name, the two slot names and the atom arity belonging to @p kind.
  *
- *  Exhaustive over `divergence_kind_t` and carrying no `default:`, so a kind appended to that enum is a
- *  `-Wswitch` warning here rather than three wrong labels inherited in silence. All three travel
- *  together because a kind fixes all three at once, and a row mislabelled in one is mislabelled in all.
+ *  Exhaustive over `divergence_kind_t` and carrying no `default:`, so a kind appended to that enum raises a
+ *  `-Wswitch` warning here rather than inheriting three wrong labels in silence. All three travel together
+ *  because a kind fixes all three at once, and a row mislabelled in one is mislabelled in all.
  */
 divergence_kind_traits_t divergence_kind_traits(divergence_kind_t kind) noexcept;
 
 /**
  *  @brief An RDKit release, as the `YYYYMM` its version string opens with.
  *
- *  Comparable as an integer, so "at or below the installed release" is one `<=`. `not_yet_fixed_k` is
- *  a named state rather than a large number, and every consumer tests for it by name before comparing.
+ *  Comparable as an integer, so "at or below the installed release" is one `<=`. `not_yet_fixed_k` is a named
+ *  state rather than a large number, and every consumer tests for it by name before comparing.
  */
 enum class rdkit_release_t : std::uint32_t {
     /** No release has corrected this yet, which is what makes the row an assertion rather than a note. */
@@ -112,11 +100,10 @@ enum class divergence_expectation_t : std::uint8_t {
 /**
  *  @brief One place where SmallField and RDKit disagree and SmallField is right.
  *
- *  Everything a row carries is either measurable or a citation, and the test re-measures all of it on
- *  every run. `rdkit_values` and `our_values` are the two sides as last recorded; `rdkit_tolerance`
- *  and `our_tolerance` are how far each side may drift before the row is stale; `divergence_threshold`
- *  is how far apart they must stay before the row is retired. A row whose threshold sits inside the
- *  sum of its two tolerances is refused at load, because such a row is a coin toss rather than a test.
+ *  Everything a row carries is either measurable or a citation, and the test re-measures all of it every run.
+ *  `rdkit_values` and `our_values` are the two sides as last recorded, `rdkit_tolerance` and `our_tolerance` how
+ *  far each may drift before the row is stale, and `divergence_threshold` how far apart they must stay.
+ *  A row whose threshold sits inside the sum of its tolerances is refused at load: it is a coin toss.
  */
 struct rdkit_divergence_row_t {
     /** Molecule the row is measured on. Points into static storage, so it outlives every caller. */
@@ -153,8 +140,6 @@ custd::span<rdkit_divergence_row_t const> rdkit_divergence_rows();
 
 /**
  *  @brief Whether @p row is still asserted as a disagreement against the installed RDKit.
- *
- *  @param[in] row Registry row to place.
  *  @param[in] installed_release_code `YYYYMM` of the linked RDKit, from `rdkit_release_code_from_version`.
  *  @return Which of the three assertions the test should make about this row.
  */

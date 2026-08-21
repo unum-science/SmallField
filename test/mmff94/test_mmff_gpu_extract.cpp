@@ -2,8 +2,8 @@
  *  @file test/mmff94/test_mmff_gpu_extract.cpp
  *  @brief Compare the GPU MMFF term extractor against the CPU native extractor.
  *
- *  Runs a batch of drug-like SMILES through both paths. Byte identity is required for every bonded
- *  term of every molecule where the GPU typer flagged success, meaning `typing_status == 0`.
+ *  Runs a batch of drug-like SMILES through both paths, requiring byte identity for every bonded term of every
+ *  molecule the GPU typer flagged as success, meaning `typing_status == 0`.
  */
 
 #include <cstddef> // `std::size_t`
@@ -53,13 +53,9 @@ namespace smallfield::tests {
 /** How many mismatching fields any one section prints before the rest are only counted. */
 static constexpr std::size_t max_printed_lines_k = 32;
 
-/**
- *  @brief The drug-like smoke set every run compares, whether or not a corpus is named.
- *
- *  Small enough to keep a bare `ctest` under a second, and wide enough to reach every term class:
- *  an ester, three fused or substituted aromatics, a formal charge, an aromatic cation, an ether
- *  ring, and a strained ring whose angles no other member exercises.
- */
+/** The drug-like smoke set every run compares, whether or not a corpus is named. Small enough to keep a bare
+ *  `ctest` under a second, wide enough to reach every term class: an ester, three fused or substituted aromatics, a
+ *  formal charge, an aromatic cation, an ether ring, and a strained ring no other member's angles exercise. */
 static constexpr std::string_view builtin_smiles_k[] = {
     "CC(=O)OC1=CC=CC=C1C(=O)O",      // aspirin
     "CN1C=NC2=C1C(=O)N(C(=O)N2C)C",  // caffeine
@@ -72,12 +68,9 @@ static constexpr std::string_view builtin_smiles_k[] = {
     "c1ccc2[nH]ccc2c1",              // indole
 };
 
-/**
- *  @brief What one molecule's fixed-stride staging slot costs, whatever the molecule holds.
- *
- *  The numerator of the compaction ratio the run reports: staging is sized for the worst molecule
- *  the bounds admit, while the packed arrays cost what the batch actually produced.
- */
+/** What one molecule's fixed-stride staging slot costs, whatever the molecule holds — the numerator of the
+ *  compaction ratio the run reports, staging being sized for the worst molecule the bounds admit while the packed
+ *  arrays cost what the batch actually produced. */
 static constexpr std::size_t staged_bytes_per_molecule_k =
     sft::max_mmff_bonds_per_mol_k * sizeof(sft::mmff94_bond_t) +
     sft::max_mmff_angles_per_mol_k * sizeof(sft::mmff94_angle_t) +
@@ -86,24 +79,20 @@ static constexpr std::size_t staged_bytes_per_molecule_k =
     sft::max_mmff_stretchbends_per_mol_k * sizeof(sft::mmff94_stretchbend_t) +
     sft::max_mmff_interactions_per_mol_k * sizeof(sft::mmff94_atom_interaction_t);
 
-/**
- *  @brief One batch of molecules beside every array the GPU pipeline wrote for it.
- *
- *  Each per-molecule array is strided by its own `max_..._per_mol_k` ceiling, so a molecule's slot
- *  is reached through a named accessor rather than through the same index expression written out at
- *  each use. The arrays are sized once, by `resize_staging`, and reused for the whole run.
- */
+/** One batch of molecules beside every array the GPU pipeline wrote for it. Each per-molecule array is strided by
+ *  its own `max_..._per_mol_k` ceiling, so a slot is reached through a named accessor rather than the same index
+ *  expression written out at each use, and the arrays are sized once by `resize_staging`. `descriptors` holds one
+ *  entry per molecule that parsed, `first_atoms` each molecule's first atom in the batch-global array, and
+ *  `total_atoms` the batch total the CSR arrays are sized by; `counts` is the extractor's per-molecule term counts
+ *  and `typing_status` is zero exactly where the GPU typer accepted the molecule; `staged_atom_offsets` numbers
+ *  each atom's CSR offsets from zero inside its own molecule's slot, and `packed` is what compaction emitted for
+ *  the same batch, with batch-global offsets. */
 struct extract_batch_t {
-    /** One entry per molecule that parsed and yielded a descriptor. */
     std::vector<sft::molecule_descriptor_t> descriptors;
-    /** Index of each molecule's first atom in the batch-global atom array. */
     std::vector<std::uint32_t> first_atoms;
-    /** Atoms across the whole batch, which is what the CSR arrays are sized by. */
     std::uint32_t total_atoms = 0;
 
-    /** Per-molecule term counts the extractor reports. */
     std::vector<sfmmff::mmff94_per_mol_counts_t> counts;
-    /** Zero exactly where the GPU typer accepted the molecule. */
     std::vector<std::uint8_t> typing_status;
     std::vector<sft::mmff94_bond_t> bonds;
     std::vector<sft::mmff94_angle_t> angles;
@@ -111,9 +100,7 @@ struct extract_batch_t {
     std::vector<sft::mmff94_oop_t> oops;
     std::vector<sft::mmff94_stretchbend_t> stretch_bends;
     std::vector<sft::mmff94_atom_interaction_t> interactions;
-    /** Per-atom CSR offsets, each numbered from zero inside its own molecule's slot. */
     std::vector<sft::mmff94_atom_offsets_t> staged_atom_offsets;
-    /** What the compaction pass emitted for the same batch, with batch-global offsets. */
     mmff94_packed_host_result_t packed;
 
     std::uint32_t num_molecules() const noexcept { return static_cast<std::uint32_t>(descriptors.size()); }
@@ -156,15 +143,11 @@ struct extract_batch_t {
     }
 };
 
-/**
- *  @brief Parse each SMILES, add hydrogens, and append every molecule that yields a descriptor.
- *
- *  A molecule RDKit refuses, or one past the batch's atom ceiling, is dropped without a diagnostic:
- *  a convenience corpus is a sample, and this test gates the extractor rather than the parser.
- *
+/** Parse each SMILES, add hydrogens, and append every molecule that yields a descriptor. A molecule RDKit refuses,
+ *  or one past the batch's atom ceiling, is dropped without a diagnostic: a convenience corpus is a sample, and
+ *  this test gates the extractor rather than the parser.
  *  @param[in] smiles_list SMILES to parse, in order.
- *  @param[out] batch Descriptors, first-atom indices, and the batch atom total; all three cleared first.
- */
+ *  @param[out] batch Descriptors, first-atom indices, and the batch atom total; all three cleared first. */
 static void fill_descriptors_into_(std::vector<std::string> const &smiles_list, extract_batch_t &batch) {
     batch.descriptors.clear();
     batch.first_atoms.clear();
@@ -187,8 +170,8 @@ static void fill_descriptors_into_(std::vector<std::string> const &smiles_list, 
         catch (...) {
             continue; // parsing, sanitization, or hydrogen addition threw
         }
-        // A sample ceiling shared with the sibling MMFF tests, well under the descriptor's own
-        // capacity: this gates the extractor on drug-like input rather than on the atom limit.
+        // A sample ceiling shared with the sibling MMFF tests, well under the descriptor's capacity: this gates
+        // the extractor on drug-like input rather than on the atom limit.
         if (molecule->getNumAtoms() > 128) continue;
         auto &descriptor = batch.descriptors.emplace_back();
         if (sft::build_descriptor(*molecule, descriptor) != sft::conformer_status_t::success_k) {
@@ -204,12 +187,9 @@ static void fill_descriptors_into_(std::vector<std::string> const &smiles_list, 
 
 #pragma region Comparisons
 
-/**
- *  @brief One reporter per compared section, so every section closes with its own `compared=` count.
- *
- *  A single reporter cannot serve them all: `summarize` closes the span since the previous call, and
- *  these sections are interleaved -- every molecule contributes to each of them in turn.
- */
+/** One reporter per compared section, so every section closes with its own `compared=` count. A single reporter
+ *  cannot serve them all: `summarize` closes the span since the previous call, and these sections are interleaved,
+ *  every molecule contributing to each in turn. */
 struct extract_reporters_t {
     diagnostic_reporter_t term_count {"cpu", "gpu"};
     diagnostic_reporter_t bond {"cpu", "gpu"};
@@ -247,15 +227,13 @@ struct extract_reporters_t {
     }
 };
 
-/** What became of one molecule; the four states partition the batch. */
+/** What became of one molecule; the four states partition the batch. A mismatch is at least one field disagreeing,
+ *  or the term counts disagreeing so the arrays could not be walked at all; a typer refusal means the GPU never
+ *  extracted terms, and an extractor refusal means the CPU offers no reference to hold the GPU to. */
 enum class molecule_outcome_t {
-    /** Every compared field agreed. */
     matched_k,
-    /** At least one field disagreed, or the term counts did and the arrays could not be walked. */
     mismatched_k,
-    /** The GPU typer refused it, so it never extracted terms to compare. */
     typer_refused_k,
-    /** The CPU extractor refused it, so there is no reference to hold the GPU to. */
     extractor_refused_k,
 };
 
@@ -280,12 +258,8 @@ struct extract_tally_t {
     std::uint32_t skipped() const noexcept { return typer_refused + extractor_refused; }
 };
 
-/**
- *  @brief Compare the five per-molecule term counts, returning how many of them disagree.
- *
- *  Term arrays of different lengths cannot be walked in step, so a caller that sees a non-zero
- *  answer must stop rather than index into them.
- */
+/** Compare the five per-molecule term counts, returning how many of them disagree. Term arrays of different lengths
+ *  cannot be walked in step, so a caller seeing a non-zero answer must stop rather than index into them. */
 static std::size_t compare_term_counts_(diagnostic_reporter_t &reporter, std::uint32_t molecule_index,
                                         sfp::etkdg_prepared_molecule_t const &cpu_reference,
                                         sfmmff::mmff94_per_mol_counts_t const &gpu_counts) {
@@ -299,10 +273,9 @@ static std::size_t compare_term_counts_(diagnostic_reporter_t &reporter, std::ui
     return molecule.reported_field_count();
 }
 
-/*  Each comparison below walks one term array of one molecule and answers with the number of terms
- *  that differ in any field. The loops are deliberately non-short-circuiting: their counts are what
- *  the molecule verdict and the section's `compared=` line are built from, and stopping at the first
- *  bad term would understate both. */
+/*  Each comparison below walks one term array of one molecule and answers with the number of terms differing in any
+ *  field. The loops are non-short-circuiting: their counts build the molecule verdict and the section's `compared=`
+ *  line, and stopping at the first bad term would understate both. */
 
 static std::size_t compare_bonds_(diagnostic_reporter_t &reporter, std::uint32_t molecule_index,
                                   std::vector<sft::mmff94_bond_t> const &cpu_terms,
@@ -400,13 +373,9 @@ static std::size_t compare_stretch_bends_(diagnostic_reporter_t &reporter, std::
     return mismatching_terms;
 }
 
-/**
- *  @brief Compare the per-atom CSR term counts, returning how many atoms disagree.
- *
- *  Both sides number their offsets from zero within the molecule, so the counts rather than the
- *  offsets are what carries across. Per-atom ordering is deterministic on both sides: atoms are
- *  walked in index order and term types in bond, angle, torsion, oop, stretch-bend order.
- */
+/** Compare the per-atom CSR term counts, returning how many atoms disagree. Both sides number their offsets from
+ *  zero within the molecule, so the counts carry across rather than the offsets, and ordering is deterministic on
+ *  both: atoms in index order, term types in bond, angle, torsion, oop, stretch-bend order. */
 static std::size_t compare_csr_counts_(diagnostic_reporter_t &reporter, std::uint32_t molecule_index,
                                        std::uint32_t num_atoms,
                                        std::vector<sft::mmff94_atom_offsets_t> const &cpu_offsets,
@@ -431,13 +400,9 @@ static bool slices_equal_(void const *staged, void const *packed_slice, std::siz
     return std::memcmp(staged, packed_slice, bytes) == 0;
 }
 
-/**
- *  @brief Check the compaction pass, returning how many of its fields disagree.
- *
- *  The staged slices are already known good against the CPU by the time this runs, so compaction is
- *  correct exactly when the packed arrays reproduce them byte for byte at the metadata-declared
- *  offsets, with every CSR start shifted into the batch-global interaction array.
- */
+/** Check the compaction pass, returning how many of its fields disagree. The staged slices are already known good
+ *  against the CPU by the time this runs, so compaction is correct exactly when the packed arrays reproduce them
+ *  byte for byte at the declared offsets, every CSR start shifted into the batch-global interaction array. */
 static std::size_t compare_packed_layout_(diagnostic_reporter_t &reporter, extract_batch_t const &batch,
                                           std::uint32_t molecule_index) {
     auto const &gpu_counts = batch.counts[molecule_index];
@@ -505,16 +470,12 @@ static std::size_t compare_packed_layout_(diagnostic_reporter_t &reporter, extra
     return layout.reported_field_count();
 }
 
-/**
- *  @brief Cross-validate one molecule's staged and packed GPU terms against the CPU extractor.
- *
+/** Cross-validate one molecule's staged and packed GPU terms against the CPU extractor.
  *  @param[inout] reporters One section per term class; each accumulates this molecule's fields.
  *  @param[in] tables MMFF94 parameter tables the CPU reference reads.
  *  @param[in] batch The staged batch, holding both the descriptors and everything the GPU wrote.
- *  @param[in] molecule_index Which molecule of the batch to compare.
  *  @param[inout] cpu_reference Scratch the CPU extractor refills; hoisted so it grows once per run.
- *  @return Which of the four buckets this molecule falls in.
- */
+ *  @return Which of the four buckets this molecule falls in. */
 static molecule_outcome_t compare_molecule_(extract_reporters_t &reporters, sfparam::mmff94_tables_view_t const &tables,
                                             extract_batch_t const &batch, std::uint32_t molecule_index,
                                             sfp::etkdg_prepared_molecule_t &cpu_reference) {
@@ -547,13 +508,9 @@ static molecule_outcome_t compare_molecule_(extract_reporters_t &reporters, sfpa
 
 #pragma region Reporting
 
-/**
- *  @brief Print what the batch cost staged against packed, and how much of it took the fallback.
- *
- *  The staging arrays are fixed-stride, so their cost is the same for every molecule; the packed
- *  arrays cost what the batch actually holds. Both numbers are per molecule, so the ratio between
- *  them is the compaction win.
- */
+/** Print what the batch cost staged against packed, and how much of it took the fallback. The staging arrays are
+ *  fixed-stride so every molecule costs the same, while the packed arrays cost what the batch holds; both numbers
+ *  are per molecule, so the ratio between them is the compaction win. */
 static void report_footprint_(extract_batch_t const &batch, extract_tally_t const &tally) {
     std::size_t const packed_bytes = batch.packed.bonds.size() * sizeof(sft::mmff94_bond_t) +
                                      batch.packed.angles.size() * sizeof(sft::mmff94_angle_t) +
@@ -606,8 +563,8 @@ int main(int argc, char **argv) {
     fmt::println("batch: {} molecules, {} total atoms", fmt::group_digits(batch.num_molecules()),
                  fmt::group_digits(batch.total_atoms));
 
-    // Zero is the typer's verdict for a molecule it accepted, so a refused launch would leave the status
-    // array claiming the whole batch was typed and every comparison below would run on stale staging.
+    // Zero is the typer's verdict for a molecule it accepted, so a refused launch would leave the status array
+    // claiming the whole batch was typed and every comparison would run on stale staging.
     auto const probe = sftest::launch_mmff94_gpu_extract_pipeline(
         tables_host, batch.descriptors, batch.first_atoms, batch.counts, batch.typing_status, batch.bonds, batch.angles,
         batch.torsions, batch.oops, batch.stretch_bends, batch.interactions, batch.staged_atom_offsets, batch.packed);
@@ -615,8 +572,8 @@ int main(int argc, char **argv) {
         return sftest::report_fail(test_name_k, "the device refused the extraction pipeline: {}",
                                    sftest::extract_probe_reason(probe));
 
-    // The CPU reference comes from `extract_mmff94_params_fully_native`, one molecule at a time. The
-    // sweep is deliberately non-short-circuiting: every molecule feeds the section counts below.
+    // The CPU reference comes from `extract_mmff94_params_fully_native`, one molecule at a time; the sweep is
+    // non-short-circuiting, since every molecule feeds the section counts below.
     sftest::extract_reporters_t reporters;
     reporters.limit_printed_lines(sftest::max_printed_lines_k);
     sftest::extract_tally_t tally;
