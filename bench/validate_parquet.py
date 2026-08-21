@@ -77,6 +77,7 @@ class CrossValidation:
 
 
 def parse_args() -> argparse.Namespace:
+    """The validator's command line: the shard directory, the cross-check sample count, and a shard cap."""
     parser = argparse.ArgumentParser(description="Validate SmallField output parquet-shards.")
     parser.add_argument(
         "--input",
@@ -242,6 +243,7 @@ def cross_validation_passed(result: CrossValidation) -> bool:
 
 
 def render_aggregate_table(stats: ShardStats) -> None:
+    """Print the shard totals, and the energy percentiles and range when any energy survived."""
     table = Table(title=f"Aggregate stats — {thousands(stats.num_shards)} shards", show_header=False)
     table.add_column("metric", style="bold")
     table.add_column("value", justify="right")
@@ -260,6 +262,7 @@ def render_aggregate_table(stats: ShardStats) -> None:
 
 
 def render_cross_validation_table(result: CrossValidation) -> None:
+    """Print the sample's comparison counts, and the signed delta percentiles when any delta survived."""
     if result.skipped:
         log.warn("RDKit not available; cross-validation skipped")
         return
@@ -289,6 +292,7 @@ def render_cross_validation_table(result: CrossValidation) -> None:
 
 
 def main() -> int:
+    """Check the schema, print the aggregate and cross-validation tables, and return the exit code they earn."""
     args = parse_args()
 
     shards = find_shards(args.input, args.shard_limit)

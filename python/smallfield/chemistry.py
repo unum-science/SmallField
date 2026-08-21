@@ -5,8 +5,6 @@ Imports RDKit lazily: a validator that only checks a schema must still run witho
 
 from __future__ import annotations
 
-from typing import Optional
-
 
 def parent_with_hydrogens(smiles: str):
     """The molecule the pipeline actually embedded: largest fragment, then explicit hydrogens.

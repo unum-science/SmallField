@@ -24,8 +24,6 @@ from __future__ import annotations
 
 import argparse
 import multiprocessing as mp
-import os
-import sys
 from pathlib import Path
 from typing import Iterator, List, Tuple
 
@@ -108,6 +106,10 @@ def convert_smi_to_parquet(
     pool = mp.Pool(workers) if workers > 1 else None
 
     def flush_batch(start_row: int, identifiers: List[str], smiles: List[str]):
+        """Write the shard covering ``identifiers`` and ``smiles`` from ``start_row``, or queue it for the pool.
+
+        A queued task keeps its rows resident until the pool is drained after the last batch.
+        """
         end_row = start_row + len(identifiers)
         task = (output_dir, start_row, end_row, identifiers, smiles, compression)
         if pool is None:
@@ -138,6 +140,10 @@ def convert_smi_to_parquet(
 
 
 def main() -> int:
+    """Parse the command line, run `convert_smi_to_parquet`, and return the process exit code.
+
+    ``--compression none`` becomes ``None`` rather than the string, which is how PyArrow spells uncompressed.
+    """
     parser = argparse.ArgumentParser(
         description="Convert a SMILES file into Parquet shards for smallfield_batch.",
     )

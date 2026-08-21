@@ -218,6 +218,31 @@ check_redundant_brief() {
         "$file puts @brief on a one-line doc block - drop it, the sentence is the brief:"
 }
 
+# A `/** */` block documents the declaration under it, so two in a row with nothing between means the
+# first documents nothing and whatever it described lost its documentation. That is what inserting a new
+# block directly after a closing `*/` does, and the symbol it orphans is usually the one the reader came
+# for. A `/* */` block ahead of a `/** */` is the opposite and correct: prose that documents no symbol.
+#
+# Alone among these checks this reads the whole staged file rather than the added lines. The inserted
+# block is what breaks the block above it, and that one is unchanged context, so a diff of added lines
+# never holds the pair. The tree is clean of this today, so whole-file reading costs no legacy noise.
+check_orphaned_doc_blocks() {
+    local orphans
+    orphans=$(git show ":$file" 2>/dev/null | awk '
+        {
+            if (closed && $0 ~ /^[[:space:]]*$/) next
+            if (closed && $0 ~ /^[[:space:]]*\/\*\*/)
+                print "    the block closing at line " closed " documents nothing; another opens at " NR
+            if ($0 ~ /^[[:space:]]*\/\*\*/) { doxygen = 1; inside = 1 }
+            else if ($0 ~ /^[[:space:]]*\/\*[^*]/) { doxygen = 0; inside = 1 }
+            if (inside && $0 ~ /\*\/[[:space:]]*$/) { closed = (doxygen ? NR : 0); inside = 0; next }
+            closed = 0
+        }' || true)
+    [ -z "$orphans" ] || fail "$orphans" \
+        "$file leaves a doc block with no declaration under it - a second /** opens first, so the" \
+        "            symbol the earlier block described is now undocumented:"
+}
+
 # A // comment at column zero sits outside every function body, where it is either documentation or
 # a section banner. Documentation is /** ... */, prose that documents no symbol is /* ... */, and a
 # section is named by #pragma region. Body comments are indented and so are never matched here.
@@ -778,6 +803,7 @@ while IFS= read -r -d '' file; do
         check_doxygen_symbol_markup
         check_sentence_spacing
         check_redundant_brief
+        check_orphaned_doc_blocks
         check_scope_comments
         check_backtick_math
         check_region_dashes

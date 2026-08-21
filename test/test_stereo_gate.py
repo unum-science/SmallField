@@ -44,12 +44,14 @@ def report_of(
 
 
 def within_budget(report: FidelityReport) -> bool:
+    """`shard_is_within_budget` under the three shipped ceilings, so a case varies only its ``report``."""
     return shard_is_within_budget(
         report, SHARD_CHIRAL_INVERSION_LIMIT, SHARD_EZ_INVERSION_LIMIT, GEOMETRY_UNUSABLE_LIMIT
     )
 
 
 def test_clean_shard_passes():
+    """Nothing inverted on a draw large enough to answer passes, so a gate refusing every run cannot read as correct."""
     assert within_budget(report_of())
 
 
@@ -76,10 +78,14 @@ def test_unusable_geometry_cannot_buy_a_clean_rate():
 
 
 def test_no_row_scored_is_a_failure():
+    """No row reaching the scorer fails, since the declared counts alone would otherwise carry a verdict."""
     assert not within_budget(report_of(rows_scored=0))
 
 
 def test_missing_rdkit_is_a_skip_not_a_verdict():
+    """RDKit absent leaves both verdicts true on a report that would otherwise fail, since an instrument
+    that never ran can neither convict the pipeline nor clear it.
+    """
     report = report_of(chiral_declared=695, chiral_inverted=159)
     report.skipped = True
     assert within_budget(report)
@@ -87,12 +93,18 @@ def test_missing_rdkit_is_a_skip_not_a_verdict():
 
 
 def test_control_still_refuses_a_broken_instrument():
+    """A control past `CONTROL_INVERSION_LIMIT` fails beside a clean shard, since RDKit scoring its own
+    geometry has no way to invert but a miscounting harness does.
+    """
     report = report_of()
     report.control_chiral.inverted = int(report.control_chiral.declared * CONTROL_INVERSION_LIMIT / 100.0) + 1
     assert not control_is_sound(report)
 
 
 def test_control_scoring_nothing_is_a_failure():
+    """A control that scored no molecule fails, since one proving nothing renders the same clean 0.000 %
+    as one proving the harness sound.
+    """
     report = report_of()
     report.control_chiral.molecules = 0
     assert not control_is_sound(report)

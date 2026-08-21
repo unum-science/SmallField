@@ -34,6 +34,7 @@ _theme = Theme(
 
 
 def _format_elapsed(seconds: float) -> str:
+    """Render ``seconds`` as ``HH:MM:SS``, with hours unbounded so a run past a day keeps counting up."""
     total = int(seconds)
     return f"{total // 3600:02}:{(total // 60) % 60:02}:{total % 60:02}"
 
@@ -56,28 +57,38 @@ class Logger:
     err_console: Console = field(default_factory=lambda: Console(theme=_theme, stderr=True))
 
     def timestamp_prefix(self) -> str:
+        """The ``[wall clock | +elapsed]`` prefix every line carries, elapsed measured from `start_time`."""
         wall = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         elapsed = _format_elapsed(time.monotonic() - self.start_time)
         return f"[{wall} | +{elapsed}]"
 
     def _emit(self, console: Console, style: str, message: str, *args: Any) -> None:
+        """Print the prefixed ``message`` to ``console`` in the `rich` theme entry named by ``style``.
+
+        ``args`` are applied with ``str.format`` and only when non-empty, so a lone message keeps its braces.
+        """
         text = message.format(*args) if args else message
         console.print(f"{self.timestamp_prefix()} [{style}]{text}[/]")
 
     def info(self, message: str, *args: Any) -> None:
+        """Emit ``message`` formatted with ``args`` at info level, on stdout."""
         self._emit(self.console, "info", message, *args)
 
     def warn(self, message: str, *args: Any) -> None:
+        """Emit ``message`` formatted with ``args`` at warning level, on stderr."""
         self._emit(self.err_console, "warn", message, *args)
 
     def error(self, message: str, *args: Any) -> None:
+        """Emit ``message`` formatted with ``args`` at error level, on stderr."""
         self._emit(self.err_console, "error", message, *args)
 
     def trace(self, message: str, *args: Any) -> None:
+        """Emit ``message`` formatted with ``args`` on stdout, only once `verbose_level` reaches 1."""
         if self.verbose_level >= 1:
             self._emit(self.console, "trace", message, *args)
 
     def trace2(self, message: str, *args: Any) -> None:
+        """Emit ``message`` formatted with ``args`` on stdout, only once `verbose_level` reaches 2."""
         if self.verbose_level >= 2:
             self._emit(self.console, "trace2", message, *args)
 

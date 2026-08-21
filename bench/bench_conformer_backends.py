@@ -21,6 +21,7 @@ log = Logger()
 
 
 def parse_args() -> argparse.Namespace:
+    """The benchmark's command line: input corpus, conformer count, GPU list, and the per-system skips."""
     parser = argparse.ArgumentParser(
         description="Side-by-side conformer-generation benchmark (RDKit / SmallField / nvMolKit)."
     )
@@ -92,6 +93,7 @@ class Result:
     def record(
         self, wall_seconds: float, num_success: int, num_target: int, num_molecules: int, note: str = ""
     ) -> None:
+        """Store one system's timing and counts, deriving both rates from ``wall_seconds``, which may be zero."""
         self.wall_seconds = wall_seconds
         self.molecules_per_second = num_molecules / wall_seconds if wall_seconds > 0 else 0.0
         self.conformers_per_second = num_success / wall_seconds if wall_seconds > 0 else 0.0
@@ -101,6 +103,7 @@ class Result:
 
 
 def bench_rdkit(smiles: List[str], num_conformers: int, random_seed: int) -> Result:
+    """Time pure RDKit — ETKDGv3 across every core, then MMFF94 on the molecules that embedded."""
     from rdkit.Chem import AllChem, rdDistGeom
 
     result = Result("RDKit (CPU, OpenMP)")
@@ -126,6 +129,7 @@ def bench_rdkit(smiles: List[str], num_conformers: int, random_seed: int) -> Res
 
 
 def bench_smallfield(smiles: List[str], num_conformers: int, random_seed: int, gpu_ids: List[int]) -> Result:
+    """Time SmallField on ``gpu_ids``, after a warm-up call that keeps device init out of the measurement."""
     import smallfield.api as smallfield
 
     result = Result("SmallField (GPU)")
@@ -160,6 +164,7 @@ def bench_nvmolkit(
     gpu_ids: List[int],
     chunk_size: int,
 ) -> Result:
+    """Time RDKit + nvMolKit in chunks of ``chunk_size``, counting the chunks its embedder aborts."""
     from rdkit import Chem
     from rdkit.Chem import rdDistGeom
     from nvmolkit.embedMolecules import EmbedMolecules
@@ -202,6 +207,7 @@ def bench_nvmolkit(
 
 
 def render_results_table(results: Iterable[Result]) -> None:
+    """Print one row per system — wall clock, both rates and success share — with a skipped one shown as dashes."""
     table = Table(title="Conformer-generation benchmark", show_header=True, header_style="bold")
     table.add_column("System")
     table.add_column("Wall (s)", justify="right")
@@ -249,6 +255,7 @@ def selected_systems(args: argparse.Namespace, smiles: List[str], gpu_ids: List[
 
 
 def main() -> int:
+    """Run every system the flags left enabled, print the table, and return non-zero if any of them failed."""
     args = parse_args()
     gpu_ids: List[int] = [int(entry) for entry in args.gpus.split(",") if entry.strip()]
 

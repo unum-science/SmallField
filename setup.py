@@ -116,20 +116,32 @@ boost_libraries = ["boost_serialization", "boost_iostreams"]
 
 
 class BuildExt(build_ext):
+    """`build_ext` that will not compile the binding until the CMake libraries it links against exist."""
+
     def finalize_options(self):
+        """Move intermediate objects beside the CMake tree they link against, out of setuptools' own ``build/``.
+
+        A private build directory is then private for the whole build, not only for the library it resolves.
+        """
         super().finalize_options()
-        # Objects land beside the CMake tree they link against rather than under setuptools' own
-        # `build/`, so a private build directory is private for the whole build and not only for
-        # the library it resolves.
         self.build_temp = os.path.join(smallfield_build_dir, os.path.basename(self.build_temp))
 
     def build_extensions(self):
-        # The extension is one `.cpp` against a library CMake has already built, so the only thing
-        # this adds to the base class is making sure that library exists.
+        """Compile the extension once the libraries it links against are present.
+
+        The extension is one translation unit against a library CMake has already built, so guaranteeing that
+        library is the only thing this adds to the base class.
+        """
         self.ensure_smallfield_libraries()
         super().build_extensions()
 
     def ensure_smallfield_libraries(self):
+        """Configure and build the CMake targets the extension links, unless both artifacts are already present.
+
+        Both files existing is the whole check, so a stale tree is reused rather than rebuilt, and the configure
+        step is handed the same RDKit prefix this file resolved, so the library and the binding cannot end up
+        compiled against two different RDKits.
+        """
         static_library = os.path.join(smallfield_build_dir, "libsmallfield_lib.a")
         shared_library = os.path.join(smallfield_build_dir, "libsmallfield_python_lib.so")
         if os.path.exists(static_library) and os.path.exists(shared_library):
@@ -173,8 +185,7 @@ ext_modules = [
         # only Sapphire Rapids and Turin carry, so the binding failed to build on any older host and
         # would have faulted on one that compiled it and ran elsewhere. Native matches what CMake
         # gives the library, and both make the result non-redistributable in the same way.
-        extra_compile_args=["-std=c++20", "-fPIC", "-march=native"]
-        + (["-fopenmp"] if enable_openmp else []),
+        extra_compile_args=["-std=c++20", "-fPIC", "-march=native"] + (["-fopenmp"] if enable_openmp else []),
         extra_link_args=[f"-Wl,-rpath,{python_lib_dir}"]
         + [f"-Wl,-rpath,{os.path.abspath(smallfield_build_dir)}"]
         + [f"-Wl,-rpath,{rdkit_lib_dir}"]

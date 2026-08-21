@@ -150,6 +150,19 @@ assert_rejects "a real decorative ruler" src/smallfield/note.hpp \
 assert_rejects "a real backward-looking comment" src/smallfield/note.hpp \
     '/* This field is no longer used by the packer. */' "carries backward-looking prose"
 
+# Inserting a doc block after a closing `*/` orphans the block above it, which is how a kernel lost its
+# documentation to a helper dropped in front of it. The accepted case is the house form it resembles:
+# `/* */` prose documents no symbol, so a `/** */` may follow it.
+assert_rejects "a doc block orphaned by one inserted after it" src/smallfield/note.hpp \
+    '/** Counts the slots a wave carries. */
+/** Counts the atoms a slot carries. */
+std::uint32_t count;' "leaves a doc block with no declaration under it"
+assert_accepts "prose ahead of a doc block" src/smallfield/note.hpp \
+    '/*  The counters below are read together, so they are introduced together. */
+
+/** Counts the atoms a slot carries. */
+std::uint32_t count;'
+
 # The banner rule reaches the string-literal form that `check_rulers` cannot: that one anchors the
 # whole line and requires a comment marker, so every banner a binary actually prints slips past it.
 assert_rejects "a decorative banner in printed output" bench/note.cpp \

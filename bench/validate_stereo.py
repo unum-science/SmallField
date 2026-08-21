@@ -17,7 +17,7 @@ import glob
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -84,6 +84,7 @@ class StereoScore:
 
     @property
     def percent(self) -> float:
+        """Share of `declared` the geometry contradicts, in percent; zero declared reads as a clean zero."""
         return 100.0 * self.inverted / max(self.declared, 1)
 
 
@@ -110,6 +111,7 @@ class FidelityReport:
 
 
 def parse_args() -> argparse.Namespace:
+    """The harness's command line: the shard directory, the per-shard sample size, and the three ceilings."""
     parser = argparse.ArgumentParser(description="Measure stereochemical fidelity of SmallField output shards.")
     parser.add_argument("--input", required=True, help="Directory containing output parquet-shards (*.parquet).")
     parser.add_argument(
@@ -323,6 +325,7 @@ def measure_shard(path: str, num_samples: int, seed: int, report: FidelityReport
 
 
 def render_report(report: FidelityReport, corpus: str, shards: int) -> None:
+    """Print control beside subject for both stereo kinds, then the counts of everything the scorer skipped."""
     if report.skipped:
         log.warn("RDKit not available; stereochemical fidelity not measured")
         return
@@ -419,6 +422,7 @@ def shard_is_within_budget(report: FidelityReport, max_chiral: float, max_ez: fl
 
 
 def main() -> int:
+    """Score the shards, print the report, and fail on either a broken instrument or an out-of-budget shard."""
     args = parse_args()
 
     shards = find_shards(args.input, args.shard_limit)

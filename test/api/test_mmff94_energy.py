@@ -1,7 +1,8 @@
 """Pytest suite for the `smallfield.api` Python surface: package layout, single- and
 batch-SMILES conformer generation, and error handling on invalid input.
 
-Run with ``pytest test/test_mmff94_energy.py``.
+Run with ``pytest test/api/test_mmff94_energy.py``, or through `pixi run test-python-gpu`, which is
+the tier that binds the compiled extension.
 """
 
 from __future__ import annotations
@@ -16,13 +17,17 @@ import smallfield.api as sfa
 
 
 def _num_atoms_with_hydrogens(smiles: str) -> int:
+    """Atom count of ``smiles`` once hydrogens are explicit, the axis a coordinate array is measured against."""
     molecule = Chem.MolFromSmiles(smiles)
     assert molecule is not None
     molecule = Chem.AddHs(molecule)
     return molecule.GetNumAtoms()
 
 
-def test_package_surface_moves_api_under_smallfield_api():
+def test_package_surface_keeps_api_under_smallfield_api():
+    """`Context` and `ConformerStatus` reach a caller through `smallfield.api` alone, the package root
+    staying submodules-only so neither name resolves two ways.
+    """
     assert hasattr(smallfield, "api")
     assert not hasattr(smallfield, "Context")
     assert not hasattr(smallfield, "ConformerStatus")
@@ -31,6 +36,9 @@ def test_package_surface_moves_api_under_smallfield_api():
 
 
 def test_single_smiles_generation_returns_interleaved_coordinates():
+    """A lone SMILES string widens to a finite float32 ``(K, N, 3)`` array, atom-major over ``N`` explicit-hydrogen
+    atoms. Slots that failed are dropped rather than padded, so only a lower bound on ``K`` holds.
+    """
     smiles = "CCO"
     coordinates = sfa.generate_conformers(smiles, num_conformers=2, random_seed=42)
 
@@ -44,6 +52,9 @@ def test_single_smiles_generation_returns_interleaved_coordinates():
 
 
 def test_batch_generation_returns_flat_buffers_and_status_codes():
+    """A sequence of SMILES returns flat buffers rather than an array per molecule, every conformer slot padded
+    to ``max_atoms_per_molecule`` so a single stride addresses the whole batch.
+    """
     smiles_batch = ["CCO", "c1ccccc1"]
     num_conformers = 2
     atom_stride = 64
@@ -80,6 +91,7 @@ def test_atom_stride_is_published_rather_than_restated():
 
 
 def test_invalid_smiles_raises_value_error():
+    """A SMILES the parser rejects raises `ValueError`, since `None` here already means every conformer failed."""
     with pytest.raises(ValueError, match="Invalid SMILES"):
         sfa.generate_conformers("not_a_smiles")
 
