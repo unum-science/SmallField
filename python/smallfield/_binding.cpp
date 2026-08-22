@@ -144,11 +144,9 @@ PYBIND11_MODULE(_smallfield, smallfield_module) {
         },
         py::call_guard<py::gil_scoped_release>(), "Whether this process can see a CUDA device.");
 
-    // Every enumerator is named, so `batch.status` never shows a bare integer; the assertion stops a build that adds
-    // one without naming it below.
-    static_assert(sfapi::conformer_status_count_k == 15u, "a conformer_status_t was added - name it below");
-    py::enum_<sfapi::conformer_status_t>(smallfield_module, "ConformerStatus")
-        .value("SUCCESS", sfapi::conformer_status_t::success_k)
+    // Every enumerator is named, so `batch.status` never shows a bare integer.
+    py::enum_<sfapi::conformer_status_t> conformer_status(smallfield_module, "ConformerStatus");
+    conformer_status.value("SUCCESS", sfapi::conformer_status_t::success_k)
         .value("STEREO_FAILURE", sfapi::conformer_status_t::stereo_failure_k)
         .value("MMFF_UNCONVERGED", sfapi::conformer_status_t::mmff_unconverged_k)
         .value("INVALID_SMILES", sfapi::conformer_status_t::invalid_smiles_k)
@@ -164,6 +162,9 @@ PYBIND11_MODULE(_smallfield, smallfield_module) {
         .value("POLISH_INVERTED_CENTER", sfapi::conformer_status_t::polish_inverted_center_k)
         .value("POLISH_INVERTED_BOND", sfapi::conformer_status_t::polish_inverted_bond_k)
         .value("NONPHYSICAL_GEOMETRY", sfapi::conformer_status_t::nonphysical_geometry_k);
+    // Counted off the list above rather than restated beside it, so the two cannot be edited apart.
+    if (py::len(conformer_status.attr("__members__")) != sfapi::conformer_status_count_k)
+        throw std::runtime_error("a conformer_status_t is unnamed in the ConformerStatus binding");
 
     py::class_<conformer_batch_t>(smallfield_module, "ConformerBatch",
                                   "Named outputs of one `Context.generate_conformers` call.")

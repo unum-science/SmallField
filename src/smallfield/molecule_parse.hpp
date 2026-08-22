@@ -25,6 +25,7 @@
 
 #include <GraphMol/Descriptors/MolDescriptors.h>
 #include <GraphMol/FileParsers/MolSupplier.h>
+#include <GraphMol/ForceFieldHelpers/MMFF/AtomTyper.h>
 #include <GraphMol/GraphMol.h>
 #include <GraphMol/MolStandardize/Fragment.h>
 #include <GraphMol/SmilesParse/SmilesParse.h>
@@ -205,6 +206,35 @@ inline parse_result_t parse_smiles(std::string_view smiles, parse_options_t cons
 
     result.status = types::conformer_status_t::success_k;
     return result;
+}
+
+/**
+ *  @brief Force every RDKit lazy-init singleton to initialise on one thread before a parallel region
+ *  races on first access.
+ *
+ *  Touches the SMILES parser, addHs, `assignStereochemistry` (which pulls in the CIP-rank global
+ *  state), and the MMFF94 parameter tables. These have process-wide lazy caches that in some RDKit
+ *  versions are not safe for concurrent first-time access. Here rather than beside either caller,
+ *  because the preprocess fan-out and the fallback fan-out are both in one binary and a second copy
+ *  is a second warm-up.
+ */
+inline void warm_up_rdkit_globals_once() {
+    [[maybe_unused]] static bool const warmed = [] {
+        try {
+            auto warm = RDKit::SmilesToMol("C[C@H](O)[C@@H](Cl)c1ccccc1");
+            if (warm) {
+                RDKit::MolOps::addHs(*warm);
+                RDKit::MolOps::assignStereochemistry(*warm, /*cleanIt=*/true, /*force=*/true,
+                                                     /*flagPossibleStereoCenters=*/true);
+                RDKit::MMFF::MMFFMolProperties properties(*warm);
+                [[maybe_unused]] bool const parametrizable = properties.isValid();
+            }
+        }
+        catch (...) {
+            // Best-effort: a throw costs the race protection, not correctness.
+        }
+        return true;
+    }();
 }
 
 } // namespace smallfield

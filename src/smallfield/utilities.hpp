@@ -10,9 +10,9 @@
  *  include here costs three translation units `nvcc` compiles — which is why the command-line number
  *  parser lives in `number_parse.hpp` rather than here.
  *
- *  Neither helper is marked `__host__ __device__`, because `parameters/mmff94_tables.hpp` pulls this
+ *  No helper here is marked `__host__ __device__`, because `parameters/mmff94_tables.hpp` pulls this
  *  header into translation units compiled as plain C++, where a CUDA attribute is not a keyword. Device
- *  code reaches both as `constexpr` through `--expt-relaxed-constexpr`.
+ *  code reaches them as `constexpr` through `--expt-relaxed-constexpr`.
  */
 
 #pragma once
@@ -62,6 +62,19 @@ template <typename value_, typename alignment_>
 constexpr auto align_up_(value_ value, alignment_ alignment) noexcept {
     value_ const step = static_cast<value_>(alignment);
     return static_cast<value_>((value + step - 1) & ~(step - 1));
+}
+
+/**
+ *  @brief Ceiling of @p numerator divided by @p denominator, zero when there is nothing to divide by.
+ *
+ *  Two template parameters for the same reason `align_up_` takes two: call sites mix widths. The result
+ *  takes the width of @p numerator. Written out, this form is one character from its truncating sibling.
+ */
+template <typename numerator_, typename denominator_>
+constexpr auto divide_round_up_(numerator_ numerator, denominator_ denominator) noexcept {
+    numerator_ const step = static_cast<numerator_>(denominator);
+    if (step == 0) return static_cast<numerator_>(0);
+    return static_cast<numerator_>((numerator + step - 1) / step);
 }
 
 /** Exchange two values. Used by the MMFF94 key canonicalisation steps, on host and device alike. */

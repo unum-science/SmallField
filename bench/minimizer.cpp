@@ -10,7 +10,7 @@
  *  back into the conformer, so our minimizer and RDKit's start from bit-identical coordinates. The two convergence
  *  tests are @b not the same quantity and are never presented as one: ours is an absolute root mean square over all
  *  `3N` gradient components, RDKit's `ForceField::minimize` tests a scaled residual against `forceTol`, so its
- *  default of `1e-4` is not comparable to ours of `5e-5` and only gradient norms at the same geometry are.
+ *  default of `1e-4` is not comparable to ours of `5e-4` and only gradient norms at the same geometry are.
  */
 
 #include <cmath>   // `std::sqrt`, `std::fabs`, `std::isfinite`, `std::log10`
@@ -58,11 +58,12 @@ static constexpr std::size_t production_cap_index_k = 1;
 
 /** Threshold handed to the sweep, low enough that no cap converges out from under the measurement. The question is
  *  where the residual lands, so a run stopping early would answer with the threshold rather than the minimizer;
- *  production's `5e-5` is reported separately, as the bar each measured residual is compared against. */
+ *  production's own bar is reported separately, as what each measured residual is compared against. */
 static constexpr float sweep_gradient_threshold_k = 1.0e-12f;
 
-/** Production's own bar, quoted beside every residual so the comparison is visible rather than remembered. */
-static constexpr float production_gradient_threshold_k = 5.0e-5f;
+/** Production's own bar, quoted beside every residual. Tracks `mmff_polish_gradient_threshold_k` in
+ *  `cuda/etkdg_pipeline.cuh`, which sits behind that header's `__CUDACC__` guard and so cannot be shared. */
+static constexpr float production_gradient_threshold_k = 5.0e-4f;
 
 /** Iterations RDKit is allowed per `minimize` call, which is also its own documented default. */
 static constexpr unsigned int rdkit_iterations_per_round_k = 200;

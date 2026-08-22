@@ -606,6 +606,21 @@ check_cuda_allocation() {
         "            cudaMallocAsync and cudaFreeAsync on the allocator's stream:"
 }
 
+# A written-out ceiling is one character from its truncating sibling, and a shared array was once sized by
+# the floor of a count its own indices rounded up. `divide_round_up_` names the direction.
+check_hand_rolled_ceiling() {
+    case "$file" in
+    src/smallfield/utilities.hpp) return 0 ;; # ? The helper's own body
+    esac
+    local ceilings
+    ceilings=$(printf '%s\n' "$added" |
+        code_only |
+        grep -E '\([^()]+\+[[:space:]]*([A-Za-z_][A-Za-z0-9_]*|[0-9]+)u?[[:space:]]*-[[:space:]]*1u?\)[[:space:]]*/' || true)
+    [ -z "$ceilings" ] || fail "$ceilings" \
+        "$file writes a ceiling division by hand - call divide_round_up_ from" \
+        "            smallfield/utilities.hpp, which names the rounding direction:"
+}
+
 # {fmt} has no device-side form, and a header that pulls it in puts it in front of every kernel
 # body that includes the header. The rule is a list of function bodies enforced as a rule about
 # includes, because that is the part a grep can see.
@@ -822,6 +837,7 @@ while IFS= read -r -d '' file; do
         check_split_literals
         check_file_docblock
         check_cuda_allocation
+        check_hand_rolled_ceiling
         check_deduced_return
         case "$file" in
         *.cu | *.cuh) check_host_threads ;;

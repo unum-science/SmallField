@@ -29,18 +29,18 @@
 #include "smallfield/cuda/warp_primitives.cuh"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
+#include "smallfield/utilities.hpp"
 
 namespace smallfield::cuda {
 
 using smallfield::types::etkdg_molecule_metadata_t;
 using smallfield::types::max_atoms_per_molecule_k;
 using smallfield::types::molecule_descriptor_t;
+using smallfield::types::unreachable_hops_k;
 
-/** 32-bit words needed to hold one bit per atom at the `max_atoms_per_molecule_k` cap. */
-inline constexpr std::uint32_t bond_distance_mask_words_k = max_atoms_per_molecule_k / 32u;
-
-/** Hop count written for a pair with no bonded path between its atoms. */
-inline constexpr std::uint8_t bond_distance_unreachable_k = types::unreachable_hops_k;
+/** 32-bit words needed to hold one bit per atom at the `max_atoms_per_molecule_k` cap. Rounded up, because
+ *  the sweep below indexes these arrays by a cursor rounded up the same way. */
+inline constexpr std::uint32_t bond_distance_mask_words_k = divide_round_up_(max_atoms_per_molecule_k, 32u);
 
 /**
  *  @brief Fill the batch pool's per-molecule N x N hop-count blocks.
@@ -75,10 +75,10 @@ static __global__ void bond_distance_bfs_kernel(molecule_descriptor_t const *__r
 
         // Every pair starts unreachable; the sweeps below overwrite the ones a path reaches.
         for (std::uint32_t entry = lane; entry < num_atoms * num_atoms; entry += warp_size_k)
-            block[entry] = bond_distance_unreachable_k;
+            block[entry] = unreachable_hops_k;
         __syncwarp();
 
-        std::uint32_t const words = (num_atoms + 31u) / 32u;
+        std::uint32_t const words = divide_round_up_(num_atoms, 32u);
         for (std::uint32_t source = lane; source < num_atoms; source += warp_size_k) {
             std::uint8_t *const row = block + source * num_atoms;
             row[source] = 0;
@@ -108,8 +108,8 @@ static __global__ void bond_distance_bfs_kernel(molecule_descriptor_t const *__r
                 }
                 if (reached_any == 0) break;
 
-                std::uint8_t const value = depth < bond_distance_unreachable_k ? static_cast<std::uint8_t>(depth)
-                                                                               : bond_distance_unreachable_k;
+                std::uint8_t const value = depth < unreachable_hops_k ? static_cast<std::uint8_t>(depth)
+                                                                      : unreachable_hops_k;
                 for (std::uint32_t word = 0; word < words; ++word) {
                     std::uint32_t bits = next[word];
                     while (bits != 0) {
@@ -137,7 +137,7 @@ inline void launch_bond_distance_bfs(molecule_descriptor_t const *descriptors,
     constexpr std::uint32_t warps_per_block_k = block_threads_k / warp_size_k;
     // One block per four molecules saturates a wave-sized batch without launching empty warps
     // for the tail; the grid-stride loop in the kernel covers whatever the cap leaves over.
-    std::uint32_t const warp_blocks = (molecule_count + warps_per_block_k - 1u) / warps_per_block_k;
+    std::uint32_t const warp_blocks = divide_round_up_(molecule_count, warps_per_block_k);
     std::uint32_t const blocks = warp_blocks < 4096u ? warp_blocks : 4096u;
     bond_distance_bfs_kernel<<<blocks, block_threads_k, 0, stream>>>(descriptors, metadata, bond_distance,
                                                                      molecule_count);

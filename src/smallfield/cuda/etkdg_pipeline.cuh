@@ -365,9 +365,8 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
         // Rebuilding it at the head of every attempt from an explicit absolute offset keeps it out of the DG,
         // crush and ETK stages entirely. The offset is where the carried state would have reached: 100 elements
         // per attempt index, then four uniforms for every atom this lane owns.
-        std::uint32_t const lane_owned_atoms = (lane < num_atoms)
-                                                   ? ((num_atoms - lane + warp_size_k - 1u) / warp_size_k)
-                                                   : 0u;
+        std::uint32_t const lane_owned_atoms = (lane < num_atoms) ? divide_round_up_(num_atoms - lane, warp_size_k)
+                                                                  : 0u;
 
         conformer_status_t verdict = conformer_status_t::stereo_failure_k;
         float final_energy = 0.0f;
@@ -457,8 +456,8 @@ enum class polish_path_t : std::int32_t {
     write_back_accepted_k = 4,
 };
 
-/** Exits `polish_path_t` names, so a histogram over it declares its own width once. */
-constexpr std::size_t polish_path_count_k = 5;
+/** Exits `polish_path_t` names, counted off its last enumerator so a histogram declares its width once. */
+constexpr std::size_t polish_path_count_k = static_cast<std::size_t>(polish_path_t::write_back_accepted_k) + 1u;
 
 /** What each of the floats `mmff_polish_warp_kernel` writes per slot into its diagnostics array holds. */
 enum class polish_diagnostic_t : std::uint32_t {
@@ -476,8 +475,9 @@ enum class polish_diagnostic_t : std::uint32_t {
     staged_energy_k = 5,
 };
 
-/** Floats per conformer slot in `mmff_polish_warp_kernel`'s diagnostics array. */
-constexpr std::uint32_t polish_diagnostic_floats_k = 6;
+/** Floats per conformer slot in `mmff_polish_warp_kernel`'s diagnostics array, counted off the enum. */
+constexpr std::uint32_t polish_diagnostic_floats_k = static_cast<std::uint32_t>(polish_diagnostic_t::staged_energy_k) +
+                                                     1u;
 
 /** One conformer slot's row of `polish_diagnostic_floats_k` floats, unpacked. */
 struct polish_row_t {
@@ -719,7 +719,7 @@ __global__ void stamp_refused_molecules_kernel(conformer_status_t const *__restr
  *  bandwidth against shipping fp32 coordinates. One thread per element, vector-friendly grid:
  *  @code{.cpp}
  *  std::uint32_t const block = 256;
- *  std::uint32_t const grid = (num_elements + block - 1) / block;
+ *  std::uint32_t const grid = divide_round_up_(num_elements, block);
  *  convert_coords_fp32_to_fp16_kernel<<<grid, block, 0, stream>>>(source, destination, num_elements);
  *  @endcode
  */

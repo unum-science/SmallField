@@ -47,11 +47,6 @@ struct element_gate_case_t {
     sft::conformer_status_t expected;
 };
 
-/** The atom count the single-warp pipeline caps a molecule at, hydrogens included. `parse_smiles` applies it after
- *  `addHs`, so the alkanes below straddle the cap by chain length: C63H128 is 191 atoms and fits, C64H130 is 194
- *  and does not. */
-static constexpr std::size_t atom_cap_k = sfp::max_atoms_per_molecule_k;
-
 /** The ladder opens one ring-bond label per rung beside the macrocycle's own, and SMILES has ninety-nine. */
 static_assert(sft::max_rings_k + 11 < 99, "the ring cap outgrew the two-digit ring-bond labels");
 
@@ -204,7 +199,9 @@ int main(int argc, char **argv) {
     // every bound named from its library constant rather than a magic number. `too_many_bonds_k` gets no
     // case: at four bonds per carbon a molecule under the atom cap tops out at exactly `max_bonds_k`, so
     // no real molecule crosses it and only a descriptor array bound is guarded.
-    std::size_t const carbons_that_fit = (sftest::atom_cap_k - 2) / 3;
+    // `parse_smiles` applies the cap after `addHs`, so the alkanes straddle it by chain length:
+    // C63H128 is 191 atoms and fits, C64H130 is 194 and does not.
+    std::size_t const carbons_that_fit = (sft::max_atoms_per_molecule_k - 2) / 3;
     std::string const alkane_at_cap(carbons_that_fit, 'C');
     std::string const alkane_over_cap(carbons_that_fit + 1, 'C');
     std::string const ladder_at_cap = sftest::carbon_ladder_(sft::max_rings_k);

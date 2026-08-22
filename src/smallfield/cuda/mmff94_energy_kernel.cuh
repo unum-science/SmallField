@@ -52,7 +52,6 @@ constexpr float mmff_angle_cubic_bend_k = -0.006981317f;
 constexpr float mmff_linear_bend_prefactor_k = 143.9325f;
 constexpr float mmff_torsion_prefactor_k = 0.5f;
 constexpr float mmff_stretch_bend_prefactor_k = 2.51210f;
-constexpr float mmff_degrees_to_radians_k = 3.14159265f / 180.0f;
 constexpr float mmff_radians_to_degrees_k = 180.0f / 3.14159265f;
 
 /**

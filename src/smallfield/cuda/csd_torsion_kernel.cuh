@@ -37,6 +37,7 @@
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 #include "smallfield/types/storage.hpp"
+#include "smallfield/utilities.hpp"
 
 namespace smallfield::cuda {
 
@@ -63,6 +64,10 @@ using smallfield::types::molecule_descriptor_t;
 using smallfield::types::reserve_outcome_t;
 using smallfield::types::table_residency_t;
 using smallfield::types::upload_into;
+
+/** 32-bit words needed to hold one claim bit per bond at the `max_bonds_k` cap. Rounded up, because the
+ *  claim below indexes these words as `bond_index / warp_size_k`. */
+inline constexpr std::uint32_t claimed_word_count_k = divide_round_up_(max_bonds_k, warp_size_k);
 
 /**
  *  @brief Per-thread device stack the matcher needs. Sub-query evaluation still recurses, bounded by the
@@ -285,8 +290,8 @@ static __global__ __launch_bounds__(32, 8) void csd_torsion_match_kernel(
     etk_torsion_descriptor_t *const output = torsions + static_cast<std::size_t>(molecule_index) * torsion_stride;
 
     // Bonds an earlier pattern claimed, one bit each, shared so the ring pass on lane 0 sees the warp's claims.
-    __shared__ std::uint32_t claimed_words[max_bonds_k / warp_size_k];
-    if (lane < max_bonds_k / warp_size_k) claimed_words[lane] = 0;
+    __shared__ std::uint32_t claimed_words[claimed_word_count_k];
+    if (lane < claimed_word_count_k) claimed_words[lane] = 0;
     __syncwarp();
 
     csd_molecule_gate_t const gate = build_molecule_gate(descriptor);
@@ -367,11 +372,10 @@ static __global__ __launch_bounds__(32, 8) void csd_torsion_match_kernel(
                 std::uint32_t const word = bond_index / warp_size_k;
                 std::uint32_t const bit_mask = 1u << (bond_index % warp_size_k);
                 if ((claimed_words[word] & bit_mask) != 0) continue;
-                constexpr std::uint8_t planar_k = hybridization_sp2_k;
-                if (descriptor.hybridization[atom_first] != planar_k ||
-                    descriptor.hybridization[atom_second] != planar_k ||
-                    descriptor.hybridization[atom_third] != planar_k ||
-                    descriptor.hybridization[atom_fourth] != planar_k)
+                if (descriptor.hybridization[atom_first] != hybridization_sp2_k ||
+                    descriptor.hybridization[atom_second] != hybridization_sp2_k ||
+                    descriptor.hybridization[atom_third] != hybridization_sp2_k ||
+                    descriptor.hybridization[atom_fourth] != hybridization_sp2_k)
                     continue;
 
                 claimed_words[word] |= bit_mask;

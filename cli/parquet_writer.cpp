@@ -30,14 +30,21 @@
 #include <parquet/arrow/writer.h>
 
 #include "smallfield/api/conformer_layout.hpp"
+#include "smallfield/postprocess/shape_descriptors.hpp"
 #include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/views.hpp"
+#include "smallfield/utilities.hpp"
 
 #include "cli/parquet_writer.hpp"
 
 namespace fs = std::filesystem;
 
 namespace smallfield::cli {
+
+/*  The header states the width as a literal so the on-disk schema needs no RDKit; this is the one
+ *  translation unit that sees both, so it is where they are held equal. */
+static_assert(usrcat_components_k == postprocess::usrcat_components_k,
+              "the shard's USRCAT width and the descriptor's have drifted");
 
 #pragma region Refusals
 
@@ -277,7 +284,7 @@ static shard_write_report_t allocate_fp16_list_(std::string_view column, std::si
 
     shard_write_report_t const allocation_failed {.status = shard_write_t::buffer_allocation_failed_k,
                                                   .column = column};
-    std::size_t const bitmap_bytes = (num_rows + 7) / 8;
+    std::size_t const bitmap_bytes = smallfield::divide_round_up_(num_rows, 8u);
     auto validity_result = arrow::AllocateBuffer(static_cast<std::int64_t>(bitmap_bytes));
     if (!validity_result.ok()) return allocation_failed;
     auto offsets_result = arrow::AllocateBuffer(static_cast<std::int64_t>((num_rows + 1) * sizeof(std::int32_t)));
@@ -297,11 +304,11 @@ static std::shared_ptr<arrow::Array> finish_fp16_list_(fp16_list_buffers_t &buff
                                                        std::size_t total_halves, std::int64_t null_count) {
     auto leaf_data = arrow::ArrayData::Make(arrow::float16(), static_cast<std::int64_t>(total_halves),
                                             {nullptr, std::move(buffers.values)}, /*null_count=*/0);
-    auto leaf_array = arrow::MakeArray(std::move(leaf_data));
+    auto leaf_array = arrow::MakeArray(leaf_data);
     auto list_data = arrow::ArrayData::Make(arrow::list(arrow::float16()), static_cast<std::int64_t>(num_rows),
                                             {std::move(buffers.validity), std::move(buffers.offsets)},
                                             {leaf_array->data()}, null_count);
-    return arrow::MakeArray(std::move(list_data));
+    return arrow::MakeArray(list_data);
 }
 
 /**
@@ -509,7 +516,7 @@ class row_columns_t {
         std::uint64_t const molecule_index = row.molecule_index;
         std::size_t const flat = inputs.conformers.layout.flat_slot(molecule_index, row.conformer_slot);
         std::string_view const smiles = molecules.smiles[molecule_index];
-        auto record_append_ = [&](std::string_view column, arrow::Status status) {
+        auto record_append_ = [&](std::string_view column, arrow::Status const &status) {
             record_(shard_write_t::column_append_failed_k, column, status);
         };
 
@@ -596,7 +603,7 @@ static shard_write_report_t write_parquet_(fs::path const &path, arrow::Table co
     if (!outfile_result.ok())
         return refuse_(logger, path, {.status = shard_write_t::output_open_failed_k},
                        outfile_result.status().message());
-    auto outfile = outfile_result.ValueOrDie();
+    auto const &outfile = outfile_result.ValueOrDie();
 
     // Half-precision coordinates and descriptors are near-random, so their dictionary overflows to PLAIN having
     // already paid the hashing, and their min/max statistics cost a comparator pass per page no reader consults.

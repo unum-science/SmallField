@@ -11,7 +11,7 @@
 #include <cstdio>  // `stderr`
 
 #include <array>       // `std::array`
-#include <chrono>      // `std::chrono::high_resolution_clock`, `std::chrono::duration`
+#include <chrono>      // `std::chrono::steady_clock`, `std::chrono::duration`
 #include <memory>      // `std::unique_ptr`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
@@ -45,7 +45,7 @@ namespace sft = smallfield::types;
 
 namespace smallfield::bench {
 
-using clock_type_t = std::chrono::high_resolution_clock;
+using clock_type_t = std::chrono::steady_clock;
 static double elapsed_ms_(clock_type_t::time_point start, clock_type_t::time_point end) {
     return std::chrono::duration<double, std::milli>(end - start).count();
 }

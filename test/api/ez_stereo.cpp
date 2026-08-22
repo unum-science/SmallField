@@ -83,6 +83,7 @@ int main() {
     };
 
     std::vector<std::string> smiles_storage;
+    smiles_storage.reserve(cases.size());
     for (auto const &entry : cases) smiles_storage.emplace_back(entry.smiles);
     std::vector<std::string_view> smiles(smiles_storage.begin(), smiles_storage.end());
 

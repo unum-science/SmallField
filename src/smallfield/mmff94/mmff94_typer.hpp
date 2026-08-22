@@ -29,6 +29,7 @@
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 #include "smallfield/types/views.hpp"
+#include "smallfield/utilities.hpp"
 
 namespace smallfield::mmff94 {
 using smallfield::parameters::lookup_prop;
@@ -1088,7 +1089,7 @@ constexpr std::uint8_t native_set_mmff_hydrogen_type(molecule_descriptor_t const
 
 /** Fixed-capacity set of atom indices, backing the conjugated-nitrogen flood fill. */
 struct atom_bitset_t {
-    std::array<std::uint32_t, (max_atoms_per_molecule_k + 31) / 32> words {};
+    std::array<std::uint32_t, divide_round_up_(max_atoms_per_molecule_k, 32u)> words {};
 
     constexpr void insert(std::uint32_t atom_index) noexcept { words[atom_index >> 5] |= 1u << (atom_index & 31); }
     [[nodiscard]] constexpr bool contains(std::uint32_t atom_index) const noexcept {

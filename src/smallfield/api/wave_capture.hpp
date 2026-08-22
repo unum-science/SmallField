@@ -119,6 +119,10 @@ inline capture_outcome_t capture_bin_launch(wave_slice_view_t const &device_view
                                             custd::span<std::byte const> batch_pool,
                                             custd::span<float const> metric_embedding,
                                             wave_capture_scalars_t const &scalars, cudaStream_t stream) {
+    // Read before the bin is compared: a zero-atom bin equals the zero cap an unset variable reports.
+    char const *const directory_from_environment = std::getenv("SMALLFIELD_CAPTURE_DIR");
+    if (directory_from_environment == nullptr || directory_from_environment[0] == '\0')
+        return capture_outcome_t::skipped_k;
     if (scalars.bin_max_atoms != capture_bin_atom_cap()) return capture_outcome_t::skipped_k;
     // One thread per device runs this, so the exchange is what makes "once per process" true: two devices
     // passing it would both write `manifest.txt`, and the lazily created timing events below would be
@@ -126,7 +130,7 @@ inline capture_outcome_t capture_bin_launch(wave_slice_view_t const &device_view
     static std::atomic<bool> captured {false};
     if (captured.exchange(true, std::memory_order_relaxed)) return capture_outcome_t::skipped_k;
 
-    std::string const directory = std::getenv("SMALLFIELD_CAPTURE_DIR");
+    std::string const directory = directory_from_environment;
     cudaStreamSynchronize(stream);
 
     auto const *const batch_base = reinterpret_cast<char const *>(batch_pool.data());

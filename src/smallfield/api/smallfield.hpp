@@ -100,7 +100,8 @@ struct metric_scratch_t {
      *  device's stream; its `capacity()` is the largest group a wave may bin, so the extent cannot
      *  drift from the allocation it describes. */
     device_indices_t group_indices;
-    /** Atom count the reservation above was last sized against. */
+    /** Largest bin this scratch was prepared for. No allocation depends on it; it is the ceiling
+     *  `build_metric_initial_coordinates_on_gpu` refuses a wider bin against. */
     std::uint32_t max_atoms = 0;
     /** Host-side per-bin molecule lists, refilled each wave; grows once. */
     std::array<std::vector<std::uint32_t>, atom_limited_bin_count_k> bin_groups {};

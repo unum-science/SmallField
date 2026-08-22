@@ -11,6 +11,8 @@
 
 #include <cuda_runtime.h>
 
+#include "smallfield/utilities.hpp"
+
 #include "test/parameters/mmff94_tables_kernels.hpp"
 
 namespace sf = smallfield;
@@ -95,7 +97,7 @@ __global__ void torsion_lookup_kernel(sf::parameters::mmff94_tables_view_t view,
 static constexpr std::uint32_t probe_block_threads_k = 128;
 
 static std::uint32_t probe_blocks_(std::uint32_t query_count) noexcept {
-    return (query_count + probe_block_threads_k - 1) / probe_block_threads_k;
+    return smallfield::divide_round_up_(query_count, probe_block_threads_k);
 }
 
 void launch_device_vdw_lookup(sf::parameters::mmff94_tables_view_t view, vdw_query_t const *queries,

@@ -23,6 +23,7 @@
 
 #include "smallfield/api/smallfield.hpp"
 #include "smallfield/types/views.hpp"
+#include "smallfield/utilities.hpp"
 
 #include "test/helpers.hpp"
 #include "test/rdkit_reference.hpp"
@@ -43,7 +44,6 @@ namespace smallfield::api {
  *  lifted from a `cudaMemGetInfo` probe so its edge cases assert without a GPU whose free VRAM a test dictates. */
 std::size_t wave_budget_bytes(std::size_t free_probe_count, std::size_t smallest_free_per_slot,
                               std::size_t smallest_total_per_slot) noexcept;
-std::uint32_t divide_rounding_up(std::uint32_t numerator, std::uint32_t denominator) noexcept;
 std::uint32_t reserve_molecules_per_device(std::uint32_t wave_size, std::uint32_t device_count) noexcept;
 
 } // namespace smallfield::api
@@ -134,7 +134,7 @@ static void check_per_device_reservation(diagnostic_reporter_t &reporter) {
             .mismatch("wave_sizing", "wave_size={} device_count={}", division_case.wave_size,
                       division_case.device_count)
             .field("quotient", division_case.expected_quotient,
-                   api::divide_rounding_up(division_case.wave_size, division_case.device_count), exactly_equal)
+                   smallfield::divide_round_up_(division_case.wave_size, division_case.device_count), exactly_equal)
             .field("reservation", division_case.expected_reservation,
                    api::reserve_molecules_per_device(division_case.wave_size, division_case.device_count),
                    exactly_equal);

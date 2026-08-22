@@ -1033,7 +1033,8 @@ struct staged_typing_patch_t {
  *  carries, so each accumulator's own `size()` is the next molecule's offset into it. The
  *  device-filled regions stage nothing here — the kernels write them in place after the upload —
  *  and their room is reserved by the per-device prefix the pack pass runs.
- *  Persisted across calls via a file-scope `static` vector so the `std::vector` capacities survive.
+ *  Held on the caller's `batch_prep_scratch_t`, so capacities survive a call without file-scope state
+ *  and two `context_t` objects on two threads prepare independent waves.
  */
 struct alignas(64) batch_prep_thread_contribution_t {
     etkdg_prepared_molecule_t scratch;
@@ -1048,38 +1049,7 @@ struct alignas(64) batch_prep_thread_contribution_t {
     /** Slice-local input indices for every molecule this thread's slice rejected, each tagged with the
      *  reason. Merged across threads by `collect_rejections_into_` into the caller's own sink. */
     std::vector<rejected_mol_t> rejected_input_indices;
-    std::uint32_t max_atoms_seen = 0;
-    std::uint32_t max_bonds_seen = 0;
 };
-
-/**
- *  @brief Force every RDKit lazy-init singleton to initialise on the main thread before an OMP
- *  parallel-for races on first access.
- *
- *  Touches the SMILES parser, addHs, `assignStereochemistry` (which pulls in the CIP-rank global
- *  state), the MMFF94 parameter tables, and an ETKDG-style substructure match path. These all
- *  have process-wide lazy-loaded caches that in some RDKit versions are not safe for concurrent
- *  first-time access.
- */
-inline void warm_up_rdkit_globals_once_() {
-    [[maybe_unused]] static bool const warmed = [] {
-        try {
-            auto warm = RDKit::SmilesToMol("C[C@H](O)[C@@H](Cl)c1ccccc1");
-            if (warm) {
-                RDKit::MolOps::addHs(*warm);
-                RDKit::MolOps::assignStereochemistry(*warm, /*cleanIt=*/true, /*force=*/true,
-                                                     /*flagPossibleStereoCenters=*/true);
-                RDKit::MMFF::MMFFMolProperties properties(*warm);
-                [[maybe_unused]] bool const parametrizable = properties.isValid();
-            }
-        }
-        catch (...) {
-            // Warm-up is best-effort. If it throws, the subsequent parallel-for call hits the
-            // same cache-miss path; it costs the race protection, not correctness.
-        }
-        return true;
-    }();
-}
 
 /**
  *  @brief First stage of the preprocess-step: parallel per-molecule RDKit parse and byte-append into
@@ -1098,7 +1068,7 @@ static inline void prepare_per_thread_contribs_(custd::span<std::string_view con
                                                 smallfield::salt_policy_t salt_policy,
                                                 std::uint32_t output_atom_capacity,
                                                 std::vector<batch_prep_thread_contribution_t> &contribs) {
-    warm_up_rdkit_globals_once_();
+    warm_up_rdkit_globals_once();
     int const n_threads_max = omp_get_max_threads();
     if (static_cast<int>(contribs.size()) < n_threads_max) contribs.resize(n_threads_max);
     for (auto &contribution : contribs) {
@@ -1111,8 +1081,6 @@ static inline void prepare_per_thread_contribs_(custd::span<std::string_view con
         contribution.typing_patches.clear();
         contribution.mols.clear();
         contribution.rejected_input_indices.clear();
-        contribution.max_atoms_seen = 0;
-        contribution.max_bonds_seen = 0;
     }
 
     std::size_t const molecule_count = smiles_list.size();
@@ -1137,10 +1105,6 @@ static inline void prepare_per_thread_contribs_(custd::span<std::string_view con
                 continue;
             }
             std::uint32_t const num_atoms = prepared.num_atoms;
-            std::uint32_t const num_bonds = prepared.descriptor.num_bonds;
-            if (num_atoms > contribution.max_atoms_seen) contribution.max_atoms_seen = num_atoms;
-            if (num_bonds > contribution.max_bonds_seen) contribution.max_bonds_seen = num_bonds;
-
             batch_prep_per_mol_record_t record;
             record.original_index = static_cast<std::uint32_t>(molecule);
             record.metadata = prepared.metadata;

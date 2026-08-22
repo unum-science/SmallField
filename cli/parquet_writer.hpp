@@ -93,7 +93,9 @@ struct molecule_columns_t {
     [[nodiscard]] std::uint64_t count() const noexcept { return num_atoms.size(); }
 };
 
-/** Components a USRCAT vector carries; its first 12 are the USR descriptor, not stored separately. */
+/** Components a USRCAT vector carries; its first 12 are the USR descriptor, not stored separately. A literal
+ *  rather than `postprocess::usrcat_components_k`, so the on-disk schema costs no RDKit include; the two are
+ *  held equal by a `static_assert` in `parquet_writer.cpp`, which sees both. */
 inline constexpr std::uint32_t usrcat_components_k = 60;
 
 /**

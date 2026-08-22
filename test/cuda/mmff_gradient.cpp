@@ -37,8 +37,6 @@ namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-using sftest::gpu_mmff_energy;
-
 static constexpr std::string_view test_name_k = "smallfield_test_mmff_gradient";
 
 namespace smallfield::tests {

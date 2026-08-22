@@ -75,6 +75,10 @@ jobs:
       - name: Build
         run: cmake --build build_release --parallel
 
+      # EXCLUDE_FROM_ALL, so the default target above never reaches it and only `setup.py` names it.
+      - name: Build the Python extension
+        run: cmake --build build_release --parallel --target smallfield_python_lib
+
       # Unrolled rather than looped so a missing architecture names itself in the job summary. sm_89
       # is the one an edit to the list would silently drop, and the one the L40S target needs.
       - name: Confirm sm_80 reached the binary

@@ -12,7 +12,7 @@
 
 #include <algorithm>     // `std::max`, `std::min`, `std::sort`
 #include <array>         // `std::array`
-#include <chrono>        // `std::chrono::high_resolution_clock`, `std::chrono::duration`
+#include <chrono>        // `std::chrono::steady_clock`, `std::chrono::duration`
 #include <numeric>       // `std::iota`
 #include <string_view>   // `std::string_view`
 #include <unordered_map> // `std::unordered_map`
@@ -152,21 +152,13 @@ std::size_t wave_budget_bytes(std::size_t free_probe_count, std::size_t smallest
     return smallest_total_per_slot / 2u;
 }
 
-/** Ceiling of @p numerator divided by @p denominator, zero when there is nothing to divide by. Split out of
- *  `reserve_molecules_per_device` so the zero-denominator edge is one named, test-visible answer rather
- *  than an unsigned wrap that a second wrap happens to undo. */
-std::uint32_t divide_rounding_up(std::uint32_t numerator, std::uint32_t denominator) noexcept {
-    if (denominator == 0) return 0;
-    return (numerator + denominator - 1u) / denominator;
-}
-
 /** Molecules to pre-reserve on each device for a @p wave_size wave spread over @p device_count devices.
  *  Adds one slack molecule so a wave whose remainder lands unevenly never leaves a device one slot short;
  *  with no devices there is nothing to spread and the reservation is the floor of one. Not `static`: see
  *  `wave_budget_bytes`. */
 std::uint32_t reserve_molecules_per_device(std::uint32_t wave_size, std::uint32_t device_count) noexcept {
     if (device_count == 0) return 1u;
-    return divide_rounding_up(wave_size, device_count) + 1u;
+    return divide_round_up_(wave_size, device_count) + 1u;
 }
 
 /** Fold @p per_slot to its smallest entry, or zero when nothing was probed. */
@@ -300,8 +292,8 @@ enum class wave_phase_t : std::uint8_t {
     download_k,
 };
 
-/** Phases a wave is timed in. One more boundary event than this is needed to bracket them all. */
-inline constexpr std::size_t wave_phase_count_k = 4;
+/** Phases a wave is timed in, counted off the enum. One more boundary event is needed to bracket them all. */
+inline constexpr std::size_t wave_phase_count_k = static_cast<std::size_t>(wave_phase_t::download_k) + 1u;
 
 /** One wave's per-phase GPU and DMA wall on one device, in milliseconds, measured on events recorded into
  *  the device's own stream, so this is device time rather than host-side scheduling. */
@@ -371,12 +363,14 @@ struct phase_events_t {
     }
 };
 
-/** Milliseconds since construction, which is what every host-side wave boundary is stated against. */
+/** Milliseconds since construction, which is what every host-side wave boundary is stated against.
+ *  `steady_clock` rather than `high_resolution_clock`, which libstdc++ defines as `system_clock`: a clock
+ *  an NTP step can move backwards is not one to measure a duration against. */
 struct wall_clock_t {
-    std::chrono::high_resolution_clock::time_point origin = std::chrono::high_resolution_clock::now();
+    std::chrono::steady_clock::time_point origin = std::chrono::steady_clock::now();
 
     [[nodiscard]] double elapsed_ms() const noexcept {
-        return std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - origin).count();
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - origin).count();
     }
 };
 
@@ -1110,7 +1104,7 @@ static void enqueue_binned_kernels_(wave_slice_view_t const &device_view,
         check_launch_(sink, "validate_polished_stereo_kernel launch");
 
         constexpr std::uint32_t stamp_block_k = 256;
-        stamp_refused_molecules_kernel<<<divide_rounding_up(molecule_count, stamp_block_k), stamp_block_k, 0, stream>>>(
+        stamp_refused_molecules_kernel<<<divide_round_up_(molecule_count, stamp_block_k), stamp_block_k, 0, stream>>>(
             regions.molecule_verdicts.data(), regions.status.data(), molecule_count, conformer_count);
         check_launch_(sink, "stamp_refused_molecules_kernel launch");
     }
@@ -1122,7 +1116,7 @@ static void enqueue_download_(device_wave_regions_t const &regions, host_wave_re
     if (!regions.coordinates_fp32.empty()) {
         constexpr std::uint32_t convert_block_k = 256;
         std::uint32_t const element_count = static_cast<std::uint32_t>(regions.coordinates_fp32.size());
-        std::uint32_t const convert_grid = divide_rounding_up(element_count, convert_block_k);
+        std::uint32_t const convert_grid = divide_round_up_(element_count, convert_block_k);
         convert_coords_fp32_to_fp16_kernel<<<convert_grid, convert_block_k, 0, stream>>>(
             regions.coordinates_fp32.data(), regions.coordinates_fp16.data(), element_count);
         check_launch_(sink, "convert_coords_fp32_to_fp16_kernel launch");
@@ -1554,7 +1548,7 @@ static std::vector<wave_range_t> split_into_waves_(std::uint32_t num_input, std:
     std::uint32_t const single_wave_limit = std::min(wave_size_target * 3u / 2u, wave_size_ceiling);
     std::uint32_t const stride = num_input <= single_wave_limit ? num_input
                                                                 : std::max<std::uint32_t>(wave_size_target, 1u);
-    waves.reserve(divide_rounding_up(num_input, stride));
+    waves.reserve(divide_round_up_(num_input, stride));
     for (std::uint32_t begin = 0; begin < num_input; begin += stride)
         waves.push_back({.begin = begin, .end = std::min(begin + stride, num_input)});
     return waves;

@@ -1,22 +1,27 @@
 [build-system]
-requires = ["setuptools>=82", "pybind11>=3.1", "numpy>=2.5"]
 build-backend = "setuptools.build_meta"
+requires = ["setuptools>=82", "pybind11>=3.1", "numpy>=2.5"]
 
 # Floors match `pixi.toml`, which pins the only environment this is built and tested
-# in: Python 3.12, setuptools 82, pybind11 3.1, numpy 2.5. Claiming a wider range would
+# in: Python 3.14, setuptools 82, pybind11 3.1, numpy 2.5. Claiming a wider range would
 # be claiming untested support.
 [project]
-name = "smallfield"
-dynamic = ["version"]
-description = "SmallField: GPU conformer generation with ETKDG and MMFF94"
-readme = "README.md"
-requires-python = ">=3.12"
-license = { file = "LICENSE" }
 authors = [
-  { name = "Ash Vardanian", email = "1983160+ashvardanian@users.noreply.github.com" },
+  {name = "Ash Vardanian", email = "1983160+ashvardanian@users.noreply.github.com"},
 ]
-urls = { Homepage = "https://github.com/unum-science/SmallField" }
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Environment :: GPU :: NVIDIA CUDA :: 12",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: C++",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: Chemistry",
+]
 dependencies = ["numpy>=2.5", "rich>=15"]
+description = "SmallField: GPU conformer generation with ETKDG and MMFF94"
+dynamic = ["version"]
 keywords = [
   "cheminformatics",
   "conformer-generation",
@@ -30,25 +35,20 @@ keywords = [
   "cuda",
   "gpu",
 ]
-classifiers = [
-  "Development Status :: 4 - Beta",
-  "Intended Audience :: Science/Research",
-  "License :: OSI Approved :: Apache Software License",
-  "Environment :: GPU :: NVIDIA CUDA :: 12",
-  "Operating System :: POSIX :: Linux",
-  "Programming Language :: C++",
-  "Programming Language :: Python :: 3.14",
-  "Topic :: Scientific/Engineering :: Chemistry",
-]
+license = {file = "LICENSE"}
+name = "smallfield"
+readme = "README.md"
+requires-python = ">=3.14"
+urls = {Homepage = "https://github.com/unum-science/SmallField"}
 
 [project.optional-dependencies]
+dev = ["pytest", "pytest-benchmark", "rdkit", "pybind11", "ruff"]
 test = ["pytest", "pytest-benchmark", "rdkit"]
-dev = ["pytest", "pytest-benchmark", "rdkit", "pybind11", "black", "ruff"]
 
 # The VERSION file is the single source of truth. The release workflow rewrites every other copy
 # from it, so nothing needs to assert that they agree.
 [tool.setuptools.dynamic]
-version = { file = "VERSION" }
+version = {file = "VERSION"}
 
 # `python/` on the path so `import smallfield` resolves from a clone without an install step, which
 # is what lets the CPU test job run before anything is built; `bench/` so the stereo harness's own
@@ -61,11 +61,9 @@ version = { file = "VERSION" }
 pythonpath = ["python", "bench"]
 testpaths = ["test"]
 
-[tool.black]
-line-length = 120
-target-version = ['py312']
-
 [tool.ruff]
 line-length = 120
-select = ["E", "F", "B"]
+
+[tool.ruff.lint]
 ignore = ["E501"]
+select = ["E", "F", "B"]

@@ -118,7 +118,8 @@ enum class fallback_stage_t : std::uint8_t {
     store_k,
 };
 
-constexpr std::size_t fallback_stage_count_k = 6;
+/** Stages `fallback_stage_t` names, counted off its last enumerator. */
+constexpr std::size_t fallback_stage_count_k = static_cast<std::size_t>(fallback_stage_t::store_k) + 1u;
 
 /** Report names in enumerator order, so a printed line and the enum cannot drift. */
 constexpr std::array<std::string_view, fallback_stage_count_k> fallback_stage_names_k {"parse", "type",     "embed",

@@ -33,28 +33,6 @@ namespace sfapi = smallfield::api;
 
 namespace smallfield::cli {
 
-/** Single-threaded warm-up forcing every RDKit lazy-init singleton the fallback OMP loop touches to populate
- *  its caches before ~188 fallback threads race on first access. Matches `warm_up_rdkit_globals_once_` in
- *  `etkdg_prepare_batch.hpp`. */
-static void warm_up_rdkit_globals_for_fallback_() {
-    [[maybe_unused]] static bool const warmed = [] {
-        try {
-            auto warm = RDKit::SmilesToMol("C[C@H](O)[C@@H](Cl)c1ccccc1");
-            if (warm) {
-                RDKit::MolOps::addHs(*warm);
-                RDKit::MolOps::assignStereochemistry(*warm, /*cleanIt=*/true, /*force=*/true,
-                                                     /*flagPossibleStereoCenters=*/true);
-                // Constructing the properties loads RDKit's lazy MMFF parameter singletons.
-                RDKit::MMFF::MMFFMolProperties props(*warm);
-            }
-        }
-        catch (...) {
-            // Best-effort.
-        }
-        return true;
-    }();
-}
-
 #pragma region One Molecule
 
 /**
@@ -336,7 +314,7 @@ void rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallback_output
     if (num_retries == 0) return;
 
     int const num_threads = inputs.num_threads > 0 ? inputs.num_threads : omp_get_max_threads();
-    warm_up_rdkit_globals_for_fallback_();
+    warm_up_rdkit_globals_once();
 
 #pragma omp parallel for schedule(dynamic, 16) num_threads(num_threads) if (num_threads > 1)
     for (std::uint64_t retry_entry = 0; retry_entry < num_retries; ++retry_entry) {

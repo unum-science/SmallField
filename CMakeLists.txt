@@ -202,10 +202,16 @@ add_library(smallfield_warnings INTERFACE)
 if (NOT MSVC)
     # No `-Werror`: warnings should surface without blocking a build. CUDA device code gets the host warnings forwarded
     # through `-Xcompiler`.
+    #
+    # The set past `-Wsign-conversion` is a ratchet: each was measured at zero hits across all 41 host translation
+    # units and zero inside RDKit, Boost, Arrow or CUDA, so they cost nothing today and refuse a regression tomorrow.
+    # `-Wuseless-cast` is deliberately absent -- it fires on the defensive casts at the RDKit boundary, which are
+    # useless only because that library's return types happen to match ours today.
     target_compile_options(
         smallfield_warnings
-        INTERFACE $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wconversion;-Wsign-conversion>
-                  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Wconversion,-Wsign-conversion>
+        INTERFACE
+            $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wconversion;-Wsign-conversion;-Wcast-qual;-Wnull-dereference;-Wimplicit-fallthrough;-Wsuggest-override;-Wnon-virtual-dtor;-Wformat=2;-Wundef;-Wmissing-declarations>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Wconversion,-Wsign-conversion,-Wcast-qual,-Wnull-dereference,-Wimplicit-fallthrough,-Wsuggest-override,-Wnon-virtual-dtor,-Wformat=2,-Wundef,-Wmissing-declarations>
     )
 endif ()
 

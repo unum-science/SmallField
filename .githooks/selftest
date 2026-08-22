@@ -229,6 +229,18 @@ assert_rejects "a synchronous device allocation" src/smallfield/note.cu \
 assert_accepts "a stream-ordered device allocation" src/smallfield/note.cu \
     '    cudaMallocAsync(&device_pool, total_bytes, stream);'
 
+# A hand-written ceiling, in both the named-divisor and literal-divisor spellings, against the helper that
+# replaces them. The accepted case also covers a plain division, which must not read as a ceiling.
+assert_rejects "a ceiling division written by hand" src/smallfield/note.cuh \
+    '    std::uint32_t const words = (num_atoms + warp_size_k - 1u) / warp_size_k;' \
+    "writes a ceiling division by hand"
+assert_rejects "a ceiling division with a literal divisor" src/smallfield/note.cuh \
+    '    std::size_t const bitmap_bytes = (num_rows + 8 - 1) / 8;' "writes a ceiling division by hand"
+assert_accepts "the named ceiling helper" src/smallfield/note.cuh \
+    '    std::uint32_t const words = divide_round_up_(num_atoms, warp_size_k);'
+assert_accepts "a plain division" src/smallfield/note.cuh \
+    '    std::uint32_t const halved = total_slots / 2u;'
+
 assert_rejects "fmt reaching a device header" src/smallfield/cuda/note.cuh \
     '#include <fmt/format.h>' "is a device header and includes"
 

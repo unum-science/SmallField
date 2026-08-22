@@ -9,7 +9,7 @@ When you change a rule, change it here first.
 Configuring the CMake build arms the hooks:
 
 ```sh
-cmake -B build .        # runs `git config core.hooksPath .githooks`
+cmake -B build .            # runs `git config core.hooksPath .githooks`
 git config core.hooksPath   # should print .githooks
 ```
 
@@ -225,9 +225,10 @@ The transposition between the two layouts is one named function, overloaded on d
 Writing it inline is how the same three lines came to exist in four files in four spellings, two of them sharing a name with different signatures.
 
 __`custd` is `cuda::std`, and that is not a preference.__
-`std::mdspan` needs C++23, and `nvcc` 12.8 and 12.9 reject `-std=c++23` outright, so it cannot enter any translation unit `nvcc` touches.
+`std::mdspan` needs C++23, and every `nvcc` this project can reach rejects `-std=c++23` outright, so it cannot enter any translation unit `nvcc` touches.
+Measured across 12.8, 12.9 and 13.2: all three answer `nvcc fatal: Value 'c++23' is not defined for option 'std'`.
 libcu++ ships the same interface at C++20 for host and device alike and arrives with `CUDA::cudart`, already a `PUBLIC` dependency.
-The alias names the namespace once so the swap is a single `#if` when `nvcc` 13 and libstdc++ 16 land together.
+The alias names the namespace once, so a swap stays a single `#if` — but CUDA 13 landed without C++23, so this is the spelling to keep rather than one to wait out.
 It is spelled for the namespace rather than for one type in it, because it names the span as well as the views.
 
 __One span type, and it is `custd::span`.__
@@ -286,7 +287,11 @@ An owning buffer is `buffer<value_type_, allocator_type_>` and a borrowed one is
 There is no third thing, and a raw pointer that outlives the expression using it is a defect.
 
 A pointer into a container, held across a phase boundary, is a lifetime bug waiting for a reallocation — `gpu_pipeline_handle_t` holds the span it actually reads instead.
-Residence is a compile-time property for the same reason: host code holding a device pointer should not compile rather than fail at run time.
+
+__Residence is not carried in the type, and a tag that claims otherwise is worse than nothing.__
+A `memory_residence_t` sat on both allocators and on `buffer`, read by nothing, while `buffer::data()` handed out the same raw pointer either way.
+Carrying it for real means putting it in `custd::span`, which `preprocess/wave_slice_pool.hpp` declines to do and says why.
+Until a span carries it, name the residence in the parameter rather than imply a guarantee the type does not make.
 
 __Two facts that must agree are one fact, or they are a defect.__
 An agreement maintained by hand at every write site is one the compiler will not help with, and the type system exists to carry most of them.
@@ -527,6 +532,7 @@ A standalone line that names the declarations beneath it is a section, so it bec
 A trailing `//` on an `#include`, an `#endif`, or a closing brace is an idiom and stays.
 
 Every `@param` declares its direction as `[in]`, `[out]`, or `[inout]` — the comma form is not a spelling of the last one.
+Clang's `-Wdocumentation` accepts only `[in,out]` and so rejects all 105 of ours; that flag is not adopted, and this rule wins.
 
 __Inline code and symbol names take backticks, and none of `@c`, `@ref` or `@a` is used.__
 `@b` remains for emphasis of a word that is not code, because `**bold**` inside a comment prints literally.
@@ -596,14 +602,14 @@ A verb at column zero, so `^MISMATCH` filters alongside `^PASS` and `^FAIL`.
 
 Precision is keyed to what the number __is__, not chosen per site:
 
-| role | spec | why |
-|---|---|---|
-| a compared value | `{}` | shortest round-trip, so two distinct floats never print alike |
-| a delta | `{:+.3g}` | sign always visible, three digits shows the magnitude |
-| a tolerance | `{:.3g}` | matches the delta it is compared against |
-| a duration in milliseconds | `{:.1f}` | 0.1 ms is the meaningful resolution |
-| a percentage | `{:.3f}` | gate and report must agree, and one pair here did not |
-| a count | `{}`, or `fmt::group_digits` when a human reads it | never group a number a script might parse |
+| role                       | spec                         | why                                                           |
+| -------------------------- | ---------------------------- | ------------------------------------------------------------- |
+| a compared value           | `{}`                         | shortest round-trip, so two distinct floats never print alike |
+| a delta                    | `{:+.3g}`                    | sign always visible, three digits shows the magnitude         |
+| a tolerance                | `{:.3g}`                     | matches the delta it is compared against                      |
+| a duration in milliseconds | `{:.1f}`                     | 0.1 ms is the meaningful resolution                           |
+| a percentage               | `{:.3f}`                     | gate and report must agree, and one pair here did not         |
+| a count                    | `{}`, or `fmt::group_digits` | never group a number a script might parse                     |
 
 __The reporter in `test/helpers.hpp` owns the grammar, so a call site passes values and never a format string.__
 It formats and never compares.
@@ -721,7 +727,9 @@ Two added pointer parameters and an early-return guard cost half again the regis
 The kernel split that went the other way bought a quarter more throughput.
 Register pressure here converts into wall time in both directions, and it does so for reasons that do not follow from reading the diff.
 
-So anything that could reach a kernel is measured with `cuobjdump --dump-resource-usage` against the recorded per-architecture baseline before it lands, and any movement in `REG`, `STACK` or `LOCAL` on the Blackwell targets is a revert rather than a discussion.
+So anything that could reach a kernel is measured with `cuobjdump --dump-resource-usage` against the recorded per-architecture baseline before it lands.
+Movement in `REG`, `STACK` or `LOCAL` on the Blackwell targets is strongly preferred against — it converts into wall time for reasons that do not follow from reading the diff — but it is a cost to weigh against what the change buys, not an automatic revert.
+Measure first, then argue with a number.
 The baseline itself is not reproduced here — it is a measurement of today's binary, not a rule, and a number pasted into a rulebook is a comment asserting a measurable fact that nothing re-checks.
 
 Name hardware constants once rather than spelling `32` for the warp size at each site.

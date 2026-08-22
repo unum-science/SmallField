@@ -12,7 +12,7 @@
 
 #include <algorithm>   // `std::min`, `std::sort`
 #include <array>       // `std::array`
-#include <chrono>      // `std::chrono::high_resolution_clock`, `std::chrono::duration`
+#include <chrono>      // `std::chrono::steady_clock`, `std::chrono::duration`
 #include <limits>      // `std::numeric_limits`
 #include <random>      // `std::mt19937`
 #include <string>      // `std::string`
@@ -37,7 +37,7 @@ namespace sfapi = smallfield::api;
 namespace sfbench = smallfield::bench;
 namespace sftest = smallfield::tests;
 namespace sftypes = smallfield::types;
-using clock_type_t = std::chrono::high_resolution_clock;
+using clock_type_t = std::chrono::steady_clock;
 
 /** Name printed on every throughput line so a concatenated CI log stays attributable. */
 static constexpr char const *executable_name_k = "smallfield_bench_backends";
@@ -58,11 +58,6 @@ static constexpr double clash_distance_angstrom_k = 0.5;
 /** Atom stride of every conformer slot in the coordinate pool. Generator and cross-validator must share it: a wrong
  *  stride silently reads a neighbour conformer's coordinates. */
 static constexpr std::uint32_t coordinate_stride_atoms_k = smallfield::types::max_atoms_per_molecule_k;
-
-/** What a conformer slot carries before `generate_conformers` has written it. A value-initialized
- *  `conformer_status_t` is `success_k`, so a slot the pipeline never reached would be drawn into the RDKit
- *  cross-validation sample, scored on uninitialized coordinates, and decide this binary's exit code. */
-static constexpr sfapi::conformer_status_t unwritten_status_k = sfapi::conformer_status_t::invalid_smiles_k;
 
 #pragma region Statistics
 
@@ -190,7 +185,7 @@ static void bench_smallfield_gpu(std::vector<std::string> const &smiles, std::ui
     std::size_t const total_conformers = static_cast<std::size_t>(num_smiles) * num_conformers;
     coords_out.resize(total_conformers * coordinate_stride_atoms_k * 3);
     energies_out.resize(total_conformers);
-    status_out.assign(total_conformers, unwritten_status_k);
+    status_out.assign(total_conformers, sfapi::conformer_status_t::invalid_smiles_k);
     // Zero is what `generate_conformers` writes for a refused molecule, so an unreached one reads refused, not stale.
     num_atoms_out.assign(num_smiles, std::uint8_t {0});
 
@@ -226,7 +221,7 @@ static void bench_smallfield_multi_gpu(std::vector<std::string> const &smiles, s
     std::size_t const total_conformers = static_cast<std::size_t>(num_smiles) * num_conformers;
     std::vector<__half> coords(total_conformers * coordinate_stride_atoms_k * 3);
     std::vector<float> energies(total_conformers);
-    std::vector<sfapi::conformer_status_t> status(total_conformers, unwritten_status_k);
+    std::vector<sfapi::conformer_status_t> status(total_conformers, sfapi::conformer_status_t::invalid_smiles_k);
 
     // An empty device span is every visible GPU, so a `CUDA_VISIBLE_DEVICES`-controlled sweep still runs at one.
     sfapi::context_t gpu_context;

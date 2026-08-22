@@ -239,9 +239,10 @@ inline void extract_etk_torsions_native(molecule_descriptor_t const &descriptor,
             std::uint32_t const bond_index = find_bond_between(descriptor, atom_2, atom_3);
             if (bond_index == no_bond_index_k) continue;
             if (done_bonds[bond_index]) continue;
-            constexpr std::uint8_t planar_k = hybridization_sp2_k;
-            if (descriptor.hybridization[atom_1] != planar_k || descriptor.hybridization[atom_2] != planar_k ||
-                descriptor.hybridization[atom_3] != planar_k || descriptor.hybridization[atom_4] != planar_k)
+            if (descriptor.hybridization[atom_1] != hybridization_sp2_k ||
+                descriptor.hybridization[atom_2] != hybridization_sp2_k ||
+                descriptor.hybridization[atom_3] != hybridization_sp2_k ||
+                descriptor.hybridization[atom_4] != hybridization_sp2_k)
                 continue;
 
             done_bonds[bond_index] = 1;

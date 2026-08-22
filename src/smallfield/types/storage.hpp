@@ -22,7 +22,7 @@
 #include <cstddef> // `std::byte`, `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
 
-#include <concepts> // `std::convertible_to`, `std::same_as`
+#include <concepts> // `std::same_as`
 #include <utility>  // `std::exchange`
 
 #include <cuda_runtime.h>
@@ -33,17 +33,6 @@
 namespace smallfield::types {
 
 #pragma region Policies
-
-/** Where an allocation lives, and therefore who may dereference it. A compile-time property read by
- *  `requires`-clauses, never by a branch on the allocation path: host code dereferencing a device pointer
- *  is the failure this makes unspellable, where a runtime enum inside the buffer would only let it be
- *  detected, one wave too late. */
-enum class memory_residence_t : std::uint8_t {
-    /** Reachable by the CPU. Pinned host memory is still host memory. */
-    host_k,
-    /** Reachable only by a kernel, and only through the stream that allocated it. */
-    device_k,
-};
 
 /** What `try_reserve` did, and what the caller must do about interior pointers. A `bool` would fold
  *  "already large enough", the steady-state answer making no driver call, into the same `true` as "grew",
@@ -73,7 +62,6 @@ enum class table_residency_t : std::uint8_t {
  *  is not `const`, because a stream-ordered allocator may record the pool it drew from. */
 template <typename allocator_type_>
 concept memory_allocator = requires(allocator_type_ allocator, void *pointer, std::size_t bytes) {
-    { allocator_type_::residence_k } -> std::convertible_to<memory_residence_t>;
     { allocator.allocate(bytes) } noexcept -> std::same_as<void *>;
     { allocator.deallocate(pointer) } noexcept;
 };
@@ -88,8 +76,6 @@ concept memory_allocator = requires(allocator_type_ allocator, void *pointer, st
  *  off the wave path, where blocking is free.
  */
 struct pinned_allocator_t {
-    static constexpr memory_residence_t residence_k = memory_residence_t::host_k;
-
     void *allocate(std::size_t bytes) noexcept {
         void *raw = nullptr;
         return cudaHostAlloc(&raw, bytes, cudaHostAllocDefault) == cudaSuccess ? raw : nullptr;
@@ -102,8 +88,6 @@ struct pinned_allocator_t {
  *  undefined, so a buffer built on a per-wave stream is released before the stream is — the lifetime rule
  *  every other stream-ordered resource in the pipeline already follows. */
 struct device_allocator_t {
-    static constexpr memory_residence_t residence_k = memory_residence_t::device_k;
-
     cudaStream_t stream = nullptr;
 
     void *allocate(std::size_t bytes) noexcept {
@@ -178,7 +162,6 @@ class buffer {
   public:
     using value_type = value_type_;
     using allocator_type = allocator_type_;
-    static constexpr memory_residence_t residence_k = allocator_type_::residence_k;
 
     buffer() noexcept = default;
     /** Bind the allocator, and with it the stream every allocation and free will be ordered against. */

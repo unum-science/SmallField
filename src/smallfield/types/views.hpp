@@ -3,10 +3,11 @@
  *  @brief  The libcu++ namespace alias, and non-owning views over caller-owned molecule buffers.
  *
  *  Every matrix is a flat buffer plus an extent carried as one thing, so the two cannot disagree. The
- *  standard types cannot serve: `std::mdspan` needs C++23, which `nvcc` 12.8 and 12.9 reject, and
+ *  standard types cannot serve: `std::mdspan` needs C++23, which `nvcc` 12.8, 12.9 and 13.2 all reject, and
  *  `std::span`'s members are not `__host__ __device__`. libcu++ ships both at C++20 for host and device
  *  and arrives with `CUDA::cudart`, already a `PUBLIC` dependency of `smallfield_objects`; `custd` names
- *  it once, so the swap is one `#if` when `nvcc` 13 and libstdc++ 16 land together.
+ *  it once, so a swap stays one `#if` — though CUDA 13 arrived without C++23, so this is the spelling to
+ *  keep rather than one to wait out.
  *
  *  `std::uint32_t` extents are a claim about scope: these view one molecule, capped at
  *  `max_atoms_per_molecule_k` atoms and `max_bonds_k` bonds. The width is not free — a packed view is

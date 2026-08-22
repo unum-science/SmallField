@@ -33,9 +33,6 @@ namespace sft = smallfield::types;
 /** Name printed on every line, so a concatenated log stays attributable. */
 static constexpr char const *executable_name_k = "smallfield_bench_kernel_replay";
 
-/** Warp size, spelled once, matching the block size both kernels are launched at. */
-static constexpr std::uint32_t warp_size_k = 32;
-
 /** The byte a status slot carries before either kernel has written it. Zero is `conformer_status_t::success_k`, so a
  *  slot memset to zero and never reached would count as a conformer the replay produced -- the one measurement
  *  separating a representative capture from one the polish kernel skipped. */
@@ -195,7 +192,7 @@ static void launch_etkdg_(capture_manifest_t const &manifest, replay_device_t co
     std::uint32_t const conformer_count = static_cast<std::uint32_t>(manifest.conformer_count);
     std::uint32_t const gpu_max_atoms = static_cast<std::uint32_t>(manifest.gpu_max_atoms);
 
-    sfc::etkdg_pipeline_warp_kernel<<<static_cast<std::uint32_t>(manifest.grid_etkdg), warp_size_k,
+    sfc::etkdg_pipeline_warp_kernel<<<static_cast<std::uint32_t>(manifest.grid_etkdg), sfc::warp_size_k,
                                       static_cast<std::uint32_t>(manifest.shared_bytes_etkdg)>>>(
         reinterpret_cast<float const *>(pool_at(manifest.offset_bounds_matrices)),
         device.embedding + manifest.embedding_offset_floats,
@@ -225,7 +222,7 @@ static polish_launch_shape_t polish_launch_shape_(capture_manifest_t const &mani
 
     int blocks_per_multiprocessor = 0;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_multiprocessor, sfc::mmff_polish_warp_kernel,
-                                                  static_cast<int>(warp_size_k), shared_bytes);
+                                                  static_cast<int>(sfc::warp_size_k), shared_bytes);
     int multiprocessor_count = 0;
     cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, 0);
 
@@ -243,7 +240,7 @@ static void launch_mmff_(capture_manifest_t const &manifest, replay_device_t con
     std::uint32_t const conformer_count = static_cast<std::uint32_t>(manifest.conformer_count);
     std::uint32_t const gpu_max_atoms = static_cast<std::uint32_t>(manifest.gpu_max_atoms);
 
-    sfc::mmff_polish_warp_kernel<<<shape.grid, warp_size_k, shape.shared_bytes>>>(
+    sfc::mmff_polish_warp_kernel<<<shape.grid, sfc::warp_size_k, shape.shared_bytes>>>(
         reinterpret_cast<sft::mmff94_atom_vdw_params_t const *>(pool_at(manifest.offset_mmff_atom_vdw)),
         reinterpret_cast<float const *>(pool_at(manifest.offset_mmff_atom_charge)),
         reinterpret_cast<std::uint8_t const *>(pool_at(manifest.offset_bond_distance)),
