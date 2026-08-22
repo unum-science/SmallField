@@ -1,5 +1,5 @@
 /**
- *  @file test/preprocess/test_rdkit_divergences.cpp
+ *  @file test/preprocess/rdkit_divergences.cpp
  *  @brief Assert every recorded disagreement with RDKit that we believe RDKit is wrong about.
  *
  *  `rdkit_divergence_table.cpp` names each defect once and records both sides; this binary re-measures it
@@ -50,13 +50,13 @@
 #include "smallfield/types/molecule_descriptor.hpp"
 
 #include "test/preprocess/rdkit_divergence_table.hpp"
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-static constexpr std::string_view test_name_k = "test_rdkit_divergences";
+static constexpr std::string_view test_name_k = "smallfield_test_rdkit_divergences";
 
 /**
  *  @brief Molecules taken from a corpus when no cap is given; the registry's own are always walked.

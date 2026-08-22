@@ -1,5 +1,5 @@
 /**
- *  @file test/api/test_seed_determinism.cpp
+ *  @file test/api/seed_determinism.cpp
  *  @brief Assert that a fixed `random_seed` reproduces conformers bit for bit, whatever surrounds them.
  *
  *  Three properties, each its own section, because each fails its own way. `repeat` runs one batch twice
@@ -36,13 +36,13 @@
 #include "smallfield/api/smallfield.hpp"
 #include "smallfield/types/views.hpp"
 
-#include "test/test_helpers.hpp"
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/helpers.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sfapi = smallfield::api;
 namespace sftest = smallfield::tests;
 
-static constexpr std::string_view test_name_k = "test_seed_determinism";
+static constexpr std::string_view test_name_k = "smallfield_test_seed_determinism";
 
 /** Molecules the built-in corpus is grown to, and the cap applied to a named one. */
 static constexpr std::size_t default_max_molecules_k = 768;

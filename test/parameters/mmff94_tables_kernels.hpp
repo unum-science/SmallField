@@ -1,5 +1,5 @@
 /**
- *  @file test/parameters/test_mmff94_tables_kernels.hpp
+ *  @file test/parameters/mmff94_tables_kernels.hpp
  *  @brief Device launchers for the MMFF94 parameter table lookups, for use by their unit tests.
  */
 

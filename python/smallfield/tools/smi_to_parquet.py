@@ -1,6 +1,6 @@
 """
 Convert a SMILES file (one SMILES per line, optionally with whitespace-separated name)
-into a folder of Parquet shards that ``smallfield_batch`` can consume.
+into a folder of Parquet shards that ``smallfield_generate`` can consume.
 
 Output shards have two columns: ``id`` (string) and ``smiles`` (string). Shard
 filenames are deterministic given the input path and ``--rows-per-shard``::
@@ -145,7 +145,7 @@ def main() -> int:
     ``--compression none`` becomes ``None`` rather than the string, which is how PyArrow spells uncompressed.
     """
     parser = argparse.ArgumentParser(
-        description="Convert a SMILES file into Parquet shards for smallfield_batch.",
+        description="Convert a SMILES file into Parquet shards for smallfield_generate.",
     )
     parser.add_argument("--input", type=Path, required=True, help="Input .smi file")
     parser.add_argument("--output", type=Path, required=True, help="Output directory")

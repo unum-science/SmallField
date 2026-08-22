@@ -1,5 +1,5 @@
 /**
- *  @file test/cli/test_empty_shard.cpp
+ *  @file test/cli/empty_shard.cpp
  *  @brief Pin that a shard of no molecules is written, and written under the same schema as a populated one.
  *
  *  An input shard with no rows is a corpus fact, not a defect — `s3 sync` writes each shard directly to its
@@ -30,13 +30,13 @@
 #include "smallfield/api/conformer_layout.hpp"
 #include "smallfield/types/conformer_status.hpp"
 
-#include "test/test_helpers.hpp"
+#include "test/helpers.hpp"
 
 namespace fs = std::filesystem;
 namespace sfcli = smallfield::cli;
 namespace sftest = smallfield::tests;
 
-static constexpr std::string_view test_name_k = "test_empty_shard";
+static constexpr std::string_view test_name_k = "smallfield_test_empty_shard";
 
 /** The canonical output schema, in the order `write_shard` appends its columns. */
 static constexpr std::array<std::string_view, 13> schema_field_names_k {

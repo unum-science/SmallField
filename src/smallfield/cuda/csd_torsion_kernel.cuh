@@ -18,7 +18,7 @@
  *  `useBasicKnowledge` are order-dependent and run on lane 0.
  *
  *  Correctness: identical torsion set per molecule to `extract_etk_torsions_native`, checked
- *  molecule by molecule in `test/cuda/test_csd_torsion_device.cpp`.
+ *  molecule by molecule in `test/cuda/csd_torsion_device.cpp`.
  */
 
 #pragma once

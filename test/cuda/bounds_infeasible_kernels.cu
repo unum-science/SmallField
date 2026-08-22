@@ -1,8 +1,8 @@
 /**
- *  @file test/cuda/test_bounds_infeasible_kernels.cu
+ *  @file test/cuda/bounds_infeasible_kernels.cu
  *  @brief CUDA driver for the bounds-infeasibility verdict test.
  *
- *  Compiled by nvcc. The host test logic is in test_bounds_infeasible.cpp, compiled by g++.
+ *  Compiled by nvcc. The host test logic is in bounds_infeasible.cpp, compiled by g++.
  */
 
 #include <cstddef> // `std::size_t`
@@ -18,7 +18,7 @@
 #include "smallfield/types/atom_limited_bins.hpp"
 #include "smallfield/types/storage.hpp"
 
-#include "test/cuda/test_bounds_infeasible_kernels.hpp"
+#include "test/cuda/bounds_infeasible_kernels.hpp"
 
 namespace sfc = smallfield::cuda;
 namespace sft = smallfield::types;

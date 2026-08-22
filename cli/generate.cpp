@@ -1,5 +1,5 @@
 /**
- *  @file cli/smallfield_batch.cpp
+ *  @file cli/generate.cpp
  *  @brief Restartable batch processor for bulk conformer generation.
  *
  *  Four `pipeline-roles` — see GLOSSARY.md — with depth-5 ring-buffer handoffs:
@@ -46,7 +46,7 @@
 #include "smallfield/postprocess/shape_descriptors.hpp"
 #include "smallfield/types/views.hpp"
 
-#include "cli/cli_arguments.hpp"
+#include "cli/arguments.hpp"
 #include "cli/parquet_reader.hpp"
 #include "cli/parquet_writer.hpp"
 #include "cli/rdkit_fallback.hpp"
@@ -71,7 +71,7 @@ extern "C" void handle_stop_signal_(int) { stop_requested_.store(true, std::memo
 } // namespace
 
 /** The one name this binary prints, so the announcement and the usage cannot drift from the executable. */
-constexpr char const *executable_name_k = "smallfield_batch";
+constexpr char const *executable_name_k = "smallfield_generate";
 
 /** Ceiling on `--rdkit-fallback-threads` and `--gpu-runner-threads`: wider is a mistyped token, not a machine. */
 constexpr int max_threads_k = 4096;

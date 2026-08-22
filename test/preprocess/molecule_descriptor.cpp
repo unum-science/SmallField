@@ -1,5 +1,5 @@
 /**
- *  @file test/preprocess/test_descriptor.cpp
+ *  @file test/preprocess/molecule_descriptor.cpp
  *  @brief Validate `molecule_descriptor_t` against the RDKit accessors it is derived from.
  *
  *  Every field the descriptor carries for an atom, a bond, a neighbour list and a ring is compared against RDKit's
@@ -37,12 +37,12 @@
 #include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-static constexpr std::string_view test_name_k = "test_descriptor";
+static constexpr std::string_view test_name_k = "smallfield_test_molecule_descriptor";
 
 /** One pathological molecule must not bury the log; the reporter keeps counting past this. */
 static constexpr std::size_t max_printed_lines_k = 40;

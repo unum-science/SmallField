@@ -1,5 +1,5 @@
 /**
- *  @file test/parameters/test_mmff94_tables.cpp
+ *  @file test/parameters/mmff94_tables.cpp
  *  @brief Cross-validate the extracted MMFF94 tables against RDKit on the host, then against the device.
  *
  *  Two comparisons share one key set: the host suite puts every key to RDKit's live `operator()` and to our
@@ -45,14 +45,14 @@
 #include "smallfield/parameters/mmff94_tables_device.hpp"
 #include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 
-#include "test/parameters/test_mmff94_tables_kernels.hpp"
-#include "test/test_helpers.hpp"
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/helpers.hpp"
+#include "test/parameters/mmff94_tables_kernels.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sf = smallfield;
 namespace sftest = smallfield::tests;
 
-static constexpr std::string_view test_name_k = "test_mmff94_tables";
+static constexpr std::string_view test_name_k = "smallfield_test_mmff94_tables";
 
 namespace smallfield::tests {
 

@@ -1,5 +1,5 @@
 /**
- *  @file bench/bench_kernel_replay.cu
+ *  @file bench/kernel_replay.cu
  *  @brief Replays one captured atom-limited bin through the two ETKDG warp kernels, linking only CUDA.
  *
  *  Every NVIDIA profiler currently dies with a SIGSEGV at the first CUDA call inside a SmallField binary — the
@@ -10,8 +10,8 @@
  *  does, and why `bench/CMakeLists.txt` builds it as its own target rather than through `define_smallfield_target`
  *  — `smallfield_settings` for the flags the shipped kernels compile under, `CUDA::cudart` for the runtime, nothing
  *  else. The house grammar is unchanged: a verb at column zero, ASCII keys, `key=value` throughout.
- *  `SMALLFIELD_CAPTURE_DIR=<dir> SMALLFIELD_CAPTURE_BIN=48 bench_profile --smi <corpus> --conformers 3` writes the
- *  snapshot this reads; `src/smallfield/api/wave_capture.hpp` is the writer and defines the manifest keys.
+ *  `SMALLFIELD_CAPTURE_DIR=<dir> SMALLFIELD_CAPTURE_BIN=48 smallfield_bench_profile --smi <corpus> --conformers 3`
+ *  writes the snapshot this reads; `src/smallfield/api/wave_capture.hpp` is the writer and defines the manifest keys.
  */
 
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
@@ -31,7 +31,7 @@ namespace sfc = smallfield::cuda;
 namespace sft = smallfield::types;
 
 /** Name printed on every line, so a concatenated log stays attributable. */
-static constexpr char const *executable_name_k = "bench_kernel_replay";
+static constexpr char const *executable_name_k = "smallfield_bench_kernel_replay";
 
 /** Warp size, spelled once, matching the block size both kernels are launched at. */
 static constexpr std::uint32_t warp_size_k = 32;

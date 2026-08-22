@@ -1,5 +1,5 @@
 /**
- *  @file test/preprocess/test_chirality_kernels.hpp
+ *  @file test/preprocess/chirality_kernels.hpp
  *  @brief Device harness for the chirality-validation kernel, for use by its unit tests.
  */
 

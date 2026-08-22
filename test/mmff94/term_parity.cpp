@@ -1,5 +1,5 @@
 /**
- *  @file test/mmff94/test_mmff_term_parity.cpp
+ *  @file test/mmff94/term_parity.cpp
  *  @brief Gate per-term MMFF94 energy and gradient parity between the GPU kernel and RDKit.
  *
  *  A total-energy check cannot localize a divergence, and two terms wrong in opposite directions mask each other, so
@@ -38,14 +38,14 @@
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 #include "smallfield/types/views.hpp"
 
-#include "test/cuda/test_mmff_gradient_kernels.hpp"
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/cuda/mmff_gradient_kernels.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-static constexpr std::string_view test_name_k = "test_mmff_term_parity";
+static constexpr std::string_view test_name_k = "smallfield_test_term_parity";
 
 /** A corpus disagrees at thousands of components at a time, and a few dozen lines already name the pattern. */
 static constexpr std::size_t max_printed_lines_k = 64;
@@ -68,7 +68,7 @@ static constexpr float corpus_distortion_k = 0.20f;
  *  components only, no energy — so this budget is five times the worst and an order of magnitude below a regression.
  *
  *  Torsion's own 80,000 ppm exception once admitted a 47,644 ppm divergence, 149 of them energies rather than
- *  gradient components; it now measures 123 ppm on the same corpus. Triage a rise against `test_mmff_cpu_port` and
+ *  gradient components; it now measures 123 ppm on the same corpus. Triage a rise against `cpu_extract` and
  *  the SMILES parser rather than reintroducing a per-term exception.
  */
 static constexpr double max_corpus_term_mismatch_ppm_k = 2000.0;

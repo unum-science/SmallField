@@ -1,5 +1,5 @@
 /**
- *  @file bench/bench_mmff_kernels_device.cu
+ *  @file bench/mmff_kernels.cu
  *  @brief Device-side launcher for the MMFF GPU kernel trio.
  *
  *  Nothing is copied back: outputs reach 10 GB on a large batch, and term correctness is the parity suite's job.
@@ -18,7 +18,7 @@
 #include "smallfield/mmff94/mmff94_typer_device.cuh"
 #include "smallfield/types/storage.hpp"
 
-#include "bench/bench_mmff_kernels_device.hpp"
+#include "bench/mmff_kernels.hpp"
 
 namespace sfmmff = smallfield::mmff94;
 namespace sfparam = smallfield::parameters;

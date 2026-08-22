@@ -1,8 +1,8 @@
 /**
- *  @file test/cuda/test_triangle_smooth_kernels.cu
+ *  @file test/cuda/triangle_smooth_kernels.cu
  *  @brief CUDA kernel wrappers for the triangle-smoothing test.
  *
- *  Compiled by nvcc. The host test code, with its RDKit includes, is in test_triangle_smooth.cpp, compiled
+ *  Compiled by nvcc. The host test code, with its RDKit includes, is in triangle_smooth.cpp, compiled
  *  by g++.
  */
 
@@ -15,7 +15,7 @@
 #include "smallfield/types/storage.hpp"
 #include "smallfield/types/views.hpp"
 
-#include "test/cuda/test_triangle_smooth_kernels.hpp"
+#include "test/cuda/triangle_smooth_kernels.hpp"
 
 namespace smallfield::tests {
 

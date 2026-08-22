@@ -1,5 +1,5 @@
 /**
- *  @file test/mmff94/test_mmff_gpu_typer_kernels.cu
+ *  @file test/mmff94/gpu_typer_kernels.cu
  *  @brief Validate the GPU MMFF typer kernel.
  *
  *  Runs it on a batch of descriptors and hands the results back to the host .cpp for byte-level comparison against
@@ -19,7 +19,7 @@
 #include "smallfield/types/molecule_descriptor.hpp"
 #include "smallfield/types/storage.hpp"
 
-#include "test/mmff94/test_mmff_gpu_typer_kernels.hpp"
+#include "test/mmff94/gpu_typer_kernels.hpp"
 
 namespace sfmmff = smallfield::mmff94;
 namespace sfparam = smallfield::parameters;

@@ -1,5 +1,5 @@
 /**
- *  @file test/preprocess/test_chiral_parity.cpp
+ *  @file test/preprocess/chiral_volume_sign.cpp
  *  @brief Police the tag-and-parity derivation of the chiral volume sign with three exact oracles.
  *
  *  `extract_chiral_centers` derives the target signed-volume sign from the atom's tetrahedral tag and the
@@ -42,14 +42,14 @@
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 #include "smallfield/types/views.hpp"
 
-#include "test/test_helpers.hpp"
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/helpers.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-static constexpr std::string_view test_name_k = "test_chiral_parity";
+static constexpr std::string_view test_name_k = "smallfield_test_chiral_volume_sign";
 
 /** A stereo-rich corpus can disagree at thousands of centers, and ten lines already name the pattern. */
 static constexpr std::size_t max_printed_lines_k = 10;

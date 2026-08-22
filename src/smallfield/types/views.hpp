@@ -139,7 +139,7 @@ using conformer_aos_t = coordinates_aos<coordinate_role_t::position_k, float>;
  *  bound, lower triangle for its lower, and equal indices on the diagonal, held at zero in both roles.
  *  These take the pair unordered, so a caller never states which index lands in the row — a choice whose
  *  correct and inverted forms differ in nothing else and both read plausible. `constexpr` rather than
- *  `__host__ __device__` because `test/parameters/test_mmff94_tables.cpp` compiles this header as plain
+ *  `__host__ __device__` because `test/parameters/mmff94_tables.cpp` compiles this header as plain
  *  C++; device code reaches them through `--expt-relaxed-constexpr`. Each reads one bound rather than
  *  returning both: the smoothing loops branch on which inequality applies before it is known whether the
  *  lower bound is wanted, and a pair-returning form costs `triangle_smooth_kernel` registers for a value

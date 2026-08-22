@@ -17,11 +17,11 @@ nvcc_path = shutil.which("nvcc")
 enable_openmp = not is_macos
 enable_cuda = is_linux and nvcc_path is not None
 
-# The CMake tree this links against, and where every intermediate object lands. `build` is what the
-# presets configure and stays the default; SMALLFIELD_BUILD_DIR points a parallel session at a
-# private tree instead, so validating the binding does not write into a build directory something
-# else is using.
-smallfield_build_dir = os.environ.get("SMALLFIELD_BUILD_DIR") or "build"
+# The CMake tree this links against, and where every intermediate object lands. `build_dev` is what
+# the `dev` preset configures and stays the default; SMALLFIELD_BUILD_DIR points a parallel session
+# at a private tree instead, so validating the binding does not write into a build directory
+# something else is using.
+smallfield_build_dir = os.environ.get("SMALLFIELD_BUILD_DIR") or "build_dev"
 
 # RDKit ships no pkg-config, so probe the usual prefixes most-explicit first.
 # RDKIT_PREFIX mirrors the CMake flag, CONDA_PREFIX covers an activated conda or

@@ -1,5 +1,5 @@
 /**
- *  @file test/api/test_conformer_slot_layout.cpp
+ *  @file test/api/slot_layout.cpp
  *  @brief Guard the structure-of-arrays conformer slot contract.
  *
  *  Reading a slot as `3 * num_atoms` contiguous halves from its base gets x and then inter-component
@@ -19,13 +19,13 @@
 
 #include "smallfield/api/conformer_layout.hpp"
 
-#include "test/test_helpers.hpp"
+#include "test/helpers.hpp"
 
 namespace sftest = smallfield::tests;
 
 using smallfield::api::conformer_slot_layout_t;
 
-static constexpr std::string_view test_name_k = "test_conformer_slot_layout";
+static constexpr std::string_view test_name_k = "smallfield_test_slot_layout";
 
 namespace smallfield::tests {
 

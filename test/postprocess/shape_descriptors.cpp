@@ -1,5 +1,5 @@
 /**
- *  @file test/postprocess/test_shape_descriptors.cpp
+ *  @file test/postprocess/shape_descriptors.cpp
  *  @brief Confirm native USR / USRCAT match RDKit within tolerance, and that fragment separation is rigid.
  *
  *  Each molecule is parsed with the library's parse contract, embedded as one ETKDGv3 conformer at a fixed seed
@@ -44,12 +44,12 @@
 #include "smallfield/postprocess/fragment_separation.hpp"
 #include "smallfield/postprocess/shape_descriptors.hpp"
 
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sfpost = smallfield::postprocess;
 namespace sftest = smallfield::tests;
 
-static constexpr std::string_view test_name_k = "test_shape_descriptors";
+static constexpr std::string_view test_name_k = "smallfield_test_shape_descriptors";
 
 /** One pathological molecule must not bury the log; the reporters keep counting past this. */
 static constexpr std::size_t max_printed_lines_k = 40;

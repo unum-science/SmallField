@@ -1,5 +1,5 @@
 /**
- *  @file test/preprocess/test_chirality.cpp
+ *  @file test/preprocess/chirality.cpp
  *  @brief Police the device chirality check against conformers RDKit embedded from the same tags.
  *
  *  `validate_chirality_` answers one question per molecule: does every extracted chiral center realize the signed
@@ -11,7 +11,7 @@
  *
  *  Coverage: a curated set of stereocenter-bearing drug molecules plus an optional SMILES corpus named by `argv[1]`
  *  or `SMALLFIELD_TEST_CORPUS`, capped by `argv[2]` or `SMALLFIELD_TEST_MAX_MOLS`; a named corpus that does not open
- *  is a failure, never an empty run. Compiled with g++, C++20. CUDA kernels in test_chirality_kernels.cu.
+ *  is a failure, never an empty run. Compiled with g++, C++20. CUDA kernels in chirality_kernels.cu.
  */
 
 #include <cstddef> // `std::size_t`
@@ -29,15 +29,15 @@
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 #include "smallfield/types/views.hpp"
 
-#include "test/preprocess/test_chirality_kernels.hpp"
-#include "test/test_helpers.hpp"
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/helpers.hpp"
+#include "test/preprocess/chirality_kernels.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-static constexpr std::string_view test_name_k = "test_chirality";
+static constexpr std::string_view test_name_k = "smallfield_test_chirality";
 
 /** A stereo-rich corpus can disagree at hundreds of molecules, and ten lines already name the pattern. */
 static constexpr std::size_t max_printed_lines_k = 10;

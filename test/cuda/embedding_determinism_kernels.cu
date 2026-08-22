@@ -1,8 +1,8 @@
 /**
- *  @file test/cuda/test_embedding_determinism_kernels.cu
+ *  @file test/cuda/embedding_determinism_kernels.cu
  *  @brief CUDA driver for the metric-embedding reproducibility test.
  *
- *  Compiled by nvcc. The host test logic is in test_embedding_determinism.cpp, compiled by g++.
+ *  Compiled by nvcc. The host test logic is in embedding_determinism.cpp, compiled by g++.
  */
 
 #include <cstddef> // `std::size_t`
@@ -16,7 +16,7 @@
 #include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/storage.hpp"
 
-#include "test/cuda/test_embedding_determinism_kernels.hpp"
+#include "test/cuda/embedding_determinism_kernels.hpp"
 
 namespace sfc = smallfield::cuda;
 namespace sft = smallfield::types;

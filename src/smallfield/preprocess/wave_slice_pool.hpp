@@ -165,7 +165,7 @@ struct wave_slice_shape_t {
  *  data it measures.
  *
  *  Residence is @b not carried here, and cannot be until the one caller that walks a device allocation
- *  moves with it: `launch_gpu_pipeline` and `test/cuda/test_bond_distance_kernels.cu` both walk device
+ *  moves with it: `launch_gpu_pipeline` and `test/cuda/bond_distance_kernels.cu` both walk device
  *  bytes, while `wave_slice_pool_t::host_view` walks pinned host bytes. Nothing but the call site says
  *  which.
  */

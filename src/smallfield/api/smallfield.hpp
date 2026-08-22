@@ -119,7 +119,7 @@ struct launch_scratch_t;
  *  second resident wave would write over the first's regions; one set per slot, at 75 % of free VRAM per
  *  wave, halves the wave rather than deepening the pipeline. The dispatch loop could not use a third slot
  *  anyway, finalizing wave N−1 before launching wave N. Named for the pinned prep ring rather than the
- *  pipeline, because `cli/smallfield_batch.cpp` carries an unrelated depth for the four-role handoff.
+ *  pipeline, because `cli/generate.cpp` carries an unrelated depth for the four-role handoff.
  */
 inline constexpr std::uint32_t pinned_prep_depth_k = 2;
 

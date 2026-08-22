@@ -1,5 +1,5 @@
 /**
- *  @file bench/bench_bounds_embedding.cpp
+ *  @file bench/bounds_quality.cpp
  *  @brief Score `build_bounds_matrix` by handing it to RDKit's own embedder and reading what comes back.
  *
  *  Our refusal counter cannot answer this: `bounds_infeasible_k` is emitted at one site and has read zero across
@@ -38,8 +38,8 @@
 #include "smallfield/types/molecule_descriptor.hpp"
 #include "smallfield/types/views.hpp"
 
-#include "bench/bench_arguments.hpp"
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "bench/arguments.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sfbench = smallfield::bench;
 namespace sfp = smallfield::preprocess;
@@ -47,7 +47,7 @@ namespace sftest = smallfield::tests;
 namespace sftypes = smallfield::types;
 
 /** Name printed on every line so a concatenated CI log stays attributable. */
-static constexpr char const *executable_name_k = "bench_bounds_embedding";
+static constexpr char const *executable_name_k = "smallfield_bench_bounds_quality";
 
 /** Molecules read from the corpus when `--molecules` is not given; the size the recorded experiment used. */
 static constexpr std::size_t default_molecule_count_k = 300;

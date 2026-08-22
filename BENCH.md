@@ -8,14 +8,14 @@ For where the time goes and what to do about it see [`ROADMAP.md`](ROADMAP.md); 
 
 Four binaries measure four different things, and quoting one as another is the most common mistake made with this document.
 
-| Binary                     | Measures                                            | Includes the Pipeline Roles                |
-| :------------------------- | :-------------------------------------------------- | :----------------------------------------- |
-| `smallfield_batch`         | End-to-end corpus throughput, Parquet in and out    | Yes — reader, gpu-runner, fallback, writer |
-| `bench_profile`            | One `generate_conformers` pass, GPU only            | No                                         |
-| `bench_conformer_backends` | SmallField against RDKit CPU, plus the quality gate | No                                         |
-| `bench_mmff_kernels`       | The MMFF typing, extraction and CSR kernel trio     | No                                         |
+| Binary                      | Measures                                            | Includes the Pipeline Roles                |
+| :-------------------------- | :-------------------------------------------------- | :----------------------------------------- |
+| `smallfield_generate`       | End-to-end corpus throughput, Parquet in and out    | Yes — reader, gpu-runner, fallback, writer |
+| `smallfield_bench_profile`  | One `generate_conformers` pass, GPU only            | No                                         |
+| `smallfield_bench_backends` | SmallField against RDKit CPU, plus the quality gate | No                                         |
+| `smallfield_bench_mmff`     | The MMFF typing, extraction and CSR kernel trio     | No                                         |
 
-__Only `smallfield_batch` measures the shipping system.__
+__Only `smallfield_generate` measures the shipping system.__
 The library harnesses skip the Parquet reader, the writer, and the RDKit fallback that re-embeds what the GPU refused.
 That fallback is 42 % of a shard's serial wall clock on Enamine REAL and roughly 85 % on PubChem, so a library number quoted as pipeline throughput overstates the pipeline by up to 7×.
 
@@ -24,20 +24,20 @@ That fallback is 42 % of a shard's serial wall clock on Enamine REAL and roughly
 ```bash
 # Build. `dev` is the inner loop; `release` is the shipped fatbin.
 cmake --preset dev -DSMALLFIELD_BUILD_CLI=ON
-cmake --build build --parallel
+cmake --build build_dev --parallel
 
 # End-to-end pipeline throughput — the number that describes the shipping system.
 # Stage at least six shards into a folder, or the depth-5 ring never fills.
 LD_PRELOAD=$PWD/.pixi/envs/default/lib/libjemalloc.so.2 \
-  ./build/cli/smallfield_batch \
+  build_dev/smallfield_generate \
   --input <folder of parquet-shards> --output <folder on local disk> \
   --dataset real --num-conformers 3 --verbose
 
 # GPU stage alone, no reader, writer or fallback
-./build/bench/bench_profile --smi <corpus>.smi --conformers 3
+build_dev/smallfield_bench_profile --smi <corpus>.smi --conformers 3
 
 # RDKit comparison and the paired quality gate
-./build/bench/bench_conformer_backends --smi <corpus>.smi --conformers 3 --quality-samples 512
+build_dev/smallfield_bench_backends --smi <corpus>.smi --conformers 3 --quality-samples 512
 ```
 
 Three conformers per molecule is the production mode; K changes which resource binds, so a number at another K answers a different question.
@@ -102,7 +102,7 @@ __Exit codes__ are `0` success, `1` a check failed, `2` the command line was ref
 One H100 80 GB HBM3, Intel Xeon Platinum 8468 with 16 threads, driver 570.195.03 and CUDA 12.8.
 Sixteen host threads is this box's defining constraint: `compute_thread_budget_` sizes the gpu-runner-role and fallback-role at `num_procs - 4` each, so they are 12 wide and contend, where a many-threaded server would not.
 
-__Pipeline, `smallfield_batch`, K=3, one GPU.__
+__Pipeline, `smallfield_generate`, K=3, one GPU.__
 
 | Corpus                        |    End-to-End | Molecule Success | Measured               |
 | :---------------------------- | ------------: | ---------------: | :--------------------- |
@@ -135,7 +135,7 @@ __`shape-descriptors` is the second-largest host cost on REAL__, and it is not f
 `compute_shape_descriptors_` runs over every molecule, outside the retry guard, and its body is a second full `SmilesToMol` + `addHs` plus four `SubstructMatch` calls over a SMILES the `preprocess-step` already parsed.
 On a 200 K PubChem run the same span reads 1.6 %, because there the fallback is large enough to dwarf it — another figure that does not transfer between corpora.
 
-__Library, `bench_conformer_backends`, PubChem 20,000 molecules, K=1.__
+__Library, `smallfield_bench_backends`, PubChem 20,000 molecules, K=1.__
 
 | System                | conf/s |
 | :-------------------- | -----: |
@@ -249,7 +249,7 @@ They have different fixes, so the shape is worth more than the percentage: the r
 ### Closing The Tetrahedral Residual
 
 Measured in-tree by `bench/validate_stereo.py`, which runs the control every time and refuses a run whose control is non-zero.
-One 20,000-molecule PubChem shard through `smallfield_batch` at K=3, scored over 5,000 molecules selected by `input_row` at an even stride so every configuration covers the same molecules.
+One 20,000-molecule PubChem shard through `smallfield_generate` at K=3, scored over 5,000 molecules selected by `input_row` at an even stride so every configuration covers the same molecules.
 `1× H100`, 8 physical cores, 2026-08-14.
 
 | Configuration                             |                    Centres Inverted | E/Z Inverted | Fallback Molecules |      Wall |
@@ -283,7 +283,7 @@ Whether that cost matters depends on the box, the same way the repair's gain doe
 
 ### A Centre Carries Two Signed Volumes, And They Are Not The Same Number
 
-The same 19,952-molecule PubChem shard through `smallfield_batch` at K=3, scored over 10,000 molecules by `bench/validate_stereo.py`.
+The same 19,952-molecule PubChem shard through `smallfield_generate` at K=3, scored over 10,000 molecules by `bench/validate_stereo.py`.
 `1× H100`, 8 physical cores, 2026-08-16.
 The control reads 0.000 % on every row.
 
@@ -362,7 +362,7 @@ E/Z reads 0.163 % there against a control of 0.202 %, both two bonds of a ~1,200
 
 `mmff_polish_warp_kernel` does not move on any architecture — 63 registers and no stack on `sm_90`, 71 and 8 bytes on `sm_100`, 79 and 8 bytes on `sm_120`, each byte-identical to the same build with the second term removed.
 The pivot path lost the three cross products it used to sum and gained a shared normal, which is what pays for the second term's two.
-`compute-sanitizer --tool racecheck` reports 0 hazards over `test_pipeline`.
+`compute-sanitizer --tool racecheck` reports 0 hazards over `smallfield_test_pipeline`.
 
 ### The Distance-Geometry Budget Is Not Free, And Still Worth Raising
 
@@ -370,7 +370,7 @@ Doubling the two four-dimensional stages — distance geometry 100 → 200 itera
 
 | Measurement                                  |      before |       after |       delta |
 | :------------------------------------------- | ----------: | ----------: | ----------: |
-| `stereo_failure`, `bench_conformer_backends` |     1.830 % |     1.240 % |   __−32 %__ |
+| `stereo_failure`, `smallfield_bench_backends` |     1.830 % |     1.240 % |   __−32 %__ |
 | GPU arm, same harness                        |    3,649 ms |    4,225 ms | __+15.8 %__ |
 | fallback dispatches, full CLI at K=3         |         599 |         401 |   __−33 %__ |
 | `gpu-runner` wall, full CLI                  |       5.6 s |       7.2 s |       +29 % |
@@ -399,7 +399,7 @@ The conflation is latent, not live.
 Preloading or not preloading it proves nothing, because `SMALLFIELD_USE_JEMALLOC=ON` puts it in `DT_NEEDED` regardless.
 
 ```bash
-cmake -B build-nojemalloc -DCMAKE_BUILD_TYPE=Release -DSMALLFIELD_CUDA_ARCH="90-real" \
+cmake -B build_nojemalloc -DCMAKE_BUILD_TYPE=Release -DSMALLFIELD_CUDA_ARCH="90-real" \
       -DSMALLFIELD_CUDA_LINEINFO=ON -DSMALLFIELD_USE_JEMALLOC=OFF
 ```
 

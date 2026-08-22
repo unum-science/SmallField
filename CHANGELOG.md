@@ -9,6 +9,38 @@ An experiment that was tried and rejected without landing is dated by the commit
 Every number names the hardware it was measured on, because this project targets Hopper and Blackwell alike and at every tier from one GPU to a multi-node cluster.
 A number without that label is unlabelled, not implicitly the machine `BENCH.md` happens to use — entries here span single-H100 kernel work and 8-GPU Blackwell throughput runs, and the two do not transfer.
 
+## 2026-08-22 — One Name per Binary, in the Build Root — `710e18c`
+
+`./build/bench/bench_conformer_backends` named its role three times and its subject once.
+Every executable now lands flat in the build root through `CMAKE_RUNTIME_OUTPUT_DIRECTORY`, every source is named for its subject alone, and the role moves into the target name, derived mechanically as `smallfield_<role>_<source stem>`.
+
+The two CLI binaries are renamed for what they do rather than what they process, so an older invocation needs rewriting:
+
+| was | is |
+| :-- | :- |
+| `build/cli/smallfield_batch` | `build_dev/smallfield_generate` |
+| `build/cli/smallfield_descriptors` | `build_dev/smallfield_describe` |
+| `build/bench/bench_conformer_backends` | `build_dev/smallfield_bench_backends` |
+| `build/bench/bench_profile` | `build_dev/smallfield_bench_profile` |
+| `build/bench/bench_bounds_embedding` | `build_dev/smallfield_bench_bounds_quality` |
+| `build/bench/bench_mmff_kernels` | `build_dev/smallfield_bench_mmff` |
+| `build/bench/bench_mmff_convergence` | `build_dev/smallfield_bench_minimizer` |
+| `build/bench/bench_kernel_replay` | `build_dev/smallfield_bench_kernel_replay` |
+| `build/test/test_<name>` | `build_dev/smallfield_test_<name>` |
+
+Four test subjects are renamed as well as de-stuttered, because the old names misdescribed what the binary gates: `test_dg_energy` also covers the gradient, the chirality window and FIRE, so it is `distance_geometry`; `test_descriptor` named the molecule descriptor while `test_shape_descriptors` named USR and USRCAT, so it is `molecule_descriptor`; `test_chiral_parity` is `chiral_volume_sign`, which is the quantity it derives; and `test_csd_torsion_predicates` is `csd_torsion_host`, paired against the device half.
+Every file under `test/mmff94/` repeated its own folder, and the four that remain now read as two matched pairs, `cpu_typer` against `gpu_typer` and `cpu_extract` against `gpu_extract`.
+
+Each binary's `executable_name_k` or `test_name_k` is now its own name, so a line in a concatenated CI log and a `ctest -R` selector are the same string.
+The `producer` key in every output shard's Parquet metadata reads `smallfield_generate`; nothing reads it back, and shards written before this date carry `smallfield_batch`.
+
+Preset directories move to `build_dev`, `build_debug`, `build_release` and `build_profile`, and `setup.py` follows with its default.
+
+Two build flags moved with the layout.
+`-march=native` was unconditional on every Release and RelWithDebInfo build, which meant the `release` preset emitted a five-architecture fatbin behind host code that only ran on the machine that built it, and `setup.py` inherited the same for wheels.
+It is now `SMALLFIELD_MARCH_NATIVE`, off by default and on in the `dev` and `profile` presets, so every measured number keeps its meaning and only the shipping build changes.
+Install rules move behind `SMALLFIELD_INSTALL`, defaulting to on at top level, so a vendoring consumer stops inheriting an export set it cannot use.
+
 ## 2026-08-11 — Batch Region Offsets Past the 32-Bit Ceiling — `002e119`
 
 `per_mol_sizes_t::bounds` and `::bond_distance` summed `num_atoms * num_atoms` across a batch in `std::uint32_t`, and that sum sized the pinned allocation.

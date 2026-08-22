@@ -59,7 +59,7 @@ constexpr std::string_view smoothing_name(smoothing_t verdict) noexcept {
  *  @brief Slack a crossed pair is allowed before it counts as impossible, in angstrom.
  *
  *  A pair whose bounds meet exactly — a rigid triangle, a fixed bond — crosses by the rounding a float sweep
- *  leaves behind, and refusing those would refuse molecules that embed perfectly well. `test_triangle_smooth`
+ *  leaves behind, and refusing those would refuse molecules that embed perfectly well. `triangle_smooth`
  *  prints the largest crossing its corpus produced, so the margin against this number is read, not assumed.
  */
 constexpr float bounds_crossing_tolerance_k = 1e-4f;

@@ -1,5 +1,5 @@
 /**
- *  @file bench/bench_mmff_kernels_device.hpp
+ *  @file bench/mmff_kernels.hpp
  *  @brief Device-side launcher for the GPU MMFF kernel-trio scaling benchmark.
  */
 

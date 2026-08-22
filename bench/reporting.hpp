@@ -1,5 +1,5 @@
 /**
- *  @file bench/bench_reporting.hpp
+ *  @file bench/reporting.hpp
  *  @brief The per-status breakdown every conformer benchmark prints beneath its throughput line.
  *
  *  A `conf/s` figure already divides by produced conformers, so only this breakdown makes a rejection class visible —

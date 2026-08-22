@@ -1,5 +1,5 @@
 /**
- *  @file test/cuda/test_csd_torsion_device.cpp
+ *  @file test/cuda/csd_torsion_device.cpp
  *  @brief Gate the device CSD torsion matcher against the host extractor, molecule for molecule.
  *
  *  The device kernel and `extract_etk_torsions_native` read the same flat descriptor and compiled pattern
@@ -34,14 +34,14 @@
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
-#include "test/cuda/test_csd_torsion_device_kernels.hpp"
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/cuda/csd_torsion_device_kernels.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-static constexpr std::string_view test_name_k = "test_csd_torsion_device";
+static constexpr std::string_view test_name_k = "smallfield_test_csd_torsion_device";
 
 namespace smallfield::tests {
 

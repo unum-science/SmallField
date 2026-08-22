@@ -144,7 +144,7 @@ static inline std::size_t estimate_per_molecule_batch_bytes(std::uint32_t max_at
  *  `cudaMemGetInfo` on every device failed — degrades to half the smallest per-slot @b total VRAM rather
  *  than to nothing, which would drop the sizer onto its hardcoded default; both arms yield zero only when
  *  nothing at all is known about the hardware. Not `static`, because the probe feeding it cannot be steered
- *  from a test and `test/api/test_pipeline.cpp` drives this arithmetic directly.
+ *  from a test and `test/api/pipeline.cpp` drives this arithmetic directly.
  */
 std::size_t wave_budget_bytes(std::size_t free_probe_count, std::size_t smallest_free_per_slot,
                               std::size_t smallest_total_per_slot) noexcept {

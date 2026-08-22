@@ -1,5 +1,5 @@
 /**
- *  @file test/cli/test_shard_sealing.cpp
+ *  @file test/cli/shard_sealing.cpp
  *  @brief Pin the two ways an input shard leaves the set a later run is offered: its sentinel, and parking.
  *
  *  Completeness downstream is the `.encoded` sentinel and nothing else, so a shard ending a run with neither
@@ -21,13 +21,13 @@
 
 #include "cli/shard_inventory.hpp"
 
-#include "test/test_helpers.hpp"
+#include "test/helpers.hpp"
 
 namespace fs = std::filesystem;
 namespace sfcli = smallfield::cli;
 namespace sftest = smallfield::tests;
 
-static constexpr std::string_view test_name_k = "test_shard_sealing";
+static constexpr std::string_view test_name_k = "smallfield_test_shard_sealing";
 
 namespace smallfield::tests {
 

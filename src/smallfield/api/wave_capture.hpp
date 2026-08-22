@@ -5,7 +5,7 @@
  *  Every NVIDIA profiler crashes a binary that links the conda stack, so a kernel measurement has to happen
  *  in a process linking nothing but the CUDA runtime. This writes one bin's launch to disk — the batch pool,
  *  the metric embedding, the byte offset of each pointer argument inside them, and the launch geometry — and
- *  `bench/bench_kernel_replay.cu` reads it back and launches the same two kernels with the same arguments.
+ *  `bench/kernel_replay.cu` reads it back and launches the same two kernels with the same arguments.
  *  The capture is off unless `SMALLFIELD_CAPTURE_DIR` names a writable directory, and it fires for the first
  *  bin whose atom cap equals `SMALLFIELD_CAPTURE_BIN`, once per process.
  */

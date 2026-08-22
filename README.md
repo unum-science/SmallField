@@ -148,7 +148,7 @@ On one H100 the GPU stage runs at 10,070 conf/s and the full batch pipeline deli
 
 Python and C++ share the GPU path.
 `sf.generate_conformers` and `smallfield::api::context_t` enter the same CUDA pipeline, so neither is the faster interface.
-The `smallfield_batch` binary adds the Parquet reader, writer and CPU fallback roles around it for corpus-scale runs.
+The `smallfield_generate` binary adds the Parquet reader, writer and CPU fallback roles around it for corpus-scale runs.
 
 Sustained throughput depends on how often the GPU refuses a molecule, since every refusal falls back to CPU RDKit.
 Clean, lead-like corpora stay near the ceiling; heterogeneous archives with large molecules and unsupported elements pay more.
@@ -204,15 +204,15 @@ etkdg_ctx.generate_conformers(smiles, config, max_atoms,
 Restartable parquet → parquet binary that streams shards through pipeline-roles (reader → runner → writer) and resumes from a partially-completed output folder.
 
 ```bash
-smallfield_batch --input chembl_smi/ --output chembl_3d_mmff/ \
+smallfield_generate --input chembl_smi/ --output chembl_3d_mmff/ \
     --num-conformers 1 --gpus 0,1,2,3,4,5,6,7
 ```
 
-`smallfield_descriptors` augments shards that already hold 3D conformers, computing USR and USRCAT shape descriptors from the stored fp16 coordinates instead of re-running the GPU.
+`smallfield_describe` augments shards that already hold 3D conformers, computing USR and USRCAT shape descriptors from the stored fp16 coordinates instead of re-running the GPU.
 It rounds through fp16 exactly as the producer does, so a re-generated shard and an augmented one agree byte for byte.
 
 ```bash
-smallfield_descriptors --input chembl_3d_mmff/ --output chembl_3d_usrcat/
+smallfield_describe --input chembl_3d_mmff/ --output chembl_3d_usrcat/
 ```
 
 ## Installation
@@ -232,14 +232,15 @@ C++ tests and benchmarks need RDKit, which `pixi install` already provides — t
 
 ```bash
 cmake --preset dev                     # one architecture, detected from the local GPU
-cmake --build build --parallel
+cmake --build build_dev --parallel
 ctest --preset dev
 ```
 
-`--preset release` builds the full `80/89/90/100/120` fatbin into `build-release/`, which is what ships and what CI compiles.
+`--preset release` builds the full `80/89/90/100/120` fatbin into `build_release/`, which is what ships and what CI compiles.
 It is several times slower, so keep it for release checks rather than the inner loop.
+It is also the preset that leaves `SMALLFIELD_MARCH_NATIVE` off, so the host code it emits runs on any CPU rather than only the one that built it.
 
-Every knob is `SMALLFIELD_`-prefixed and listed at the top of `CMakeLists.txt`; `cmake -LH build | grep SMALLFIELD` prints them with their descriptions.
+Every knob is `SMALLFIELD_`-prefixed and listed at the top of `CMakeLists.txt`; `cmake -LH build_dev | grep SMALLFIELD` prints them with their descriptions.
 `SMALLFIELD_BUILD_TESTS` and `SMALLFIELD_BUILD_BENCHMARKS` default to on only when this is the top-level project, so vendoring the tree gets the library alone.
 
 ## Using SmallField From Another Project
@@ -259,13 +260,14 @@ Because the library is header-only apart from one translation unit, the headers 
 ## C++ Benchmarks
 
 ```bash
-cmake --build build --parallel --target bench_conformer_backends
+cmake --build build_dev --parallel --target smallfield_bench_backends
 
 # ETKDG + MMFF94 throughput (RDKit CPU vs SmallField GPU)
-./build/bench/bench_conformer_backends --smi /path/to/chembl.smi
+build_dev/smallfield_bench_backends --smi /path/to/chembl.smi
 ```
 
-`--multi-gpu-only` on `bench_conformer_backends` reports isolated 1/2/4/8-GPU scaling.
+Every executable lands flat in the build root and is named `smallfield_<role>_<source stem>`, so `build_dev/smallfield_bench_` completes to the whole set.
+`--multi-gpu-only` on `smallfield_bench_backends` reports isolated 1/2/4/8-GPU scaling.
 
 ## Project Layout
 
@@ -277,9 +279,9 @@ src/smallfield/preprocess/  host preprocessing: SMILES parse, bounds, Cahn-Ingol
 src/smallfield/mmff94/      native MMFF94 typer, charge, term extractor (CPU + GPU)
 src/smallfield/cuda/        CUDA kernels: preprocess, metric embedding, DG, ETK, MMFF, FIRE
 src/smallfield/postprocess/ USR / USRCAT shape descriptors, fragment separation
-cli/                        smallfield_batch (generate) + smallfield_descriptors (augment)
+cli/                        generate.cpp + describe.cpp, the two Parquet binaries
 test/                       C++ and Python tests cross-validated against RDKit
-bench/                      bench_conformer_backends + bench_mmff_kernels + bench_profile
+bench/                      backends.cpp + mmff.cpp + profile.cpp + minimizer.cpp
 python/smallfield/          Python package: api.py (generate), tools/ (shard preparation)
 ```
 

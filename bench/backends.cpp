@@ -1,5 +1,5 @@
 /**
- *  @file bench/bench_conformer_backends.cpp
+ *  @file bench/backends.cpp
  *  @brief RDKit CPU against SmallField GPU over one SMILES corpus, swept across batch sizes, with the
  *  SmallField geometries cross-validated by RDKit's own MMFF94.
  *
@@ -29,9 +29,9 @@
 #include "smallfield/api/smallfield.hpp"
 #include "smallfield/types/views.hpp"
 
-#include "bench/bench_arguments.hpp"
-#include "bench/bench_reporting.hpp"
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "bench/arguments.hpp"
+#include "bench/reporting.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sfapi = smallfield::api;
 namespace sfbench = smallfield::bench;
@@ -40,7 +40,7 @@ namespace sftypes = smallfield::types;
 using clock_type_t = std::chrono::high_resolution_clock;
 
 /** Name printed on every throughput line so a concatenated CI log stays attributable. */
-static constexpr char const *executable_name_k = "bench_conformer_backends";
+static constexpr char const *executable_name_k = "smallfield_bench_backends";
 
 /* Ceilings on the value-taking flags, so a mistyped count is a diagnostic and not a `std::bad_alloc`. */
 static constexpr std::uint32_t max_conformers_per_molecule_k = 1024;

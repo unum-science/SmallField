@@ -67,26 +67,26 @@ jobs:
       # project ships. `SMALLFIELD_CUDA_ARCH` is left at its default, which is the full fatbin -
       # locally the `dev` preset narrows it to `native`, and that is the guarantee this job restores.
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+        run: cmake -S . -B build_release -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
 
       - name: Report the architectures being built
-        run: grep -E '^SMALLFIELD_CUDA_ARCH' build/CMakeCache.txt
+        run: grep -E '^SMALLFIELD_CUDA_ARCH' build_release/CMakeCache.txt
 
       - name: Build
-        run: cmake --build build --parallel
+        run: cmake --build build_release --parallel
 
       # Unrolled rather than looped so a missing architecture names itself in the job summary. sm_89
       # is the one an edit to the list would silently drop, and the one the L40S target needs.
       - name: Confirm sm_80 reached the binary
-        run: cuobjdump --list-elf build/test/test_pipeline | grep -q sm_80
+        run: cuobjdump --list-elf build_release/smallfield_test_pipeline | grep -q sm_80
       - name: Confirm sm_89 reached the binary
-        run: cuobjdump --list-elf build/test/test_pipeline | grep -q sm_89
+        run: cuobjdump --list-elf build_release/smallfield_test_pipeline | grep -q sm_89
       - name: Confirm sm_90 reached the binary
-        run: cuobjdump --list-elf build/test/test_pipeline | grep -q sm_90
+        run: cuobjdump --list-elf build_release/smallfield_test_pipeline | grep -q sm_90
       - name: Confirm sm_100 reached the binary
-        run: cuobjdump --list-elf build/test/test_pipeline | grep -q sm_100
+        run: cuobjdump --list-elf build_release/smallfield_test_pipeline | grep -q sm_100
       - name: Confirm sm_120 reached the binary
-        run: cuobjdump --list-elf build/test/test_pipeline | grep -q sm_120
+        run: cuobjdump --list-elf build_release/smallfield_test_pipeline | grep -q sm_120
 
       # The host-only test binaries never open a device: they link `CUDA::cudart` for the libcu++
       # headers behind `smallfield/types/views.hpp` and never call into it, and nothing here links

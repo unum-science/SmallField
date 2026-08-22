@@ -1,5 +1,5 @@
 /**
- *  @file test/mmff94/test_mmff_typer.cpp
+ *  @file test/mmff94/cpu_typer.cpp
  *  @brief Cross-validate the native MMFF atom typer against RDKit's `MMFFMolProperties::getMMFFAtomType`.
  *
  *  On drug-like SMILES. The gate counts @b molecules, not atoms: a wrong type is a wrong molecule, and averaging
@@ -41,15 +41,15 @@
 #include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 #include "smallfield/mmff94/mmff94_typer.hpp"
 
-#include "test/test_helpers.hpp"
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/helpers.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sfparam = smallfield::parameters;
 namespace sfmmff = smallfield::mmff94;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-static constexpr std::string_view test_name_k = "test_mmff_typer";
+static constexpr std::string_view test_name_k = "smallfield_test_cpu_typer";
 
 namespace smallfield::tests {
 

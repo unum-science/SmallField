@@ -1,5 +1,5 @@
 /**
- *  @file bench/bench_mmff_convergence.cpp
+ *  @file bench/minimizer.cpp
  *  @brief Separate an algorithmic stall from an unreachable threshold from too small a budget, in the MMFF94 polish.
  *
  *  Production telemetry reports the Barzilai-Borwein polish exhausting its whole budget on essentially every slot at
@@ -35,9 +35,9 @@
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 #include "smallfield/types/views.hpp"
 
-#include "bench/bench_arguments.hpp"
-#include "test/cuda/test_mmff_gradient_kernels.hpp"
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "bench/arguments.hpp"
+#include "test/cuda/mmff_gradient_kernels.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sfc = smallfield::cuda;
 namespace sfp = smallfield::preprocess;
@@ -46,7 +46,7 @@ namespace sftest = smallfield::tests;
 
 namespace smallfield::bench {
 
-static constexpr std::string_view executable_name_k = "bench_mmff_convergence";
+static constexpr std::string_view executable_name_k = "smallfield_bench_minimizer";
 
 #pragma region Sweep Points
 

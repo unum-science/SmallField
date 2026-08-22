@@ -7,7 +7,7 @@
  *  same data in flat arrays that upload with one copy each and binary-search on the device, and every
  *  cascade answers byte-identically to RDKit's `operator()` — including the four- and five-level
  *  `MMFFDef` equivalence fallbacks of angle, torsion and out-of-plane.
- *  `test/parameters/test_mmff94_tables.cpp` gates that against RDKit over 10K random key tuples.
+ *  `test/parameters/mmff94_tables.cpp` gates that against RDKit over 10K random key tuples.
  *
  *  Doubles become floats at extraction time: the ETKDG kernel consumes float32 and the extra
  *  precision sits below the tolerances required.
@@ -233,7 +233,7 @@ static_assert(sizeof(mmff94_covrad_entry_t) == 12);
 
 /*  The `MMFFVdWCollection` scalars that belong to the collection rather than to one atom type. They are
  *  the same on every molecule, so the nonbonded kernel compiles them in rather than reading them from the
- *  uploaded view; `test/parameters/test_mmff94_tables.cpp` compares each against RDKit's live collection,
+ *  uploaded view; `test/parameters/mmff94_tables.cpp` compares each against RDKit's live collection,
  *  which is what holds a compiled-in constant to the parameter file it was read from.
  *
  *  MMFF `power`, the exponent `alpha_i` is raised to, has no consumer: `r_star` arrives already combined

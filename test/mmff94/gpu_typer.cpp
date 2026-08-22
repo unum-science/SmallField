@@ -1,5 +1,5 @@
 /**
- *  @file test/mmff94/test_mmff_gpu_typer.cpp
+ *  @file test/mmff94/gpu_typer.cpp
  *  @brief Run the GPU MMFF typer kernel against the native CPU typer on a set of drug-like SMILES.
  *
  *  Gate: byte-identical atom types and per-atom partial charges.
@@ -31,16 +31,16 @@
 #include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
-#include "test/mmff94/test_mmff_gpu_typer_kernels.hpp"
-#include "test/test_helpers.hpp"
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/helpers.hpp"
+#include "test/mmff94/gpu_typer_kernels.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sfmmff = smallfield::mmff94;
 namespace sfparam = smallfield::parameters;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-static constexpr std::string_view test_name_k = "test_mmff_gpu_typer";
+static constexpr std::string_view test_name_k = "smallfield_test_gpu_typer";
 
 namespace smallfield::tests {
 

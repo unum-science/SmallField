@@ -1,5 +1,5 @@
 /**
- *  @file test/preprocess/test_batch_layout.cpp
+ *  @file test/preprocess/batch_layout.cpp
  *  @brief Validate the batch-layout arithmetic against 32-bit wrap, with no GPU and no RDKit corpus.
  *
  *  Two regions a batch carries are quadratic in the atom count — the N × N distance bounds matrix and the
@@ -26,12 +26,12 @@
 
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 
-#include "test/test_helpers.hpp"
+#include "test/helpers.hpp"
 
 namespace sfp = smallfield::preprocess;
 namespace sftest = smallfield::tests;
 
-static constexpr std::string_view test_name_k = "test_batch_layout";
+static constexpr std::string_view test_name_k = "smallfield_test_batch_layout";
 
 /** Atoms per molecule in the headline sweep — the pipeline's own per-molecule cap. */
 static constexpr std::uint32_t sweep_atom_count_k = smallfield::types::max_atoms_per_molecule_k;

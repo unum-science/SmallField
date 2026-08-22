@@ -1,5 +1,5 @@
 /**
- *  @file test/cuda/test_csd_torsion_device_kernels.hpp
+ *  @file test/cuda/csd_torsion_device_kernels.hpp
  *  @brief Device harness for the CSD torsion matcher, for use by its unit tests.
  */
 

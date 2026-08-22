@@ -1,5 +1,5 @@
 /**
- *  @file test/mmff94/test_mmff_gpu_extract_kernels.cu
+ *  @file test/mmff94/gpu_extract_kernels.cu
  *  @brief Validate the GPU MMFF term-extractor kernel.
  *
  *  Runs it and hands results back to the host for byte-level diff vs the CPU native extractor.
@@ -20,7 +20,7 @@
 #include "smallfield/parameters/mmff94_tables_device.hpp"
 #include "smallfield/types/storage.hpp"
 
-#include "test/mmff94/test_mmff_gpu_extract_kernels.hpp"
+#include "test/mmff94/gpu_extract_kernels.hpp"
 
 namespace sfmmff = smallfield::mmff94;
 namespace sfparam = smallfield::parameters;

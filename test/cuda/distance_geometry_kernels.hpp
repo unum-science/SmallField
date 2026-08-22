@@ -1,5 +1,5 @@
 /**
- *  @file test/cuda/test_dg_energy_kernels.hpp
+ *  @file test/cuda/distance_geometry_kernels.hpp
  *  @brief Device harness for distance-geometry energy, chirality validation, and FIRE minimization.
  */
 

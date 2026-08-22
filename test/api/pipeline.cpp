@@ -1,5 +1,5 @@
 /**
- *  @file test/api/test_pipeline.cpp
+ *  @file test/api/pipeline.cpp
  *  @brief End-to-end ETKDG over the SmallField library API: SMILES → `context_t::generate_conformers` →
  *  RDKit cross-validation, plus wave-sizing arithmetic, per-wave timing, and two-context reentrancy.
  */
@@ -24,12 +24,12 @@
 #include "smallfield/api/smallfield.hpp"
 #include "smallfield/types/views.hpp"
 
-#include "test/test_helpers.hpp"
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/helpers.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sftest = smallfield::tests;
 
-static constexpr std::string_view test_name_k = "test_pipeline";
+static constexpr std::string_view test_name_k = "smallfield_test_pipeline";
 
 /** Molecules taken from a named corpus when no cap is given; the built-in molecules are always included. */
 static constexpr std::size_t default_max_molecules_k = 100;

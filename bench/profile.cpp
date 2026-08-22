@@ -1,5 +1,5 @@
 /**
- *  @file bench/bench_profile.cpp
+ *  @file bench/profile.cpp
  *  @brief Minimal CPU-prep profile driver: one `generate_conformers` call, no baseline and no warm-up, so
  *  a `perf record` over it sees the preprocessing alone.
  */
@@ -20,14 +20,14 @@
 
 #include "smallfield/api/smallfield.hpp"
 
-#include "bench/bench_arguments.hpp"
-#include "bench/bench_reporting.hpp"
+#include "bench/arguments.hpp"
+#include "bench/reporting.hpp"
 
 namespace sfapi = smallfield::api;
 namespace sfbench = smallfield::bench;
 
 /** Name printed on every throughput line so a concatenated CI log stays attributable. */
-static constexpr char const *executable_name_k = "bench_profile";
+static constexpr char const *executable_name_k = "smallfield_bench_profile";
 
 /** Ceiling on `--conformers`: the coordinate buffer is molecules times conformers times `max_atoms` times three
  *  halves, so an

@@ -37,7 +37,7 @@ Usage:
         --output test/preprocess/adversarial.smi \\
         --meta   test/preprocess/adversarial.meta.json
 
-Output: `adversarial.smi` is one SMILES per line, no IDs, fed into smi_to_parquet.py for smallfield_batch.
+Output: `adversarial.smi` is one SMILES per line, no IDs, fed into smi_to_parquet.py for smallfield_generate.
 The meta JSON records which template each row came from, so a diagnostic can point at the boundary a
 failing molecule exercises.
 """

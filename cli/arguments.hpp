@@ -1,5 +1,5 @@
 /**
- *  @file cli/cli_arguments.hpp
+ *  @file cli/arguments.hpp
  *  @brief `argparse` bindings shared by the `cli/` binaries, writing a parsed value into its destination.
  *
  *  `argparse`'s own `scan` answers a malformed token without naming the flag, so every value-taking flag goes

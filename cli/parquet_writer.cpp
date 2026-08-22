@@ -572,7 +572,7 @@ class row_columns_t {
  *  aligns to principal axes, but the FIRE/MMFF relaxation after it drifts the pose off that frame. */
 static std::shared_ptr<arrow::KeyValueMetadata> build_provenance_(writer_inputs_t const &inputs) {
     auto provenance = std::make_shared<arrow::KeyValueMetadata>();
-    provenance->Append("producer", "smallfield_batch");
+    provenance->Append("producer", "smallfield_generate");
 #ifdef SMALLFIELD_GIT_SHA
     provenance->Append("producer_git_sha", SMALLFIELD_GIT_SHA);
 #endif

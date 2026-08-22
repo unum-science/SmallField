@@ -1,5 +1,5 @@
 /**
- *  @file test/cuda/test_bounds_infeasible_kernels.hpp
+ *  @file test/cuda/bounds_infeasible_kernels.hpp
  *  @brief Device harness driving the metric prepass and the pipeline kernel over one bounds matrix.
  */
 

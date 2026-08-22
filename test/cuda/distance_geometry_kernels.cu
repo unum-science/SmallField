@@ -1,5 +1,5 @@
 /**
- *  @file test/cuda/test_dg_energy_kernels.cu
+ *  @file test/cuda/distance_geometry_kernels.cu
  *  @brief CUDA kernel wrappers for the distance-geometry energy, chirality, and FIRE tests.
  */
 
@@ -16,7 +16,7 @@
 #include "smallfield/cuda/fire_warp.cuh"
 #include "smallfield/types/storage.hpp"
 
-#include "test/cuda/test_dg_energy_kernels.hpp"
+#include "test/cuda/distance_geometry_kernels.hpp"
 
 namespace sfc = smallfield::cuda;
 namespace sft = smallfield::types;

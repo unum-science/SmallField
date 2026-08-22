@@ -2,7 +2,7 @@
  *  @file src/smallfield/log.hpp
  *  @brief Leveled, colored, timestamped logger used across library, CLI, tests, benches.
  *
- *  `logger_t` is a plain struct owned by the object that needs it — `context_t` carries one, `smallfield_batch`
+ *  `logger_t` is a plain struct owned by the object that needs it — `context_t` carries one, `smallfield_generate`
  *  owns its own for shard progress, each bench constructs a local one. No process-wide singletons, no
  *  thread_locals.
  *

@@ -1,5 +1,5 @@
 /**
- *  @file bench/bench_mmff_kernels.cpp
+ *  @file bench/mmff.cpp
  *  @brief GPU MMFF kernel-trio scaling benchmark — type-and-charge, term extraction, CSR build — timed against the
  *  CPU native path over the same batch.
  *
@@ -34,8 +34,8 @@
 #include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
-#include "bench/bench_arguments.hpp"
-#include "bench/bench_mmff_kernels_device.hpp"
+#include "bench/arguments.hpp"
+#include "bench/mmff_kernels.hpp"
 
 namespace sfbench = smallfield::bench;
 namespace sfmmff = smallfield::mmff94;
@@ -171,7 +171,7 @@ using sfbench::parsed_molecule_t;
 using sfbench::print_parse_outcomes_;
 
 /** Name printed on every throughput line so a concatenated CI log stays attributable. */
-static constexpr char const *executable_name_k = "bench_mmff_kernels";
+static constexpr char const *executable_name_k = "smallfield_bench_mmff";
 
 /** Ceiling on `--max-molecules`, so a mistyped count is a diagnostic rather than a late `cudaMalloc` failure. */
 static constexpr std::size_t max_molecules_per_run_k = 1'000'000;

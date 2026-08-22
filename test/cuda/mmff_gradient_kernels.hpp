@@ -1,5 +1,5 @@
 /**
- *  @file test/cuda/test_mmff_gradient_kernels.hpp
+ *  @file test/cuda/mmff_gradient_kernels.hpp
  *  @brief Device harness for the single-molecule MMFF94 energy and gradient kernel, for use by its unit tests.
  */
 

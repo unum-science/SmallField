@@ -1,5 +1,5 @@
 /**
- *  @file test/api/test_ez_stereo.cpp
+ *  @file test/api/ez_stereo.cpp
  *  @brief Confirm, round-trip through RDKit, that generated conformers honour defined E/Z double bonds.
  *
  *  Conformers for E/Z isomer pairs go back to RDKit, stereo is re-perceived from 3D, and it must match what
@@ -19,12 +19,12 @@
 #include "smallfield/api/smallfield.hpp"
 #include "smallfield/types/views.hpp"
 
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sfapi = smallfield::api;
 namespace sftest = smallfield::tests;
 
-static constexpr std::string_view test_name_k = "test_ez_stereo";
+static constexpr std::string_view test_name_k = "smallfield_test_ez_stereo";
 
 /**
  *  @brief A double bond's configuration, including the answer "the geometry carries none".

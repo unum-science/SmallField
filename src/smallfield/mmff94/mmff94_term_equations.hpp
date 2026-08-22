@@ -4,7 +4,7 @@
  *
  *  Nothing here may touch `etkdg_prepared_molecule_t` or `preprocess/etkdg_prepare_batch.hpp`, which is
  *  what lets `mmff94_extract_device.cuh` include it beside `mmff94_extract.hpp`. Sharing this layer is
- *  what keeps the two extractors in step: `test/mmff94/test_mmff_gpu_extract.cpp` requires byte identity
+ *  what keeps the two extractors in step: `test/mmff94/gpu_extract.cpp` requires byte identity
  *  across them for every bonded term.
  */
 

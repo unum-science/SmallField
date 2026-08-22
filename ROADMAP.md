@@ -159,7 +159,7 @@ __Gate:__ Fresh profile through the batch path, not the single-molecule path, be
 
 __Mechanism:__ Find where roughly 35 seconds go before a single molecule is embedded.
 __Evidence:__ Measured as the gap between total process time and the timed `generate_conformers` window on a 20-molecule input; fixed, independent of corpus size and conformer count.
-Excluded so far, each measured directly: MMFF94 table extraction from RDKit and the compiled CSD torsion table, since `test_mmff94_tables`, `test_mmff_gpu_typer` and `test_csd_torsion_device` each build their tables and finish in under half a second; CUDA module loading, since `CUDA_MODULE_LOADING=LAZY` changes nothing; and PTX JIT, since `cuobjdump` reports an sm_90 cubin in the binary.
+Excluded so far, each measured directly: MMFF94 table extraction from RDKit and the compiled CSD torsion table, since `smallfield_test_mmff94_tables`, `smallfield_test_gpu_typer` and `smallfield_test_csd_torsion_device` each build their tables and finish in under half a second; CUDA module loading, since `CUDA_MODULE_LOADING=LAZY` changes nothing; and PTX JIT, since `cuobjdump` reports an sm_90 cubin in the binary.
 Neither the per-device scratch struct nor the MMFF staging layout is large enough to explain it.
 __Gain:__ None on dataset throughput — the CLI amortises this over a whole shard.
 It dominates short runs and the Python binding, and it silently distorts any whole-process utilisation measurement.

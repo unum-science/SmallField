@@ -8,7 +8,7 @@
  *  on either side breaks the build. The rows live in a host-only `.cpp`, for the same reason
  *  `csd_torsion_table.cpp` does: they are string literals no kernel reads.
  *
- *  @see test/preprocess/test_rdkit_divergences.cpp, which is the whole of this table's contract.
+ *  @see test/preprocess/rdkit_divergences.cpp, which is the whole of this table's contract.
  */
 
 #pragma once

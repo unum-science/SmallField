@@ -1,5 +1,5 @@
 /**
- *  @file test/cuda/test_bounds_infeasible.cpp
+ *  @file test/cuda/bounds_infeasible.cpp
  *  @brief Test that a bounds matrix no coordinates satisfy comes back as `bounds_infeasible_k`.
  *
  *  The metric prepass is the only stage that tells an impossible bounds matrix from a hard one, and its
@@ -10,7 +10,7 @@
  *  persisted really holds a crossed pair -- because a status agreeing while the matrix does not is a
  *  verdict reached for the wrong reason.
  *
- *  The fixtures are those of `test_triangle_smooth`, which checks the same matrices against
+ *  The fixtures are those of `triangle_smooth`, which checks the same matrices against
  *  `DistGeom::triangleSmoothBounds`: this suite states what the verdict is worth, that one that it is right.
  */
 
@@ -27,8 +27,8 @@
 #include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/views.hpp"
 
-#include "test/cuda/test_bounds_infeasible_kernels.hpp"
-#include "test/test_helpers.hpp"
+#include "test/cuda/bounds_infeasible_kernels.hpp"
+#include "test/helpers.hpp"
 
 namespace sftest = smallfield::tests;
 
@@ -37,7 +37,7 @@ using sftest::gpu_pipeline_status_of_bounds;
 using smallfield::types::conformer_status_t;
 using smallfield::types::packed_matrix;
 
-static constexpr std::string_view test_name_k = "test_bounds_infeasible";
+static constexpr std::string_view test_name_k = "smallfield_test_bounds_infeasible";
 
 #pragma region Fixtures
 

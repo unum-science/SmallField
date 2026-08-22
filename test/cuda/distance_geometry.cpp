@@ -1,5 +1,5 @@
 /**
- *  @file test/cuda/test_dg_energy.cpp
+ *  @file test/cuda/distance_geometry.cpp
  *  @brief Gate the device distance-geometry energy, its gradient, its chirality window, and FIRE minimization.
  *
  *  Distance geometry embeds in @b four dimensions. The fourth axis is a real coordinate, the one the crush
@@ -17,7 +17,7 @@
  *  Corpus: a `.smi` path in `argv[1]` or `SMALLFIELD_TEST_CORPUS`, capped by `argv[2]` or
  *  `SMALLFIELD_TEST_MAX_MOLS`; absent both the built-in list runs, which is what `ctest` invokes. The
  *  finite-difference section costs two launches per component, so it walks only the first few molecules.
- *  Compiled with g++, C++20. CUDA kernels in test_dg_energy_kernels.cu.
+ *  Compiled with g++, C++20. CUDA kernels in distance_geometry_kernels.cu.
  */
 
 #include <cmath>   // `std::sqrt`, `std::fabs`, `std::isfinite`, `std::lrintf`
@@ -38,8 +38,8 @@
 #include "smallfield/types/molecule_descriptor.hpp"
 #include "smallfield/types/views.hpp"
 
-#include "test/cuda/test_dg_energy_kernels.hpp"
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/cuda/distance_geometry_kernels.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
@@ -49,7 +49,7 @@ using sft::coordinate_role_t;
 using sftest::gpu_dg_energy;
 using sftest::gpu_dg_minimize;
 
-static constexpr std::string_view test_name_k = "test_dg_energy";
+static constexpr std::string_view test_name_k = "smallfield_test_distance_geometry";
 
 #pragma region Coordinate Views
 

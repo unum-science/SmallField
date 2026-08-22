@@ -1,5 +1,5 @@
 /**
- *  @file test/mmff94/test_mmff_gpu_extract.cpp
+ *  @file test/mmff94/gpu_extract.cpp
  *  @brief Compare the GPU MMFF term extractor against the CPU native extractor.
  *
  *  Runs a batch of drug-like SMILES through both paths, requiring byte identity for every bonded term of every
@@ -34,9 +34,9 @@
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
-#include "test/mmff94/test_mmff_gpu_extract_kernels.hpp"
-#include "test/test_helpers.hpp"
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/helpers.hpp"
+#include "test/mmff94/gpu_extract_kernels.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sfmmff = smallfield::mmff94;
 namespace sfparam = smallfield::parameters;
@@ -44,7 +44,7 @@ namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-static constexpr std::string_view test_name_k = "test_mmff_gpu_extract";
+static constexpr std::string_view test_name_k = "smallfield_test_gpu_extract";
 
 namespace smallfield::tests {
 

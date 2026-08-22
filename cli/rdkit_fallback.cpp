@@ -227,7 +227,7 @@ static std::uint32_t recover_molecule_(admitted_molecule_t &admitted, std::uint6
     // and a ceiling gives up on exactly those an order of magnitude sooner. At 25 the residual embed falls
     // 279 ms to 99 ms and the total 393 ms to 153 ms, the paired best MMFF94 energy unchanged to three decimals
     // on every molecule that recovered, one slot of 1,284 lost and no molecule; at 10 the knee is past and
-    // 4.3 % of slots go. `bench_conformer_backends` has run its RDKit arm at 10 all along, so the shipped path
+    // 4.3 % of slots go. `smallfield_bench_backends` has run its RDKit arm at 10 all along, so the shipped path
     // and the benchmark disagreed about this number and the 200 was never measured.
     embed_params.maxIterations = 25;
 

@@ -112,7 +112,7 @@ __device__ __forceinline__ float embed_block_reduce_sum_(float value, float *war
  *
  *  Every block-wide sum goes through `embed_block_reduce_sum_`, so the embedding is a
  *  pure function of the bounds matrix: bitwise equal across launches and across blocks,
- *  which is what lets a shipped shard be regenerated. test_embedding_determinism pins it.
+ *  which is what lets a shipped shard be regenerated. `test/cuda/embedding_determinism.cpp` pins it.
  *
  *  Shared memory layout (all floats):
  *

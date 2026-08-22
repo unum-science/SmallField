@@ -1,5 +1,5 @@
 /**
- *  @file test/preprocess/test_chirality_kernels.cu
+ *  @file test/preprocess/chirality_kernels.cu
  *  @brief CUDA kernel wrappers for chirality validation test.
  */
 
@@ -11,7 +11,7 @@
 #include "smallfield/cuda/dg_kernel.cuh"
 #include "smallfield/types/storage.hpp"
 
-#include "test/preprocess/test_chirality_kernels.hpp"
+#include "test/preprocess/chirality_kernels.hpp"
 
 namespace sft = smallfield::types;
 namespace sfc = smallfield::cuda;

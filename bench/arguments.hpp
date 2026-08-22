@@ -1,5 +1,5 @@
 /**
- *  @file bench/bench_arguments.hpp
+ *  @file bench/arguments.hpp
  *  @brief Command-line and corpus plumbing shared by the benchmark drivers.
  *
  *  Every flag goes through `parse_number` from `smallfield/number_parse.hpp`, whose ceiling stops a four-billion

@@ -130,8 +130,8 @@ A sibling header in the same directory is written out in full like any other.
 
 ```cpp
 #include "smallfield/preprocess/csd_torsion_native.hpp" // sibling of the includer, still spelled out
-#include "test/cuda/test_mmff_gradient_kernels.hpp"
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/cuda/mmff_gradient_kernels.hpp"
+#include "test/rdkit_reference.hpp"
 ```
 
 The bare form resolves only because `""` searches the includer's own directory first, so the path a reader sees is not the path the compiler used.
@@ -145,7 +145,7 @@ Third-party groups keep their own required order — RDKit's headers are not sel
 
 __Per-worker state is an explicit rank into caller-owned scratch, never `thread_local`.__
 Hidden global state is not a style preference here: `prepare_per_device_batches_into` held its per-worker contributions and its partition buffers in file-scope statics, and that alone made two `context_t` objects on two threads corrupt each other silently.
-The buffers did not change — they moved onto a caller-owned `batch_prep_scratch_t`, which is what the reentrancy test in `test/api/test_pipeline.cpp` measures.
+The buffers did not change — they moved onto a caller-owned `batch_prep_scratch_t`, which is what the reentrancy test in `test/api/pipeline.cpp` measures.
 
 __Fill a caller-owned output rather than returning a container.__
 Write `fill_x_into(input, std::vector<T> &out)` with `out.clear()`, not `std::vector<T> compute_x(input)`, and declare the scratch above the loop that consumes it so a growth phase happens once.
@@ -382,7 +382,7 @@ static constexpr auto bits_identical_ = [](float host_value, float device_value)
 
 When such a wrapper is genuinely load-bearing, it is usually adapting arity, and the fix belongs at the callee.
 A predicate is a `constexpr` callable object rather than a function carrying a default argument: a function name decays to a pointer whose type does not include the default, so it cannot be passed where a two-argument callable is wanted, and every call site grows a lambda to bind what the declaration already said.
-`exactly_equal` in `test/test_helpers.hpp` is the shape to copy — it is used at a hundred call sites and needs an adapter at none of them.
+`exactly_equal` in `test/helpers.hpp` is the shape to copy — it is used at a hundred call sites and needs an adapter at none of them.
 
 __Discard a return value by binding it `[[maybe_unused]]`, never with a `(void)` cast.__
 The cast is a C-era idiom that reads as hiding something, and it does not compose with `[[nodiscard]]` the way a bound variable does.
@@ -499,7 +499,7 @@ __Past three fields, initialize by name.__
 Positional aggregate initialization silently survives a field insertion or rename: the literal keeps compiling and means something else.
 This has cost this project twice.
 Renaming `mmff94_angle_t::padding` to `is_linear` compiled clean at all four construction sites and meant "not linear" at every one.
-Inserting `bounds_row_stride` into `distance_geometry_energy_functor_t` shifted every later field in a test's positional initializer and broke `test_dg_energy`, caught only by bisecting against the baseline.
+Inserting `bounds_row_stride` into `distance_geometry_energy_functor_t` shifted every later field in a test's positional initializer and broke `smallfield_test_distance_geometry`, caught only by bisecting against the baseline.
 
 Add a `static_assert` on `sizeof` for any struct whose layout the GPU depends on.
 
@@ -605,7 +605,7 @@ Precision is keyed to what the number __is__, not chosen per site:
 | a percentage | `{:.3f}` | gate and report must agree, and one pair here did not |
 | a count | `{}`, or `fmt::group_digits` when a human reads it | never group a number a script might parse |
 
-__The reporter in `test/test_helpers.hpp` owns the grammar, so a call site passes values and never a format string.__
+__The reporter in `test/helpers.hpp` owns the grammar, so a call site passes values and never a format string.__
 It formats and never compares.
 `field` takes the caller's predicate, because the live ones disagree at exactly `error == tolerance` and a built-in tolerance would move a boundary by stealth.
 
@@ -649,7 +649,7 @@ A binary that prints a failure and returns `0` is worse than one that says nothi
 
 __Prefer returning a failure to exiting from inside a helper.__
 `std::exit` from deep in a call chain skips flushes and unwinding.
-The assertion macro in `test_helpers.hpp` is the deliberate exception — it is the suite's primary failure path, and unwinding would only obscure the site.
+The assertion macro in `test/helpers.hpp` is the deliberate exception — it is the suite's primary failure path, and unwinding would only obscure the site.
 
 ## Datasets
 
@@ -689,8 +689,11 @@ So:
 
 `pixi.toml` pins the only environment this is built and tested in, and `pyproject.toml`'s floors follow it rather than claiming a wider range.
 
-__`cmake --preset dev` is the inner loop__ — one architecture detected from the local GPU, `RelWithDebInfo`.
+__`cmake --preset dev` is the inner loop__ — one architecture detected from the local GPU, `RelWithDebInfo`, into `build_dev/`.
 `release` is the shipped fatbin and `profile` adds line info for `ncu`.
+
+__`SMALLFIELD_MARCH_NATIVE` is on in `dev` and `profile` and off in `release`.__
+Host code tuned for the building machine is what every measured number was taken under, and is also what would stop a shipped archive or wheel from running on an older CPU, so the preset that ships is the one that leaves it off.
 
 __`sf_assert_` is live only under `cmake --preset debug`.__
 The other three presets define `NDEBUG`, where it compiles to nothing, so a check written with it is a check the `debug` build runs and the inner loop does not.

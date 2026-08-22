@@ -1,5 +1,5 @@
 /**
- *  @file test/test_helpers.hpp
+ *  @file test/helpers.hpp
  *  @brief One machine-readable grammar for every diagnostic the C++ tests print.
  *
  *  A diagnostic is read twice: by a person scanning a CI log, and by `grep`, `awk` or a diff between two runs.
@@ -11,8 +11,8 @@
  *      MISMATCH bond bond_type=0 atom_i=3 atom_j=7 field=force_constant rdkit=4.928 ours=6.947 delta=+2.019
  *      DIVERGENCE bounds_1_4 smiles=C/C=C/C pair=0,3 upstream=BoundsMatrixBuilder.cpp:_getAtomStereo …
  *      PASS vdw compared=1245 mismatches=0 divergences=0 suppressed=0
- *      PASS test_mmff94_tables
- *      FAIL test_mmff94_tables: 3 mismatches over 4838 comparisons
+ *      PASS smallfield_test_mmff94_tables
+ *      FAIL smallfield_test_mmff94_tables: 3 mismatches over 4838 comparisons
  *
  *  `^MISMATCH` filters, `awk -F'[ =]'` parses, and the failing field names itself instead of leaving the reader
  *  to spot which of five printed numbers moved. Nothing carries a timestamp -- ctest stamps its own, and a
@@ -417,7 +417,7 @@ void diagnostic_group_t::report_(std::string_view name, reference_type_ const &r
  *  PASSED` cannot, saying something passed without saying what. Column zero is the other half: it stops a
  *  narration line merely containing the word -- `Device upload unavailable`, a `[PASS]` table cell -- from
  *  answering the same grep. Section summaries share the verb but never the `test_` prefix: `PASS vdw
- *  compared=…` closes a section, `PASS test_mmff94_tables` closes the process.
+ *  compared=…` closes a section, `PASS smallfield_test_mmff94_tables` closes the process.
  */
 inline int report_pass(std::string_view test_name) {
     fmt::println(diagnostic_stream(diagnostic_verb_t::pass_k), "{} {}", diagnostic_verb_name(diagnostic_verb_t::pass_k),

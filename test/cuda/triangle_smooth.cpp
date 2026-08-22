@@ -1,9 +1,9 @@
 /**
- *  @file test/cuda/test_triangle_smooth.cpp
+ *  @file test/cuda/triangle_smooth.cpp
  *  @brief Test GPU triangle smoothing, and the verdict it returns, against the RDKit reference.
  *
  *  Compiled with g++, not nvcc, to avoid RDKit C++20 header conflicts; the CUDA kernel calls are in
- *  test_triangle_smooth_kernels.cu. Two sections: `fixture` smooths hand-built matrices whose verdict is
+ *  triangle_smooth_kernels.cu. Two sections: `fixture` smooths hand-built matrices whose verdict is
  *  known by construction and confirms each against `DistGeom::triangleSmoothBounds`, the project's only
  *  independent answer to "is this matrix impossible"; `corpus` sweeps real molecules, compares every cell
  *  against RDKit's so a verdict agreeing for the wrong reason still fails, and re-smooths each to pin what
@@ -31,9 +31,9 @@
 
 #include "smallfield/types/views.hpp"
 
-#include "test/cuda/test_triangle_smooth_kernels.hpp"
-#include "test/test_helpers.hpp"
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/cuda/triangle_smooth_kernels.hpp"
+#include "test/helpers.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sftest = smallfield::tests;
 
@@ -43,7 +43,7 @@ using smallfield::cuda::smoothing_name;
 using smallfield::cuda::smoothing_t;
 using smallfield::types::packed_matrix;
 
-static constexpr std::string_view test_name_k = "test_triangle_smooth";
+static constexpr std::string_view test_name_k = "smallfield_test_triangle_smooth";
 
 /** Molecules taken from a named corpus when no cap is given; the built-in standards are always walked. */
 static constexpr std::size_t default_max_molecules_k = 50;

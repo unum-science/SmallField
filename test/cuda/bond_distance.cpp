@@ -1,5 +1,5 @@
 /**
- *  @file test/cuda/test_bond_distance.cpp
+ *  @file test/cuda/bond_distance.cpp
  *  @brief Gate byte-for-byte parity between the device hop-count BFS and the host all-pairs BFS.
  *
  *  A warp BFS rebuilds the N × N hop matrix the MMFF nonbonded sweep reads from the batch's bond list; the
@@ -26,14 +26,14 @@
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
-#include "test/cuda/test_bond_distance_kernels.hpp"
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/cuda/bond_distance_kernels.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-static constexpr std::string_view test_name_k = "test_bond_distance";
+static constexpr std::string_view test_name_k = "smallfield_test_bond_distance";
 
 namespace smallfield::tests {
 

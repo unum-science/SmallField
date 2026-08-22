@@ -1,5 +1,5 @@
 /**
- *  @file test/preprocess/test_csd_torsion_predicates.cpp
+ *  @file test/preprocess/csd_torsion_host.cpp
  *  @brief Cross-validate the native CSD torsion matcher against RDKit.
  *
  *  Two layers of correctness gate:
@@ -49,13 +49,13 @@
 #include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-static constexpr std::string_view test_name_k = "test_csd_torsion_predicates";
+static constexpr std::string_view test_name_k = "smallfield_test_csd_torsion_host";
 
 /** Every distinct `$(...)` body the CSD torsion corpus writes, as it appears between `$(` and `)`. Each compiles
  *  through the pattern compiler's own path, cross-checked atom by atom against RDKit. Single characters carry the

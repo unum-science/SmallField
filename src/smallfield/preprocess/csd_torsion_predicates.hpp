@@ -12,7 +12,7 @@
  *  Nothing here parses text — the SMARTS compiler that fills these structures is host-only in
  *  `csd_torsion_native.hpp` — so a pattern reaches the device as bytes and `cuda/csd_torsion_kernel.cuh`
  *  shares this code rather than mirroring it. Semantics match RDKit's `SmartsToMol` plus
- *  `SubstructMatch`, validated pattern by pattern and atom by atom in `test_csd_torsion_predicates.cpp`
+ *  `SubstructMatch`, validated pattern by pattern and atom by atom in `test/preprocess/csd_torsion_host.cpp`
  *  — 9 020 710 pattern checks over 19 193 PubChem molecules, zero disagreements.
  */
 

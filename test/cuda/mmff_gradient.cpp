@@ -1,5 +1,5 @@
 /**
- *  @file test/cuda/test_mmff_gradient.cpp
+ *  @file test/cuda/mmff_gradient.cpp
  *  @brief Gate the device MMFF94 energy and its analytical gradient against host references.
  *
  *  Neither reference alone is enough: RDKit's `calcEnergy` gates the total at identical coordinates, a
@@ -30,8 +30,8 @@
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 #include "smallfield/types/views.hpp"
 
-#include "test/cuda/test_mmff_gradient_kernels.hpp"
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/cuda/mmff_gradient_kernels.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
@@ -39,7 +39,7 @@ namespace sftest = smallfield::tests;
 
 using sftest::gpu_mmff_energy;
 
-static constexpr std::string_view test_name_k = "test_mmff_gradient";
+static constexpr std::string_view test_name_k = "smallfield_test_mmff_gradient";
 
 namespace smallfield::tests {
 

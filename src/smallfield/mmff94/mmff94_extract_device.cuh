@@ -572,7 +572,7 @@ __device__ inline void copy_packed_terms_(element_ const *__restrict__ source, e
  *  molecule the typer routed to the CPU fallback carries zero counts, so it contributes an empty slice
  *  and its metadata offsets stay well-formed.
  *
- *  `test_mmff_gpu_extract` gates the packed arrays byte for byte against the staging and prints both
+ *  `gpu_extract` gates the packed arrays byte for byte against the staging and prints both
  *  footprints: 17.2 KB per molecule over 19 167 PubChem molecules and 19.4 KB over 20 009 Enamine REAL
  *  molecules, against 116 KB of staging, so compaction buys 6.1x to 6.9x on those corpora. The packed
  *  arrays are the ones a 50 K-molecule wave allocates.

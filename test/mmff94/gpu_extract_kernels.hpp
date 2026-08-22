@@ -1,5 +1,5 @@
 /**
- *  @file test/mmff94/test_mmff_gpu_extract_kernels.hpp
+ *  @file test/mmff94/gpu_extract_kernels.hpp
  *  @brief Device harness for the MMFF94 GPU term-extraction pipeline, for use by its unit tests.
  */
 

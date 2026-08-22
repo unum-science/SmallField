@@ -1,5 +1,5 @@
 /**
- *  @file test/preprocess/test_element_gate.cpp
+ *  @file test/preprocess/element_gate.cpp
  *  @brief Validate the host-side element-validation gate in `prepare_molecule_into`.
  *
  *  Atoms outside the MMFF94 parameter set — Y, lanthanides, transition metals — must be rejected here: left
@@ -24,14 +24,14 @@
 #include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
-#include "test/test_helpers.hpp"
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/helpers.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-static constexpr std::string_view test_name_k = "test_element_gate";
+static constexpr std::string_view test_name_k = "smallfield_test_element_gate";
 
 /** One pathological corpus molecule cannot bury the rest of the run. */
 static constexpr std::size_t max_printed_lines_k = 64;

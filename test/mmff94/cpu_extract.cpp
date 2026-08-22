@@ -1,5 +1,5 @@
 /**
- *  @file test/mmff94/test_mmff_cpu_port.cpp
+ *  @file test/mmff94/cpu_extract.cpp
  *  @brief Cross-validate the native MMFF CPU port against the existing RDKit-backed path.
  *
  *  Both native extractors are held to one oracle: a cache-free baseline built from RDKit's own per-term
@@ -40,7 +40,7 @@
 #include "smallfield/types/molecule_descriptor.hpp"
 #include "smallfield/types/views.hpp"
 
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sfp = smallfield::preprocess;
 namespace sfparam = smallfield::parameters;
@@ -48,7 +48,7 @@ namespace sfmmff = smallfield::mmff94;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-static constexpr std::string_view test_name_k = "test_mmff_cpu_port";
+static constexpr std::string_view test_name_k = "smallfield_test_cpu_extract";
 
 namespace smallfield::tests {
 

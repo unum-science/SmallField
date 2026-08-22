@@ -1,5 +1,5 @@
 /**
- *  @file test/test_rdkit_reference_helpers.hpp
+ *  @file test/rdkit_reference.hpp
  *  @brief Shared utilities for C++ ETKDG tests.
  *
  *  Provides molecule loading, coordinate extraction/injection, and RDKit MMFF94 energy evaluation for
@@ -37,7 +37,7 @@
 #include "smallfield/types/molecule_descriptor.hpp"
 #include "smallfield/types/views.hpp"
 
-#include "test/test_helpers.hpp"
+#include "test/helpers.hpp"
 
 namespace smallfield::tests {
 

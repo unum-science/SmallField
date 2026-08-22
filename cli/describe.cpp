@@ -1,11 +1,11 @@
 /**
- *  @file cli/smallfield_descriptors.cpp
+ *  @file cli/describe.cpp
  *  @brief Augment `*.3D.parquet` shards that predate the canonical schema, in place.
  *
  *  A shard carrying no `usrcat` column and unsorted conformers is re-emitted through the producer's own
  *  `write_shard`, descriptors computed from stored coordinates rather than a fresh GPU run that would perturb
  *  the geometry. Both paths round through fp16 identically — the producer reads its own fp16 buffer back
- *  before describing it — so output is byte-identical to `smallfield_batch` on the same geometry.
+ *  before describing it — so output is byte-identical to `smallfield_generate` on the same geometry.
  */
 
 #include <csignal> // `std::signal`
@@ -41,7 +41,7 @@
 #include "smallfield/postprocess/shape_descriptors.hpp"
 #include "smallfield/types/views.hpp"
 
-#include "cli/cli_arguments.hpp"
+#include "cli/arguments.hpp"
 #include "cli/parquet_writer.hpp"
 #include "cli/shard_inventory.hpp"
 
@@ -55,7 +55,7 @@ using smallfield::logger_t;
 namespace {
 
 /** The one name this binary prints, so the announcement and the usage cannot drift from the executable. */
-constexpr char const *executable_name_k = "smallfield_descriptors";
+constexpr char const *executable_name_k = "smallfield_describe";
 
 #pragma region Interruption
 
@@ -251,7 +251,7 @@ enum class shard_listing_t {
 };
 
 /** Collect every `*.3D.parquet` in @p directory into a cleared @p out, sorted lexicographically. Here a
- *  `*.3D.parquet` is an @b input, the opposite of `smallfield_batch` where the same name marks an output. A
+ *  `*.3D.parquet` is an @b input, the opposite of `smallfield_generate` where the same name marks an output. A
  *  refusal is returned rather than thrown, so a misspelled folder reaches the exit code. */
 shard_listing_t fill_shard_paths_into_(fs::path const &directory, std::vector<fs::path> &out) {
     out.clear();

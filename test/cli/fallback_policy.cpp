@@ -1,5 +1,5 @@
 /**
- *  @file test/cli/test_fallback_policy.cpp
+ *  @file test/cli/fallback_policy.cpp
  *  @brief Pin every verdict of `fallback_disposition`, and the ordering rule `fallback_dispatch_cause` runs.
  *
  *  Thirteen statuses each carry an argued verdict on whether a CPU embedding recovers a refused slot, and a
@@ -22,13 +22,13 @@
 #include "cli/rdkit_fallback.hpp"
 #include "smallfield/types/conformer_status.hpp"
 
-#include "test/test_helpers.hpp"
+#include "test/helpers.hpp"
 
 namespace sfcli = smallfield::cli;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-static constexpr std::string_view test_name_k = "test_fallback_policy";
+static constexpr std::string_view test_name_k = "smallfield_test_fallback_policy";
 
 #pragma region Dispositions
 

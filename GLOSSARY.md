@@ -30,10 +30,10 @@ A _role_ is a persistent thread actor; never substitute "section" or "phase".
 
 | Role                  | Binary                  | Responsibility                                                                                       |
 | --------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------- |
-| __`reader-role`__     | `smallfield_batch`      | Reads a `parquet-shard` off disk, extracts SMILES into a `coprocessed-batch`.                        |
-| __`gpu-runner-role`__ | `smallfield_batch`      | Calls `context_t::generate_conformers` on each `coprocessed-batch` (inner pipeline runs here).       |
-| __`fallback-role`__   | `smallfield_batch`      | Runs RDKit CPU for the conformer slots the GPU could not fill — ≤5 % on drug-like inputs — then computes the USRCAT descriptor for every molecule of the batch. |
-| __`writer-role`__     | `smallfield_batch`      | Writes one output `parquet-shard` per consumed input `parquet-shard`.                                |
+| __`reader-role`__     | `smallfield_generate`   | Reads a `parquet-shard` off disk, extracts SMILES into a `coprocessed-batch`.                        |
+| __`gpu-runner-role`__ | `smallfield_generate`   | Calls `context_t::generate_conformers` on each `coprocessed-batch` (inner pipeline runs here).       |
+| __`fallback-role`__   | `smallfield_generate`   | Runs RDKit CPU for the conformer slots the GPU could not fill — ≤5 % on drug-like inputs — then computes the USRCAT descriptor for every molecule of the batch. |
+| __`writer-role`__     | `smallfield_generate`   | Writes one output `parquet-shard` per consumed input `parquet-shard`.                                |
 
 ## Wave Steps, Library Inner
 
@@ -156,12 +156,12 @@ Glossary terms are vocabulary; the table below points at where each one is groun
 
 | Glossary term       | Canonical location in source                                                                                                                  |
 | :------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------- |
-| `parquet-shard`     | `cli/smallfield_batch.cpp` — path-based iteration, no dedicated struct                                                                        |
-| `coprocessed-batch` | `coprocessed_batch_accumulator_t` in `cli/smallfield_batch.cpp` — one `generate_conformers` call        |
+| `parquet-shard`     | `cli/generate.cpp` — path-based iteration, no dedicated struct                                                                        |
+| `coprocessed-batch` | `coprocessed_batch_accumulator_t` in `cli/generate.cpp` — one `generate_conformers` call        |
 | `wave-slice`        | `wave_slice_pool_t` in `src/smallfield/preprocess/wave_slice_pool.hpp` |
 | `embedding-wave`    | `wave_record_t` in `src/smallfield/api/smallfield.cu`                                                                                         |
 | `atom-limited-bin`  | `atom_limited_bin_caps_k[]` in `src/smallfield/api/smallfield.hpp`                                                                            |
-| pipeline roles      | `cli/smallfield_batch.cpp` — architectural comment blocks, no per-role struct                                                                 |
+| pipeline roles      | `cli/generate.cpp` — architectural comment blocks, no per-role struct                                                                 |
 | `preprocess-step`   | `prepare_per_device_batches_into` in `src/smallfield/preprocess/etkdg_prepare_batch.hpp`                                                      |
 | `embedding-step`    | `launch_gpu_pipeline` in `src/smallfield/api/smallfield.cu`                                                                                   |
 | `finalize-step`     | `finalize_gpu_pipeline` in `src/smallfield/api/smallfield.cu`                                                                                 |

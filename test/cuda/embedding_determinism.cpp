@@ -1,5 +1,5 @@
 /**
- *  @file test/cuda/test_embedding_determinism.cpp
+ *  @file test/cuda/embedding_determinism.cpp
  *  @brief Assert that the 4D metric embedding is bitwise reproducible.
  *
  *  The metric prepass seeds every later ETKDG stage, so an order-dependent block reduction inside it -- a
@@ -22,15 +22,15 @@
 
 #include "smallfield/types/views.hpp"
 
-#include "test/cuda/test_embedding_determinism_kernels.hpp"
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/cuda/embedding_determinism_kernels.hpp"
+#include "test/rdkit_reference.hpp"
 
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
 using sftest::gpu_embed_replicated;
 
-static constexpr std::string_view test_name_k = "test_embedding_determinism";
+static constexpr std::string_view test_name_k = "smallfield_test_embedding_determinism";
 
 /** Builds a satisfiable bounds matrix by bracketing the distances of a random point cloud. */
 static std::vector<float> synthetic_bounds(std::uint32_t num_atoms) {
