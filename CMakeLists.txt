@@ -22,11 +22,15 @@
 #     SMALLFIELD_BUILD_TESTS        Build the ctest suite            ON when top-level
 #     SMALLFIELD_BUILD_BENCHMARKS   Build the benchmarks             ON when top-level
 #     SMALLFIELD_BUILD_CLI          Build the two Parquet binaries   OFF, needs Apache Arrow
+#     SMALLFIELD_INSTALL            Emit install and export rules    ON when top-level
 #     SMALLFIELD_USE_CCACHE         Route compiles through ccache    ON when one is installed
 #     SMALLFIELD_USE_JEMALLOC       Link jemalloc                    ON when it is installed
 #     SMALLFIELD_USE_NVTX           NVTX ranges for `nsys`           OFF
 #     SMALLFIELD_CUDA_ARCH          Architectures, or `native`       the shipped fatbin
 #     SMALLFIELD_CUDA_LINEINFO      Line info for `ncu`              OFF
+#     SMALLFIELD_MARCH_NATIVE       Host-tuned, not redistributable  OFF, ON in `dev` and `profile`
+#
+# Every executable lands flat in the build root, named `smallfield_<role>_<stem>` after the source it is built from.
 #
 # `cmake/rdkit.cmake` builds RDKit's imported targets and is shared with the installed package
 # config, since a consumer's project has no `RDKit::*` targets for the export set to reference.
@@ -52,13 +56,21 @@ list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 # A vendoring consumer gets the library and nothing else.
 option(SMALLFIELD_BUILD_TESTS "Build the ctest suite" ${PROJECT_IS_TOP_LEVEL})
 option(SMALLFIELD_BUILD_BENCHMARKS "Build the benchmarks" ${PROJECT_IS_TOP_LEVEL})
-option(SMALLFIELD_BUILD_CLI "Build the smallfield_batch and smallfield_descriptors binaries" OFF)
+option(SMALLFIELD_BUILD_CLI "Build the smallfield_generate and smallfield_describe binaries" OFF)
+
+# A vendoring consumer that never installs should not inherit an export set it cannot use.
+option(SMALLFIELD_INSTALL "Emit install and export rules" ${PROJECT_IS_TOP_LEVEL})
 
 option(SMALLFIELD_USE_CCACHE "Route compilation through ccache or sccache when one is installed" ON)
 option(SMALLFIELD_USE_JEMALLOC "Link jemalloc for the allocation-heavy host paths" ON)
 option(SMALLFIELD_USE_NVTX "Annotate pipeline roles with NVTX ranges for `nsys` timelines" OFF)
 
 option(SMALLFIELD_CUDA_LINEINFO "Emit CUDA line info so `ncu` can attribute stalls to source lines" OFF)
+
+# Off by default because it decides whether the artifact is redistributable, not how fast it is: the fatbin carries SASS
+# for five architectures precisely in order to ship, and host code tuned for the building machine undoes that. The `dev`
+# and `profile` presets turn it on, which is where every measured number comes from.
+option(SMALLFIELD_MARCH_NATIVE "Tune host code for the building machine; not redistributable" OFF)
 
 # Each entry is a device this is expected to run on, so the fatbin carries real SASS for it: Ampere (sm_80), Ada / L40S
 # (sm_89), Hopper (sm_90), Blackwell datacenter (sm_100), and Blackwell consumer / RTX PRO (sm_120).
@@ -97,6 +109,10 @@ endif ()
 
 # `.clang-tidy` ships with this repository and is useless without a compilation database.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# Every executable lands here rather than in a subdirectory mirroring its source folder, so a binary is named once and
+# reached by one path. Archives and shared objects are unaffected and stay where `setup.py` already resolves them.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
 # Unchanged translation units cost nothing on rebuilds, branch switches and CI restores, which dominates the inner loop
 # far more than any one-off compile-speed flag. This only pays off because the CUDA targets emit SASS at compile time --
@@ -159,15 +175,15 @@ else ()
     message(STATUS "jemalloc disabled -- required for compute-sanitizer, ncu and nsys")
 endif ()
 
-# `argparse` -- the command-line grammar shared by `smallfield_batch` and `smallfield_descriptors`, and nothing else.
+# `argparse` -- the command-line grammar shared by `smallfield_generate` and `smallfield_describe`, and nothing else.
 # Three costs, none of them fixable from this side:
 #
 # * It reports every error by throwing, with no macro to disable that, so both `main`s wrap `parse_args` in a `try` and
 #   convert the exception into an exit code.
 # * It copies `argv`, which the OS already owns and which outlives `main`, and parks the parsed values in `std::any`,
 #   against the caller-owned-scratch rule in `CONTRIBUTING.md`.
-# * It adds about 3.4 s to every consuming translation unit: 8.3 s to 11.9 s for `smallfield_batch.cpp` and 8.9 s to
-#   12.2 s for `smallfield_descriptors.cpp`. Only 0.4 s of that is the front end -- the header parses in 1.0 s alone,
+# * It adds about 3.4 s to every consuming translation unit: 8.3 s to 11.9 s for `cli/generate.cpp` and 8.9 s to
+#   12.2 s for `cli/describe.cpp`. Only 0.4 s of that is the front end -- the header parses in 1.0 s alone,
 #   but both files already included most of what it drags in, `<any>`, `<variant>`, `<sstream>`, `<iostream>`,
 #   `<filesystem>`, `<list>` and `<map>`. The rest is `-O2` on the instantiated parser.
 #
@@ -208,10 +224,12 @@ target_include_directories(
 target_compile_features(smallfield_settings INTERFACE cxx_std_20)
 target_compile_definitions(smallfield_settings INTERFACE $<$<BOOL:${SMALLFIELD_USE_NVTX}>:SMALLFIELD_ENABLE_NVTX>)
 if (NOT MSVC)
-    # `-march=native` uses the host's widest ISA. It also makes the resulting archive and `.so` non-redistributable,
-    # which is a shipping question rather than a build-speed one.
+    # `-march=native` uses the host's widest ISA, and makes the resulting archive and `.so` non-redistributable. The
+    # `$<CONFIG:>` clause stays alongside the option so a Debug build never picks the flag up whatever the option says.
     target_compile_options(
-        smallfield_settings INTERFACE $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release,RelWithDebInfo>>:-march=native>
+        smallfield_settings
+        INTERFACE
+            $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release,RelWithDebInfo>,$<BOOL:${SMALLFIELD_MARCH_NATIVE}>>:-march=native>
     )
 endif ()
 # `--expt-relaxed-constexpr` lets device code call `constexpr` functions not themselves annotated `__host__ __device__`.
@@ -224,10 +242,11 @@ endif ()
 # ignored and batch preparation runs single-threaded.
 target_compile_options(
     smallfield_settings
-    INTERFACE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--extended-lambda;-Xcompiler=-fopenmp>
-              $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release,RelWithDebInfo>>:--use_fast_math;-Xptxas=-O3>
-              $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release,RelWithDebInfo>>:-Xcompiler=-march=native>
-              $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<BOOL:${SMALLFIELD_CUDA_LINEINFO}>>:--generate-line-info>
+    INTERFACE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--extended-lambda;-Xcompiler=-fopenmp>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release,RelWithDebInfo>>:--use_fast_math;-Xptxas=-O3>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release,RelWithDebInfo>,$<BOOL:${SMALLFIELD_MARCH_NATIVE}>>:-Xcompiler=-march=native>
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<BOOL:${SMALLFIELD_CUDA_LINEINFO}>>:--generate-line-info>
 )
 
 # Interprocedural optimization is deliberately absent.
@@ -299,42 +318,44 @@ target_link_libraries(smallfield_python_lib PUBLIC smallfield_objects)
 
 # Installation. The headers are the library -- everything but one translation unit is header-only -- so the archive
 # alone would be useless to a consumer.
-include(GNUInstallDirs)
-include(CMakePackageConfigHelpers)
+if (SMALLFIELD_INSTALL)
+    include(GNUInstallDirs)
+    include(CMakePackageConfigHelpers)
 
-install(
-    TARGETS smallfield_lib smallfield_objects smallfield_settings smallfield_warnings
-    EXPORT smallfieldTargets
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-)
-install(
-    DIRECTORY src/smallfield
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-    FILES_MATCHING
-    PATTERN "*.hpp"
-    PATTERN "*.cuh"
-)
-install(FILES "${PROJECT_SOURCE_DIR}/cmake/rdkit.cmake" DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/smallfield)
-install(
-    EXPORT smallfieldTargets
-    NAMESPACE smallfield::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/smallfield
-)
-
-configure_package_config_file(
-    "${PROJECT_SOURCE_DIR}/cmake/smallfieldConfig.cmake.in" "${PROJECT_BINARY_DIR}/smallfieldConfig.cmake"
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/smallfield
-)
-write_basic_package_version_file(
-    "${PROJECT_BINARY_DIR}/smallfieldConfigVersion.cmake"
-    VERSION ${PROJECT_VERSION}
-    COMPATIBILITY SameMinorVersion
-)
-install(FILES "${PROJECT_BINARY_DIR}/smallfieldConfig.cmake" "${PROJECT_BINARY_DIR}/smallfieldConfigVersion.cmake"
+    install(
+        TARGETS smallfield_lib smallfield_objects smallfield_settings smallfield_warnings
+        EXPORT smallfieldTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+    install(
+        DIRECTORY src/smallfield
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        FILES_MATCHING
+        PATTERN "*.hpp"
+        PATTERN "*.cuh"
+    )
+    install(FILES "${PROJECT_SOURCE_DIR}/cmake/rdkit.cmake" DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/smallfield)
+    install(
+        EXPORT smallfieldTargets
+        NAMESPACE smallfield::
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/smallfield
-)
+    )
+
+    configure_package_config_file(
+        "${PROJECT_SOURCE_DIR}/cmake/smallfieldConfig.cmake.in" "${PROJECT_BINARY_DIR}/smallfieldConfig.cmake"
+        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/smallfield
+    )
+    write_basic_package_version_file(
+        "${PROJECT_BINARY_DIR}/smallfieldConfigVersion.cmake"
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMinorVersion
+    )
+    install(FILES "${PROJECT_BINARY_DIR}/smallfieldConfig.cmake" "${PROJECT_BINARY_DIR}/smallfieldConfigVersion.cmake"
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/smallfield
+    )
+endif ()
 
 # `enable_testing()` has to be called from the top-level directory, not from `test/`, or `ctest` finds no tests at all.
 if (SMALLFIELD_BUILD_TESTS)

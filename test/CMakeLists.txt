@@ -1,7 +1,7 @@
 # C/C++/CUDA test executables, each a standalone binary with its own main(), organised into subfolders mirroring src/:
 # api, cuda, parameters, preprocess, mmff94, postprocess.
 #
-# A mixed test pairs `<subfolder>/test_<name>.cpp` with `<subfolder>/test_<name>_kernels.cu`.  The .cpp calls a plain
+# A mixed test pairs `<subfolder>/<name>.cpp` with `<subfolder>/<name>_kernels.cu`.  The .cpp calls a plain
 # host wrapper the .cu defines, which is ordinary host linkage -- no relocatable device code is involved, which is why
 # `define_smallfield_target` leaves it off.
 #
@@ -20,29 +20,29 @@
 # plain `ctest -j 8` would silently get no serialization at all.
 function (define_smallfield_test subfolder base_name)
     cmake_parse_arguments(ARG "MIXED;GPU" "" "LINK;EXTRA_SOURCES" ${ARGN})
-    set(sources "${subfolder}/test_${base_name}.cpp" ${ARG_EXTRA_SOURCES})
+    set(sources "${subfolder}/${base_name}.cpp" ${ARG_EXTRA_SOURCES})
     if (ARG_MIXED)
-        list(APPEND sources "${subfolder}/test_${base_name}_kernels.cu")
+        list(APPEND sources "${subfolder}/${base_name}_kernels.cu")
     endif ()
     if (NOT ARG_LINK)
         set(ARG_LINK smallfield_lib)
     endif ()
     define_smallfield_target(
-        test_${base_name}
+        smallfield_test_${base_name}
         SOURCES ${sources}
         LINK ${ARG_LINK}
     )
-    add_test(NAME test_${base_name} COMMAND test_${base_name})
+    add_test(NAME smallfield_test_${base_name} COMMAND smallfield_test_${base_name})
     # The lock and the label are one fact: a test that must not run beside another device test is exactly a test a
     # GPU-less runner cannot run at all.  Written together so `ctest --label-exclude gpu` and the serialization can
     # never disagree about which half a binary is in.
     if (ARG_MIXED OR ARG_GPU)
-        set_tests_properties(test_${base_name} PROPERTIES RESOURCE_LOCK smallfield_gpu LABELS gpu)
+        set_tests_properties(smallfield_test_${base_name} PROPERTIES RESOURCE_LOCK smallfield_gpu LABELS gpu)
     endif ()
 endfunction ()
 
 define_smallfield_test(cuda triangle_smooth MIXED)
-define_smallfield_test(cuda dg_energy MIXED)
+define_smallfield_test(cuda distance_geometry MIXED)
 define_smallfield_test(cuda mmff_gradient MIXED)
 define_smallfield_test(cuda bond_distance MIXED)
 define_smallfield_test(cuda csd_torsion_device MIXED)
@@ -69,10 +69,10 @@ define_smallfield_test(
 )
 
 define_smallfield_test(preprocess chirality MIXED)
-define_smallfield_test(preprocess descriptor)
-define_smallfield_test(preprocess csd_torsion_predicates)
+define_smallfield_test(preprocess molecule_descriptor)
+define_smallfield_test(preprocess csd_torsion_host)
 define_smallfield_test(preprocess element_gate)
-define_smallfield_test(preprocess chiral_parity)
+define_smallfield_test(preprocess chiral_volume_sign)
 define_smallfield_test(preprocess batch_layout)
 define_smallfield_test(preprocess rdkit_divergences EXTRA_SOURCES preprocess/rdkit_divergence_table.cpp)
 
@@ -80,15 +80,15 @@ define_smallfield_test(postprocess shape_descriptors)
 
 define_smallfield_test(parameters mmff94_tables MIXED)
 
-define_smallfield_test(mmff94 mmff_gpu_typer MIXED)
-define_smallfield_test(mmff94 mmff_gpu_extract MIXED)
-define_smallfield_test(mmff94 mmff_cpu_port)
-define_smallfield_test(mmff94 mmff_typer)
+define_smallfield_test(mmff94 gpu_typer MIXED)
+define_smallfield_test(mmff94 gpu_extract MIXED)
+define_smallfield_test(mmff94 cpu_extract)
+define_smallfield_test(mmff94 cpu_typer)
 
 # Per-term parity reuses the single-molecule energy entry point that the gradient test's kernel wrapper already exposes,
 # so it takes that sidecar rather than one of its own.  Registered through the function like everything else, or it is
 # the one test that silently misses whatever the function grows next.
-define_smallfield_test(mmff94 mmff_term_parity GPU EXTRA_SOURCES cuda/test_mmff_gradient_kernels.cu)
+define_smallfield_test(mmff94 term_parity GPU EXTRA_SOURCES cuda/mmff_gradient_kernels.cu)
 
 # The fallback policy is a `constexpr` switch and a span walk, so the test asserts it without ever reaching a device.
 # `smallfield_lib` would only add the `rdkit_fallback` definition it never calls; `smallfield_rdkit` and `CUDA::cudart`
@@ -109,14 +109,11 @@ define_smallfield_test(cli fallback_policy LINK smallfield_rdkit fmt::fmt CUDA::
 if (SMALLFIELD_BUILD_CLI)
     find_package(Arrow CONFIG REQUIRED)
     find_package(Parquet CONFIG REQUIRED)
-    define_smallfield_test(
-        cli empty_shard
-        LINK smallfield_parquet_writer Arrow::arrow_shared Parquet::parquet_shared
-    )
+    define_smallfield_test(cli empty_shard LINK smallfield_parquet_writer Arrow::arrow_shared Parquet::parquet_shared)
     define_smallfield_test(cli shard_sealing LINK smallfield_rdkit fmt::fmt CUDA::cudart)
 endif ()
 
-define_smallfield_test(api conformer_slot_layout)
+define_smallfield_test(api slot_layout)
 define_smallfield_test(api pipeline GPU)
 define_smallfield_test(api seed_determinism GPU)
 define_smallfield_test(api ez_stereo GPU)

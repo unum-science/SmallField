@@ -30,16 +30,16 @@ target_link_libraries(
 target_compile_definitions(smallfield_parquet_writer PRIVATE SMALLFIELD_GIT_SHA="${SMALLFIELD_GIT_SHA_VALUE}")
 
 define_smallfield_target(
-    smallfield_batch
-    SOURCES smallfield_batch.cpp parquet_reader.cpp shard_inventory.cpp rdkit_fallback.cpp
+    smallfield_generate
+    SOURCES generate.cpp parquet_reader.cpp shard_inventory.cpp rdkit_fallback.cpp
     LINK smallfield_lib smallfield_parquet_writer Arrow::arrow_shared Parquet::parquet_shared argparse::argparse
     DEFINES SMALLFIELD_GIT_SHA="${SMALLFIELD_GIT_SHA_VALUE}"
 )
 
 # Descriptor augmentation rewrites existing *.3D.parquet shards through the same writer.  CPU-only.
 define_smallfield_target(
-    smallfield_descriptors
-    SOURCES smallfield_descriptors.cpp
+    smallfield_describe
+    SOURCES describe.cpp
     LINK smallfield_lib smallfield_parquet_writer Arrow::arrow_shared Parquet::parquet_shared argparse::argparse
     DEFINES SMALLFIELD_GIT_SHA="${SMALLFIELD_GIT_SHA_VALUE}"
 )

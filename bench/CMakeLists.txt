@@ -1,29 +1,29 @@
 # Benchmark executables linking the SmallField library plus RDKit for cross-validation.
 
 define_smallfield_target(
-    bench_conformer_backends
-    SOURCES bench_conformer_backends.cpp
+    smallfield_bench_backends
+    SOURCES backends.cpp
     LINK smallfield_lib
 )
 define_smallfield_target(
-    bench_profile
-    SOURCES bench_profile.cpp
+    smallfield_bench_profile
+    SOURCES profile.cpp
     LINK smallfield_lib
 )
 
 # Scores `build_bounds_matrix` by driving RDKit's own embedder through `params.boundsMat`, against two controls that
 # take the same measurement through the untouched channel.  Host-only -- it reaches no kernel and needs no GPU.
 define_smallfield_target(
-    bench_bounds_embedding
-    SOURCES bench_bounds_embedding.cpp
+    smallfield_bench_bounds_quality
+    SOURCES bounds_quality.cpp
     LINK smallfield_lib
 )
 
 # MMFF kernel scaling benchmark, measuring the GPU kernel trio in isolation.  Mixed build: the .cpp drives RDKit and
 # OpenMP CPU timing, the .cu launches the kernels with cudaEvent timing.
 define_smallfield_target(
-    bench_mmff_kernels
-    SOURCES bench_mmff_kernels.cpp bench_mmff_kernels_device.cu
+    smallfield_bench_mmff
+    SOURCES mmff.cpp mmff_kernels.cu
     LINK smallfield_lib
 )
 
@@ -32,8 +32,8 @@ define_smallfield_target(
 # minimizer under measurement is the production one and the sweep passes its budget and threshold as arguments rather
 # than moving a constant in `src/`.
 define_smallfield_target(
-    bench_mmff_convergence
-    SOURCES bench_mmff_convergence.cpp ${PROJECT_SOURCE_DIR}/test/cuda/test_mmff_gradient_kernels.cu
+    smallfield_bench_minimizer
+    SOURCES minimizer.cpp ${PROJECT_SOURCE_DIR}/test/cuda/mmff_gradient_kernels.cu
     LINK smallfield_lib
 )
 
@@ -49,6 +49,6 @@ define_smallfield_target(
 # types, so a signature or a layout change lands here and a hand-run `nvcc` line is the only thing that would say so.
 # The manifest keys it binds by name stay a run-time agreement with `src/smallfield/api/wave_capture.hpp`, which is
 # what the missing-key refusal reports.
-add_executable(bench_kernel_replay bench_kernel_replay.cu)
-target_link_libraries(bench_kernel_replay PRIVATE smallfield_settings CUDA::cudart)
-set_target_properties(bench_kernel_replay PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+add_executable(smallfield_bench_kernel_replay kernel_replay.cu)
+target_link_libraries(smallfield_bench_kernel_replay PRIVATE smallfield_settings CUDA::cudart)
+set_target_properties(smallfield_bench_kernel_replay PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)

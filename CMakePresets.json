@@ -10,10 +10,11 @@
       "name": "dev",
       "displayName": "Development",
       "description": "One architecture, detected from the local GPU. The inner loop.",
-      "binaryDir": "${sourceDir}/build",
+      "binaryDir": "${sourceDir}/build_dev",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-        "SMALLFIELD_CUDA_ARCH": "native"
+        "SMALLFIELD_CUDA_ARCH": "native",
+        "SMALLFIELD_MARCH_NATIVE": "ON"
       }
     },
     {
@@ -21,7 +22,7 @@
       "displayName": "Debug",
       "description": "One architecture, no NDEBUG. The only preset where `sf_assert_` is live.",
       "inherits": "dev",
-      "binaryDir": "${sourceDir}/build-debug",
+      "binaryDir": "${sourceDir}/build_debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug"
       }
@@ -30,7 +31,7 @@
       "name": "release",
       "displayName": "Release",
       "description": "The full 80/89/90/100/120 fatbin, which is what ships.",
-      "binaryDir": "${sourceDir}/build-release",
+      "binaryDir": "${sourceDir}/build_release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       }
@@ -40,10 +41,11 @@
       "displayName": "Profiling",
       "description": "Release plus CUDA line info for `ncu` and NVTX ranges for `nsys` role timelines.",
       "inherits": "release",
-      "binaryDir": "${sourceDir}/build-profile",
+      "binaryDir": "${sourceDir}/build_profile",
       "cacheVariables": {
         "SMALLFIELD_CUDA_LINEINFO": "ON",
-        "SMALLFIELD_USE_NVTX": "ON"
+        "SMALLFIELD_USE_NVTX": "ON",
+        "SMALLFIELD_MARCH_NATIVE": "ON"
       }
     }
   ],
