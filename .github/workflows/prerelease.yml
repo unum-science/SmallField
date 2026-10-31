@@ -1,18 +1,13 @@
 name: "Pre-Release"
 
 on:
-  push:
-    branches: ["main"]
   pull_request:
-    branches: ["main*"]
+    branches: ["main", "main-dev"]
 
-# One group per source branch, so a `main*` branch with an open PR is not built twice - `push` no
-# longer matches it, and `head_ref` folds any number of PRs from that branch into the same group.
-# Superseded PR runs are cancelled; `main` runs are not, so a build feeding the release pipeline is
-# never killed midway.
+# One group per source branch, so a new push to an open PR cancels its superseded run.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.head_ref }}
+  cancel-in-progress: true
 
 # Correctness only. Style is enforced by `.githooks/pre-commit`, not here.
 env:
@@ -24,28 +19,22 @@ permissions:
   contents: read
 
 jobs:
-  versioning:
-    name: Check Version
-    runs-on: ubuntu-24.04
+  hooks:
+    name: Run Git Hooks
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          fetch-tags: true
-          persist-credentials: false
-      - name: Run TinySemVer
-        uses: ashvardanian/tinysemver@v3
-        with:
-          verbose: "true"
-          version-file: "VERSION"
-          update-version-in: |
-            CITATION.cff:^version: (\d+\.\d+\.\d+)
-            python/smallfield/__init__.py:^__version__ = "(\d+\.\d+\.\d+)"
-          dry-run: "true"
+      - name: Run the Hooks Over New Commits
+        run: .github/scripts/check-commits.sh "${{ github.event.pull_request.base.sha }}"
 
   build_cuda:
     name: CUDA Build, Every Architecture
+    needs: hooks
+    # NVIDIA's Ubuntu 26.04 repository starts at CUDA 13.3, so the pinned 12.8 toolkit needs 24.04.
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout

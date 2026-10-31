@@ -34,13 +34,14 @@
 #
 # `cmake/rdkit.cmake` builds RDKit's imported targets and is shared with the installed package
 # config, since a consumer's project has no `RDKit::*` targets for the export set to reference.
-# The version is not generated: `src/smallfield/version.hpp` carries it, and the release workflow
-# rewrites it from `VERSION`.
+# The version is not generated: `src/smallfield/version.hpp` carries it.
 
 cmake_minimum_required(VERSION 3.24)
 
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" SMALLFIELD_VERSION)
 string(STRIP "${SMALLFIELD_VERSION}" SMALLFIELD_VERSION)
+# `project(VERSION)` takes numbers only, so a candidate's `-rc.N` stays out of it.
+string(REGEX REPLACE "-.*$" "" SMALLFIELD_VERSION "${SMALLFIELD_VERSION}")
 
 # CUDA is enabled further down, once its architectures are known -- see the `enable_language` call.
 project(

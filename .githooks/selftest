@@ -83,7 +83,7 @@ assert_message_rejects() { # assert_message_rejects <title> <message> <expected-
     local title=$1 message=$2 expected=$3 path output
     path="$scratch_root/message.$$"
     printf '%s\n' "$message" > "$path"
-    output=$("$hooks_dir/commit-msg" "$path" 2>&1)
+    output=$(cd "${message_dir:-.}" && "$hooks_dir/commit-msg" "$path" 2>&1)
     if [ $? -eq 0 ]; then
         printf 'FAIL  %s -- accepted a bad message\n' "$title"
         failed=$((failed + 1))
@@ -100,7 +100,7 @@ assert_message_accepts() { # assert_message_accepts <title> <message>
     local title=$1 message=$2 path output
     path="$scratch_root/message.$$"
     printf '%s\n' "$message" > "$path"
-    if output=$("$hooks_dir/commit-msg" "$path" 2>&1); then
+    if output=$(cd "${message_dir:-.}" && "$hooks_dir/commit-msg" "$path" 2>&1); then
         printf 'ok    %s\n' "$title"
         passed=$((passed + 1))
     else
@@ -319,6 +319,30 @@ assert_message_rejects "an assistant trailer" \
     "Add: Something
 
 Co-authored-by: Claude <noreply@anthropic.com>" "AI-assistant attribution"
+
+# The release rule reads every version site from the index, so its fixtures stage all of them.
+new_release_fixture() { # new_release_fixture <version> <__init__.py version> <major> <minor> <patch>
+    message_dir=$(new_fixture)
+    printf '%s\n' "$1" > "$message_dir/VERSION"
+    printf 'cff-version: 1.2.0\nversion: %s\n' "$1" > "$message_dir/CITATION.cff"
+    mkdir -p "$message_dir/python/smallfield"
+    printf '__version__ = "%s"\n' "$2" > "$message_dir/python/smallfield/__init__.py"
+    printf '#define SMALLFIELD_VERSION_MAJOR %s\n#define SMALLFIELD_VERSION_MINOR %s\n#define SMALLFIELD_VERSION_PATCH %s\n' "$3" "$4" "$5" \
+        > "$message_dir/src/smallfield/version.hpp"
+    git -C "$message_dir" add -A
+}
+
+new_release_fixture 0.3.1 0.3.1 0 3 1
+assert_message_accepts "a release with every version site bumped" "Release: v0.3.1"
+new_release_fixture 1.0.0-rc.1 1.0.0-rc.1 1 0 0
+assert_message_accepts "a candidate keeping the numeric core in the header" "Release: v1.0.0-rc.1"
+new_release_fixture 0.3.1 0.3.0 0 3 1
+assert_message_rejects "a release with a stale Python version" "Release: v0.3.1" "python/smallfield/__init__.py"
+new_release_fixture 0.3.1 0.3.1 0 3 0
+assert_message_rejects "a release with a stale header" "Release: v0.3.1" "src/smallfield/version.hpp"
+new_release_fixture 0.3.1 0.3.1 0 3 1
+assert_message_rejects "a release subject without its tag" "Release: 0.3.1" "exactly 'Release: vX.Y.Z'"
+assert_message_rejects "a version bump outside a release" "Fix: Bump the version" "VERSION only changes"
 
 printf '\n%d passed, %d failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]

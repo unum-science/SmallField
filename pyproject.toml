@@ -45,8 +45,6 @@ urls = {Homepage = "https://github.com/unum-science/SmallField"}
 dev = ["pytest", "pytest-benchmark", "rdkit", "pybind11", "ruff"]
 test = ["pytest", "pytest-benchmark", "rdkit"]
 
-# The VERSION file is the single source of truth. The release workflow rewrites every other copy
-# from it, so nothing needs to assert that they agree.
 [tool.setuptools.dynamic]
 version = {file = "VERSION"}
 

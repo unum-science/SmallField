@@ -23,6 +23,7 @@ Note that `core.hooksPath` and `pre-commit install` are mutually exclusive — G
 ## What They Check
 
 `commit-msg` requires a `<Verb>: <Capitalized summary>` subject with an approved verb, and rejects AI-assistant attribution trailers.
+A `Release: vX.Y.Z` or `Release: vX.Y.Z-rc.N` subject instead requires every staged version site to carry that version, and no other commit may change `VERSION`.
 
 `pre-commit` runs the style checks against __the added lines of each staged file__, then the formatter gates.
 A file that already contains a violation stays committable; a diff that introduces one does not.
