@@ -11,7 +11,6 @@ git diff --quiet HEAD || { echo "mint-release: commit or stash your changes firs
 
 export version core
 echo "$version" > VERSION
-perl -pi -e 's/^version: .+$/version: $ENV{version}/' CITATION.cff
 perl -pi -e 's/^__version__ = "[^"]+"$/__version__ = "$ENV{version}"/' python/smallfield/__init__.py
 perl -pi -e 'BEGIN { ($major, $minor, $patch) = split /\./, $ENV{core} } s/^(#define SMALLFIELD_VERSION_MAJOR )\d+$/$1$major/; s/^(#define SMALLFIELD_VERSION_MINOR )\d+$/$1$minor/; s/^(#define SMALLFIELD_VERSION_PATCH )\d+$/$1$patch/' src/smallfield/version.hpp
 git commit -am "Release: v$version" # commit-msg rejects it if any site was missed

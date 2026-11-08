@@ -2,7 +2,6 @@ cff-version: 1.2.0
 title: "SmallField: GPU conformer generation with ETKDG and MMFF94"
 message: "If you use this software, please cite it as below."
 type: software
-version: 0.3.0
 authors:
   - given-names: Ash
     family-names: Vardanian

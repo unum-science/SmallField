@@ -46,6 +46,13 @@
 # mode these checks keep having.
 
 set -u
+
+# CITATION.cff cites the concept DOI, which spans every release, so it never carries a version.
+if git show :CITATION.cff 2> /dev/null | grep -q '^version:'; then
+    echo "pre-commit: CITATION.cff carries no version; the concept DOI spans every release." >&2
+    exit 1
+fi
+
 # Exported so child greps actually see it - a bare assignment sets a shell variable that no
 # subprocess inherits, which made the byte-wise claim below false for every check in this file.
 export LC_ALL=C

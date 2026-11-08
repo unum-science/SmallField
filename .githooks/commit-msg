@@ -38,7 +38,6 @@ Release:*)
     else
         core=${version%%-*} stale=""
         [ "$(git show :VERSION 2>/dev/null)" = "$version" ] || stale="$stale VERSION"
-        git show :CITATION.cff 2>/dev/null | grep -qxF "version: $version" || stale="$stale CITATION.cff"
         git show :python/smallfield/__init__.py 2>/dev/null | grep -qxF "__version__ = \"$version\"" ||
             stale="$stale python/smallfield/__init__.py"
         # The C macros take numbers only, so a candidate keeps its core there.
